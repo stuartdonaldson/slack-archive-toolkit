@@ -1,0 +1,12 @@
+# Search terms for fetch-files.sh's best-effort file/canvas harvesting.
+# One term per line; '#'-comments and blank lines are ignored. `slackdump
+# search files` is relevance search, not exhaustive enumeration, and has no
+# working OR operator (see docs/references/slackdump-cli-notes.md) — so
+# broad coverage means running many single-term queries and merging results,
+# not one combined query. Extend this list freely; it's config, not code.
+pax
+convergence
+help
+ruck
+ao
+health

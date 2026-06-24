@@ -1,0 +1,16 @@
+[
+  {
+    "type": "message",
+    "user": "U0F",
+    "ts": "1780657200.000100",
+    "text": "standalone D — trailing month, June"
+  },
+  {
+    "type": "message",
+    "subtype": "bot_message",
+    "bot_id": "B0BOT",
+    "username": "Backblast Bot",
+    "ts": "1780660800.000100",
+    "text": "standalone E — bot message with no user field, June"
+  }
+]

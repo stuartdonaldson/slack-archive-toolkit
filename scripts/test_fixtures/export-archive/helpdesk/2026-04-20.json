@@ -1,0 +1,15 @@
+[
+  {
+    "type": "message",
+    "user": "U0C",
+    "ts": "1776686400.000100",
+    "thread_ts": "1776686400.000100",
+    "reply_count": 1,
+    "latest_reply": "1777708800.000100",
+    "replies": [
+      { "user": "U0D", "ts": "1777708800.000100" }
+    ],
+    "subscribed": false,
+    "text": "parent B — VPN question (reply lands next month)"
+  }
+]

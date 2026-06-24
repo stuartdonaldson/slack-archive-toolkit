@@ -1,0 +1,22 @@
+[project]
+name = "slackbackup"
+version = "0.1.0"
+description = "Local backup/export/catalog/search tooling for slackdump-archived Slack workspaces"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+slackbackup = "slackbackup.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slackbackup"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "SlackBackup",
+  "project_id": "d7046d48-0976-435e-a87e-4e24b26a848c"
+}

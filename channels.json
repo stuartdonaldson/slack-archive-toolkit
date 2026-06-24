@@ -1,0 +1,247 @@
+[
+  {
+    "id": "CJBG619C5",
+    "name": "helpdesk",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C77TKCVJ8",
+    "name": "1st-f",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C776T9YAU",
+    "name": "3rd-f",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C77TJFZD2",
+    "name": "mumblechatter",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0A626G4PGF",
+    "name": "1st-f",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A626HC6BH",
+    "name": "2nd-f",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A626GQ64X",
+    "name": "3rd-f",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A2FF45UAD",
+    "name": "otb-red-eye-reps",
+    "workspace": "f3cascades"
+  },
+  {
+    "id": "C0A18QD4MD5",
+    "name": "all-f3-cascades",
+    "workspace": "f3cascades"
+  },
+  {
+    "id": "C0A3GEZ7BJS",
+    "name": "all-f3-kirkland",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C780LUPK7",
+    "name": "2nd-f",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0ALXNG05R7",
+    "name": "ai-coding",
+    "workspace": "dungeons-of-finn-hill"
+  },
+  {
+    "id": "C0AQZATMPPA",
+    "name": "tidewaiter-ai",
+    "workspace": "dungeons-of-finn-hill"
+  },
+  {
+    "id": "CCUPZ6GR3",
+    "name": "classifieds",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C77PPNCUT",
+    "name": "all-pax",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C09RSQBEA2Y",
+    "name": "all-f3-tundra",
+    "workspace": "f3tundra"
+  },
+  {
+    "id": "C0A7B8U0HSL",
+    "name": "ao-torque",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C01BH5Y9M63",
+    "name": "all-announcements",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C01HF0FPJMV",
+    "name": "all-iso",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0A3J6M42JE",
+    "name": "all-f3-redmond",
+    "workspace": "f3redmond"
+  },
+  {
+    "id": "C06AWU81H9A",
+    "name": "10-week-health-challenge",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0B5CDC6L8N",
+    "name": "ai-bro",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "CC9KWR4JG",
+    "name": "ao-active-book-club",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C01CR5PNF63",
+    "name": "ao-flow",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "CV6S2MF33",
+    "name": "ao-qsource-matrix",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0A3T3LAKCK",
+    "name": "event-extremeweek2026",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C09JC0343LY",
+    "name": "event-fight-hunger-food-drive",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C08712BAVU7",
+    "name": "event-gte58",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C01QAF107DX",
+    "name": "event-hit4thecycle",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "CR3170NUA",
+    "name": "event-paintball",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C04GQBLJC23",
+    "name": "event-thepassport",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C090UQH2PAM",
+    "name": "otb-top-of-the-hill",
+    "workspace": "f3pugetsound"
+  },
+  {
+    "id": "C0A68PL017Y",
+    "name": "ao-grasslawn",
+    "workspace": "f3redmond"
+  },
+  {
+    "id": "C0A6AQJ3BC2",
+    "name": "ao-mother-rucker",
+    "workspace": "f3redmond"
+  },
+  {
+    "id": "C0A67C1LM7F",
+    "name": "ao-redmond-ridge",
+    "workspace": "f3redmond"
+  },
+  {
+    "id": "C0B6RQ7CFPZ",
+    "name": "event-summer-convergence",
+    "workspace": "f3tundra"
+  },
+  {
+    "id": "C0A1W5ZCZ5Z",
+    "name": "ao-perestroika",
+    "workspace": "f3cascades"
+  },
+  {
+    "id": "C0A2FF46DLH",
+    "name": "otb-tour-of-beauty",
+    "workspace": "f3cascades"
+  },
+  {
+    "id": "C0A6EU23D3Q",
+    "name": "ao-borderlands",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6DGHR7D3",
+    "name": "ao-heritage-park",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A61G5ET8F",
+    "name": "ao-kamiakin-speakeasy",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6VSYU5FT",
+    "name": "ao-kims-vhs",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A61G5G9QX",
+    "name": "ao-kingsgate-thunderdome",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A70F9KLSX",
+    "name": "ao-l-dub",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6VSZ1DFB",
+    "name": "ao-ruck-mountain",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6EU277L6",
+    "name": "ao-the-crucible",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6LH7SE12",
+    "name": "ao-thoreau-sasquatch",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0A6GV08XQS",
+    "name": "ao-urban-ruck",
+    "workspace": "f3kirkland"
+  },
+  {
+    "id": "C0ABPPU28P5",
+    "name": "event-extremeweek2026-kirkland",
+    "workspace": "f3kirkland"
+  }
+]

@@ -1,0 +1,6 @@
+[
+  { "id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": { "display_name": "Al" } },
+  { "id": "U0B", "name": "bob.b", "real_name": "Bob Baker", "profile": { "display_name": "" } },
+  { "id": "U0C", "name": "carol.c", "real_name": "Carol Carter", "profile": { "display_name": "Caz" } },
+  { "id": "U0D", "name": "dave.d", "real_name": "Dave Dixon", "profile": { "display_name": "" } }
+]

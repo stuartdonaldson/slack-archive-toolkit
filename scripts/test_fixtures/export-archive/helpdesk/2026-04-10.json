@@ -1,0 +1,28 @@
+[
+  {
+    "type": "message",
+    "user": "U0A",
+    "ts": "1775811600.000100",
+    "thread_ts": "1775811600.000100",
+    "reply_count": 2,
+    "latest_reply": "1775901600.000100",
+    "replies": [
+      { "user": "U0B", "ts": "1775811900.000100" },
+      { "user": "U0B", "ts": "1775901600.000100" }
+    ],
+    "subscribed": true,
+    "text": "parent A — printer is down",
+    "files": [
+      { "id": "F0X", "name": "printer-error.jpg", "filetype": "jpg",
+        "permalink": "https://example.slack.com/files/U0A/F0X/printer-error.jpg",
+        "url_private": "https://files.slack.com/files-pri/T1-F0X/printer-error.jpg" }
+    ]
+  },
+  {
+    "type": "message",
+    "user": "U0B",
+    "ts": "1775811900.000100",
+    "thread_ts": "1775811600.000100",
+    "text": "reply A1 — same-day reply"
+  }
+]
