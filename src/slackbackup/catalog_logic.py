@@ -56,13 +56,22 @@ def description_of(channel: dict) -> str:
     return (channel.get("purpose") or {}).get("value") or ""
 
 
+def _channel_fields(ch: dict, member: bool) -> dict:
+    return {
+        "member": member,
+        "name": ch["name"],
+        "description": description_of(ch),
+        "topic": (ch.get("topic") or {}).get("value") or None,
+        "is_private": ch.get("is_private", False),
+        "is_archived": ch.get("is_archived", False),
+        "creator": ch.get("creator") or None,
+        "created": ch.get("created") or None,
+    }
+
+
 def merge_fast(data: dict, channels: list[dict]) -> dict:
     for ch in channels:
-        data["channels"][ch["id"]] = {
-            "member": True,
-            "name": ch["name"],
-            "description": description_of(ch),
-        }
+        data["channels"][ch["id"]] = _channel_fields(ch, member=True)
     return data
 
 
@@ -70,14 +79,9 @@ def merge_full(data: dict, channels: list[dict]) -> dict:
     for ch in channels:
         existing = data["channels"].get(ch["id"])
         if existing is not None:
-            existing["name"] = ch["name"]
-            existing["description"] = description_of(ch)
+            existing.update(_channel_fields(ch, member=existing["member"]))
         else:
-            data["channels"][ch["id"]] = {
-                "member": False,
-                "name": ch["name"],
-                "description": description_of(ch),
-            }
+            data["channels"][ch["id"]] = _channel_fields(ch, member=False)
     return data
 
 
@@ -162,3 +166,44 @@ def name_by_id(workspace: str, channel_id: str, cache_dir: Path = DEFAULT_CACHE_
     data = load(cache_dir, workspace)
     channel = data["channels"].get(channel_id)
     return channel["name"] if channel else ""
+
+
+def set_registered_at(cache_dir: Path, workspace: str, channel_id: str, when: str) -> None:
+    """Stamps the moment we started tracking this channel (ISO8601 UTC) -
+    idempotent, never overwrites an existing value. Fallback sort key for
+    effective_recency before any backup has ever found real message data
+    for this channel. No-op if the channel isn't in the catalog yet
+    (shouldn't happen in practice - callers always look a channel up via
+    the catalog before registering it)."""
+    data = load(cache_dir, workspace)
+    channel = data["channels"].get(channel_id)
+    if channel is None or channel.get("registered_at"):
+        return
+    channel["registered_at"] = when
+    save(cache_dir, workspace, data)
+
+
+def update_last_posted(cache_dir: Path, workspace: str, channel_id: str, last_posted: str | None) -> None:
+    """Records the real last-message timestamp (ISO8601 UTC) seen in this
+    channel's local archive, called after a successful backup that found
+    at least one message. A channel that yields zero messages leaves this
+    untouched - callers fall back to registered_at via effective_recency
+    instead, so a channel that never gets traffic keeps "aging" against
+    the clock rather than looking falsely fresh."""
+    if not last_posted:
+        return
+    data = load(cache_dir, workspace)
+    channel = data["channels"].get(channel_id)
+    if channel is None:
+        return
+    channel["last_posted"] = last_posted
+    save(cache_dir, workspace, data)
+
+
+def effective_recency(catalog: dict, channel_id: str) -> str:
+    """Sort key for backup ordering: real last_posted if a backup has ever
+    found message data, else registered_at (when we started tracking it),
+    else "" (totally unknown - sorts oldest/last). ISO8601 strings sort
+    correctly as plain strings."""
+    channel = catalog.get("channels", {}).get(channel_id, {})
+    return channel.get("last_posted") or channel.get("registered_at") or ""

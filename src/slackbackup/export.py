@@ -21,7 +21,18 @@ def register(groups: argparse._SubParsersAction) -> None:
     group = groups.add_parser("export", help="export an archived channel to bounded monthly JSON")
     sub = group.add_subparsers(dest="command", required=True)
 
-    p_monthly = sub.add_parser("monthly", help="export months overlapping [--from, --to]")
+    p_monthly = sub.add_parser(
+        "monthly",
+        help="export months overlapping [--from, --to]",
+        epilog=(
+            "Example:\n"
+            "  ./slackbackup export monthly --from 2026-01-01 --to 2026-06-30 \\\n"
+            "      --workspace f3pugetsound --channel helpdesk \\\n"
+            "      --archive-root ~/slack-backups --out ~/slack-exports\n"
+            "Output: <out>/<workspace>-<channel>-yyyy-mm.json, one file per overlapping month."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_monthly.add_argument("--from", dest="date_from", required=True)
     p_monthly.add_argument("--to", dest="date_to", required=True)
     p_monthly.add_argument("--workspace", required=True)
@@ -30,7 +41,15 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_monthly.add_argument("--out", required=True)
     p_monthly.set_defaults(handler=_monthly)
 
-    p_list = sub.add_parser("list", help="list which months are already exported in a directory")
+    p_list = sub.add_parser(
+        "list",
+        help="list which months are already exported in a directory",
+        epilog=(
+            "Example:\n  ./slackbackup export list ~/slack-exports --workspace f3pugetsound\n"
+            "Output: printed to stdout (tab-separated) only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_list.add_argument("out", help="directory previously passed to 'export monthly --out'")
     p_list.add_argument("--workspace", default=None)
     p_list.add_argument("--channel", default=None)
@@ -39,6 +58,11 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_digest = sub.add_parser(
         "digest",
         help="merge the trailing N months across workspaces matching --workspace-glob into one JSON document",
+        epilog=(
+            "Example:\n  ./slackbackup export digest --archive-root ~/slack-backups\n"
+            "Output: --out, defaulting to ~/slack-exports/f3-digest-<as-of>.json."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_digest.add_argument("--archive-root", required=True)
     p_digest.add_argument("--channels-file", default="./channels.json")
@@ -54,6 +78,11 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_users = sub.add_parser(
         "users",
         help="export every known user profile, grouped per workspace matching --workspace-glob",
+        epilog=(
+            "Example:\n  ./slackbackup export users --archive-root ~/slack-backups\n"
+            "Output: --out, defaulting to ~/slack-exports/f3-user-profiles-<today>.json."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_users.add_argument("--archive-root", required=True)
     p_users.add_argument("--channels-file", default="./channels.json")

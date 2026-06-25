@@ -16,15 +16,17 @@ from slackbackup.cli import build_parser
         ["channel", "list", "f3test"],
         ["channel", "validate", "channels.json"],
         ["catalog", "show", "f3test"],
+        ["catalog", "list", "f3test"],
         ["backup", "channel", "C1", "general", "f3test", "/tmp/archive"],
         ["backup", "run", "channels.json", "/tmp/archive"],
+        ["backup", "sync-catalog", "channels.json", "/tmp/archive"],
         ["export", "monthly", "--from", "2026-01-01", "--to", "2026-01-31",
          "--workspace", "f3test", "--channel", "general",
          "--archive-root", "/tmp/archive", "--out", "/tmp/out"],
         ["files", "fetch", "/tmp/search-root"],
         ["files", "index", "/tmp/out", "/tmp/index.json",
          "--archive-root", "/tmp/archive", "--search-root", "/tmp/search"],
-        ["search", "messages", "convergence"],
+        ["search", "messages", "f3test", "convergence"],
     ],
 )
 def test_every_documented_command_parses_and_dispatches(argv):

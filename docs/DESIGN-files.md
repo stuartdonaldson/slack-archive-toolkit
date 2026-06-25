@@ -1,22 +1,32 @@
 # DESIGN — Channel Catalog & Canvas/File Harvesting
 
-**Status: implemented.** `scripts/lib/channel_catalog.sh` + `scripts/catalog-channels.sh`
-(catalog), `scripts/fetch-files.sh` + `scripts/lib/fetch_files_helpers.sh` (search-files
-harvesting), and `scripts/build-file-index.sh` + `scripts/lib/file_index_helpers.sh`
-(indexing) are all written, tested (49 passing unit/fixture tests across
-`scripts/test_catalog_channels.sh`, `scripts/test_fetch_files.sh`,
-`scripts/test_build_file_index.sh`), and verified live against real workspace data. A few
-implementation-time corrections to this design are called out inline below where they
-matter; see `docs/references/slackdump-cli-notes.md` for the empirically-verified facts
-(channel `description` via the same `-format JSON` call, `tools merge` not being usable on
-search-result databases, `FILE.DATA` carrying all file metadata with no separate
-`MIMETYPE` column, search-result rows carrying a `CHANNEL_ID` placeholder of `"SEARCH"`).
+**Status: split.** The **channel catalog** (second half of this doc) was originally shell
+(`scripts/lib/channel_catalog.sh` + `scripts/catalog-channels.sh`) and has since been **ported
+to Python** — `src/slackbackup/catalog_logic.py` (CLI: `catalog.py`) — and extended well beyond
+the original design (see §Catalog additions since the original design, below). The shell
+scripts are gone; the Python module is the only implementation.
+
+**Canvas/non-image-file harvesting** (first half of this doc — `fetch-files.sh`/
+`build-file-index.sh`) was implemented as shell only and **has not been ported to Python**.
+`src/slackbackup/files.py`'s `fetch`/`index` handlers still raise `NotImplementedError`;
+`files_logic.py` implements only the read side (`summarize()` over an already-existing
+`index.json`) — the schema below is the contract, regardless of which tool eventually produces
+it. Port when the cross-channel file-harvesting use case is actually needed; the design below
+remains valid, just unimplemented in the current codebase.
+
+A few implementation-time corrections to the original (shell) design are called out inline below
+where they matter; see `docs/references/slackdump-cli-notes.md` for the empirically-verified
+facts (channel `description` via the same `-format JSON` call, `tools merge` not being usable on
+search-result databases, `FILE.DATA` carrying all file metadata with no separate `MIMETYPE`
+column, search-result rows carrying a `CHANNEL_ID` placeholder of `"SEARCH"`).
 
 Tracked as `SlackBackup-6ql` (catalog), `SlackBackup-d02` (fetch-files), `SlackBackup-t2b`
-(build-file-index) — all closed. Companion to `docs/DESIGN.md` (per-channel message
-backup) and `docs/DESIGN-export.md` (monthly JSON export). See
-`docs/references/slackdump-cli-notes.md` for the underlying slackdump behavior/cost facts
-this design relies on — read that first if anything below seems under-justified.
+(build-file-index) — all closed (the original shell work; the catalog's later Python port and
+extensions were untracked). Companion to `docs/DESIGN.md` (per-channel message backup) and
+`docs/DESIGN-export.md` (export pipeline — `export digest` reads the catalog read-only for
+per-channel context). See `docs/references/slackdump-cli-notes.md` for the underlying slackdump
+behavior/cost facts this design relies on — read that first if anything below seems
+under-justified.
 
 ---
 
@@ -50,7 +60,7 @@ cost-asymmetry lesson, so they're designed together.
 **Decision:** use both, for different scopes, and merge by file ID:
 - **Tracked channels** (`channels.json`, already fully `archive`d/`resume`d): read the
   local `slackdump.sqlite` `FILE` table directly. Complete, free (no API call), already
-  kept current by `run-backups.sh`.
+  kept current by `backup_logic.run()` (the Python port of `run-backups.sh`).
 - **Everything else** in the same workspace: `search files` with a curated list of
   broad terms (starting point: `pax`, `convergence`, `help`, `ruck`, `ao`, `health` —
   extend this list freely; it's just config, not code), one query per term, merged and
@@ -72,7 +82,7 @@ cost-asymmetry lesson, so they're designed together.
   tracked per-channel archives) since it's a different kind of artifact.
 - This step makes real Slack API calls; re-running it is cheap (each search is
   sub-second) but not free, so it's a deliberate, occasional/manual invocation — not
-  wired into `run-backups.sh`'s automatic cadence (unlike the channel catalog below).
+  wired into `backup_logic.run()`'s automatic cadence (unlike the channel catalog below).
 
 ### `scripts/build-file-index.sh <out-files-dir> <index.json>` (new)
 
@@ -98,7 +108,7 @@ search-result databases under the new `fetch-files.sh` output root):
 
 ## Channel catalog design
 
-Generalizes `scripts/register-channel.sh`'s existing `get_channel_list()` /
+Generalizes the original shell `register-channel.sh`'s `get_channel_list()` /
 `~/.cache/register-channel/<workspace>.txt` TTL-cache (900s default) — don't build a
 second cache, extend that one.
 
@@ -106,10 +116,10 @@ second cache, extend that one.
 
 | Tier | Call | Cost | Refresh trigger |
 |---|---|---|---|
-| Fast | `list channels -member-only ...` | seconds | Automatically, once per `run-backups.sh` run (cache TTL makes same-day reruns free) |
+| Fast | `list channels -member-only ...` | seconds | Automatically, once per `backup_logic.run()` invocation (cache TTL makes same-day reruns free) |
 | Full | `list channels` (no `-member-only`) | minutes, rate-limited (slackdump self-backs-off) | Explicit, separate command only — never automatic |
 
-- The **full** tier is also the fallback `register-channel.sh` should consult when a
+- The **full** tier is also the fallback a name-based lookup (`channel_logic.register`) consults when a
   channel-by-name lookup misses the fast cache (a public channel the user hasn't
   joined) — this was very likely the cause of the "registering by name took forever"
   experience referenced this session, since the old code had no fast/full split and
@@ -121,9 +131,10 @@ second cache, extend that one.
     worse. If ever wanted, it must be its own explicit, separately-invoked operation
     (self-throttled or accepting imposed Slack backoff), never folded into the regular
     catalog refresh.
-- Output should replace the stale, manually-generated `channels-T*.txt` files currently
-  committed in the repo root (one per workspace team ID, e.g. `channels-T78NKT50E.txt`
-  = `f3pugetsound`) — those were ad hoc one-off dumps, not a maintained artifact.
+- This catalog has since replaced the stale, manually-generated `channels-T*.txt` files that
+  used to be committed in the repo root (one per workspace team ID, e.g.
+  `channels-T78NKT50E.txt` = `f3pugetsound`) — those were ad hoc one-off dumps, not a maintained
+  artifact, and have been deleted.
 
 ## Non-goals (for both pieces)
 
@@ -133,6 +144,56 @@ second cache, extend that one.
 - No per-channel last-activity lookup for untracked channels by default — explicit
   opt-in only, due to the per-channel API call cost.
 - Not modifying `channels.json` or the existing per-channel backup/export scripts.
+
+## Catalog additions since the original design
+
+The Python port (`catalog_logic.py`) kept the two-tier fast/full cache design unchanged but
+extended the per-channel schema and added a bulk-registration feature the original design did
+not anticipate:
+
+### Schema additions
+
+Beyond `member`/`name`/`description` (the original design), each cached channel now also
+carries:
+
+| Field | Source | Purpose |
+|-------|--------|---------|
+| `is_private`, `is_archived` | Mirrored from Slack's own `list channels -format JSON` (same call, no extra cost) | Lets `register_matching` (below) exclude private/archived channels from bulk discovery |
+| `creator`, `created` | Same call | Channel context surfaced in `export digest` (see `docs/DESIGN-export.md`) |
+| `registered_at` | **This app's own bookkeeping** — stamped once, idempotently, by `channel_logic.register`/`register_matching` the moment a channel is first tracked | Fallback recency signal for backup ordering (see `last_posted` below) |
+| `last_posted` | **This app's own bookkeeping** — set by `backup_logic.backup_channel` after a backup that actually found message data; left unset if the archive stayed empty | Real recency signal once available; `catalog_logic.effective_recency` prefers this over `registered_at` |
+
+`registered_at`/`last_posted` have no Slack-API source at all — they exist purely so
+`backup_logic.run()` can process a multi-channel run most-recently-active-first (real data) or
+most-recently-discovered-first (no data yet), rather than in arbitrary `channels.json` order.
+
+### Bulk registration (`channel_logic.register_matching`)
+
+Generalizes the original single-channel `register()` to glob-based discovery: e.g.
+`register_matching("f3*", "*", ...)` registers every new, public, non-archived channel across
+every registered `f3*` workspace — intended to run nightly so newly-created public channels
+(the original motivating case: `disc-it` going unnoticed in `f3pugetsound`) get picked up
+automatically instead of requiring a human to notice and run `channel register` by name.
+
+Three real bugs were found and fixed while building this, all in the shared `list_channels()`
+call both registration and the catalog depend on — fixed centrally in
+`src/slackbackup/slackdump.py` so no caller sees them again:
+
+- **Plain DM leakage** — `list channels`, even with `-member-only`, returns plain
+  direct-message conversations (`is_channel: false`, blank name, `D`-prefixed id). Filtered out.
+- **Multi-person DM leakage (privacy-sensitive)** — group DMs come back with `is_channel: true`
+  despite being a DM, a `C`-prefixed id, and a name that **embeds every participant's real
+  username** (e.g. `mpdm-bgawthrop--stuart.donaldson--chris.knowlton-1`). Filtered out by name
+  pattern (`mpdm-*`) — this would otherwise have been a real PII leak into `channels.json` and
+  any catalog cache.
+- **`shuttered*`-named channels** — this F3 community's own naming convention for a closed-out
+  AO, which Slack's own `is_archived` flag does **not** reliably reflect (confirmed empirically:
+  most `shuttered-*` channels in a real workspace were not actually archived). `register_matching`
+  filters by name prefix (case-insensitive) in addition to the `is_private`/`is_archived` checks.
+
+A bulk run against real data initially picked up ~720 channels including private ones and the DM
+leaks above before these fixes landed; after fixing all three, a clean re-run against the same
+workspace produced the expected ~380 legitimate public channels.
 
 ## Open items — resolved during implementation
 

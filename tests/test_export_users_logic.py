@@ -24,8 +24,32 @@ def test_clean_user_strips_noise_and_resolves_display_name():
     cleaned = export_logic._clean_user(raw)
     assert cleaned == {
         "id": "U0A", "name": "alice.a", "real_name": "Alice Anderson",
-        "display_name": "Al", "is_bot": False, "deleted": False,
+        "display_name": "Al", "deleted": False, "slack_roles": [],
     }
+
+
+def test_clean_user_collects_slack_roles():
+    raw = {
+        "id": "U0Z", "name": "zoe.z", "real_name": "Zoe Z", "deleted": False,
+        "profile": {"display_name": "Zoe"}, "is_admin": True, "is_owner": True, "is_primary_owner": False,
+    }
+    cleaned = export_logic._clean_user(raw)
+    assert cleaned["slack_roles"] == ["owner", "admin"]
+
+
+def test_clean_user_bot_is_a_slack_role():
+    raw = {"id": "U0BOT", "name": "bot", "real_name": "Bot", "deleted": False, "is_bot": True, "profile": {}}
+    cleaned = export_logic._clean_user(raw)
+    assert cleaned["slack_roles"] == ["bot"]
+
+
+def test_clean_user_restricted_and_app_user_roles():
+    raw = {
+        "id": "U0R", "name": "guest", "real_name": "Guest", "deleted": False,
+        "is_restricted": True, "is_app_user": True, "profile": {},
+    }
+    cleaned = export_logic._clean_user(raw)
+    assert set(cleaned["slack_roles"]) == {"restricted", "app_user"}
 
 
 def test_clean_user_empty_display_name_becomes_none():

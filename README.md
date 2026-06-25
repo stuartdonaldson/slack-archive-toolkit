@@ -1,6 +1,9 @@
-# Slack Backup
+# Slack Archive Toolkit
 
-Automated daily Slack channel backup via GitHub Actions and slackdump, storing encrypted exports in a separate private archive repo — no admin access or app installs required.
+A local Python CLI (`./slackbackup`) that backs up Slack channel history via slackdump, then
+exports it into LLM-ready digests, per-month archives, and a user-profile roster — no Slack
+admin access, no app install, no cloud infrastructure. See [docs/DESIGN.md](docs/DESIGN.md) for
+the full architecture and a data-flow diagram of what this app does versus what slackdump does.
 
 **Status:** Active development
 
@@ -8,10 +11,10 @@ Automated daily Slack channel backup via GitHub Actions and slackdump, storing e
 
 ## Getting Started
 
-Everything below runs locally via the `./slackbackup` CLI — no GitHub Actions, no PAT,
-no admin access to the workspace. Secrets (the `xoxc-` token and `xoxd-` cookie) stay on
-your machine in `~/.slackdump-tokens.json` and slackdump's own local session store —
-**never** in this repo (see `.gitignore`'s "Secrets" section).
+Everything below runs locally via the `./slackbackup` CLI — no Slack workspace admin access
+required. Secrets (the `xoxc-` token and `xoxd-` cookie) stay on your machine in
+`~/.slackdump-tokens.json` and slackdump's own local session store — **never** in this repo
+(see `.gitignore`'s "Secrets" section).
 
 ### Prerequisites
 
@@ -94,6 +97,12 @@ attachment) to produce the actual newsletter. The prompt defines the regional st
 event/leadership handling, and sourcing rules — it expects the digest's schema
 (`messages`, `channels`, `leadership.by_region`) as-is, so don't reshape the JSON first.
 
+### 7. Generate a new-member "Start Here" guide (optional)
+
+Feed the digest JSON plus [`docs/fng-getting-started-prompt.md`](docs/fng-getting-started-prompt.md)
+to an LLM to produce a "Slack: Start Here / FAQ" guide for new members, sourced only from the
+digest's actual channels/roles/events — same pattern as the newsletter prompt above.
+
 Run `./slackbackup help` for the full command list.
 
 ---
@@ -104,8 +113,8 @@ Run `./slackbackup help` for the full command list.
 |----------|---------|
 | [CONTEXT.md](docs/CONTEXT.md) | Purpose, capabilities, use cases |
 | [DESIGN.md](docs/DESIGN.md) | Per-channel backup architecture, modules, key decisions |
-| [DESIGN-export.md](docs/DESIGN-export.md) | Monthly JSON export (archive → bounded, thread-nested per-month files) |
-| [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog + canvas/file harvesting (designed, not yet implemented) |
+| [DESIGN-export.md](docs/DESIGN-export.md) | Export pipeline: monthly per-channel JSON, cross-workspace LLM digest, user-profile roster |
+| [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog (implemented) + canvas/file harvesting (designed, not yet ported to Python) |
 | [references/slackdump-cli-notes.md](docs/references/slackdump-cli-notes.md) | slackdump CLI behavior, costs, and gotchas learned the hard way — check before re-deriving |
 | [ADRs](docs/adr/) | Architecture decision records |
 

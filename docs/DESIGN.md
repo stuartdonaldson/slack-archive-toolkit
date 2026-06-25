@@ -1,136 +1,167 @@
-# DESIGN — Slack Backup
+# DESIGN — Slack Archive Toolkit
 
 ## Solution Strategy
 
-The backup logic in `scripts/` is trigger-agnostic and supports two trigger modes sharing the same code path:
+This is a local-only Python CLI (`./slackbackup`, package `src/slackbackup/`). There is no
+server, no scheduled cloud job, and no GitHub Actions workflow — those were an earlier design
+(see `git log` before the Python rewrite) and have been fully superseded. The only scheduling
+that exists is operator-controlled: an optional nightly Windows Task Scheduler job
+(`scripts/nightly-backup-digest.sh`) that just invokes the same CLI a human would type.
 
-1. **Local cron** — invoked directly on the dev system via crontab/scheduled task. No GitHub Secrets, no GitHub Actions minutes consumed, and immune to GitHub's 60-day scheduled-workflow dormancy rule (see Known Gaps below). Credentials come from a local secrets file (not committed) instead of GitHub Secrets.
-2. **GitHub Actions** — a `schedule:` cron trigger (plus manual `workflow_dispatch` for full re-sync) runs the same scripts on a GitHub-hosted runner, free and forkable with no external infrastructure. Credentials come from GitHub repository secrets, injected as env vars.
+**This app never talks to the Slack API directly.** Confirmed by inspection — there is no
+`requests`/`urllib`/`httpx` import anywhere in `src/slackbackup/`, and every Slack-facing
+operation is a subprocess call to the third-party `slackdump` binary, all of them funneled
+through one module, `src/slackbackup/slackdump.py` ("every call to the binary in this project
+goes through here" — its own docstring). If a future change needs a new Slack capability, it
+either already exists as a `slackdump` subcommand, or it's out of scope until `slackdump` adds
+it — this project does not implement its own Slack API client.
 
-Both modes write to the same private archive repo. **Build order: local cron first.** The scripts are implemented and validated as a plain local invocation before `.github/workflows/backup.yml` is written — GitHub Actions wraps the proven local logic rather than being where the logic is first built and debugged (see `SlackBackup-90o`, `SlackBackup-dj8`).
+What `slackdump` (the binary) owns, end to end:
+- Authentication/session handling (`workspace import`, browser cookie + per-workspace token).
+- Talking to the real Slack Web API: pagination, rate-limit backoff/retry, the wire format.
+- Per-channel durable storage: its own `slackdump.sqlite` archive format, and the incremental
+  `archive`/`resume` lifecycle (see Known Gaps in `docs/references/slackdump-cli-notes.md` for
+  the two confirmed footguns: `resume -dedupe` deletes thread-root rows, and `archive` over an
+  *existing* directory duplicates data — both are why this app's own orchestration logic exists,
+  see Building Block View).
+- Rendering an archive to the documented, stable **Slack Export** JSON format (`convert -f
+  export`) and to channel/message listings (`list channels`, `search messages`, `search files`).
 
-GitHub itself, when the GitHub Actions trigger is used, is also the storage backend: the fetched data is committed straight into a private GitHub repo — no server or third-party storage to provision either way. slackdump handles Slack export via browser session cookies, eliminating the need for OAuth apps or admin tokens. Splitting configuration into a public repo and backup output into a private repo isolates credentials without complicating the fork workflow.
+What this app adds on top — all pure Python, zero Slack API calls of their own, operating only
+on `slackdump`'s output and on small JSON files this app maintains itself:
+- **Channel tracking** (`channel_logic.py`) — `channels.json` is a deliberately minimal join-key
+  list (`{id, name, workspace}`); decides whether to register one channel by exact name, or to
+  bulk-discover every new public channel matching a glob across a workspace glob
+  (`register_matching`), filtering out private/archived/`shuttered*`-named channels.
+- **Catalog** (`catalog_logic.py`) — a persistent, refreshable cache over `slackdump list
+  channels`, two-tier (cheap member-only vs. expensive full), storing both Slack-mirrored fields
+  (description, creator, created, is_private, is_archived) and two fields this app derives and
+  owns outright: `registered_at` (when *we* started tracking a channel) and `last_posted` (the
+  real last-message timestamp, only ever set once a backup actually finds message data).
+- **Backup orchestration** (`backup_logic.py`) — decides `archive` vs. `resume` per channel from
+  *local* state (does a non-empty local archive already exist), auto-heals a channel stuck on an
+  unresumable empty archive (wipe + fresh `archive`, never `archive`-over-existing per the
+  documented footgun above), and processes a multi-channel run most-recently-active-first.
+- **Export pipeline** (`export_logic.py`) — three derived, read-only products built from the
+  archive + catalog, detailed in `docs/DESIGN-export.md`: bounded per-channel-month JSON,
+  a cross-workspace digest (with per-channel context and non-image file/Canvas content pulled
+  in), and a full user-profile roster.
+- **Search** (`search_logic.py`) — the one capability that *does* make a live call per
+  invocation (`slackdump search messages`), rendered to one HTML report.
 
-Storage format is slackdump's native **archive** format — one `slackdump.sqlite` database per channel — using slackdump's own `resume` command for incremental updates, rather than a custom NDJSON-append + `last_ts.txt` scheme. This was validated by spike `SlackBackup-d3r`: a real archive-then-resume cycle against a test channel confirmed `resume` correctly fetches only new activity, but also surfaced a confirmed data-loss bug in the `-dedupe` flag (it deletes thread-root message rows — see Known Gaps). Decision: use `resume` without `-dedupe`; accept occasional duplicate rows across resume cycles rather than risk silently losing thread structure.
-
-This project's scope is extraction and durable storage only — see CONTEXT.md Non-Goals. Search and analysis of the archived data are explicitly out of scope and left to a later, separate project.
+This project's git history was squashed to a single initial commit before going public, to avoid
+publishing now-removed `channels-T*.txt` files that mapped DM channel IDs to user IDs (mild PII).
+The repo and its issue tracker (`bd`) otherwise keep full normal history from that point forward.
 
 ---
 
-## Runtime Architecture
+## Data Flow
 
 ```mermaid
-graph LR
-    S["Local cron / GitHub Scheduler / workflow_dispatch"] -->|triggers| W["Backup script"]
-    W -->|reads| C["channels.json"]
-    W -->|reads secrets| GS["Local secrets file / GitHub Secrets"]
-    W -->|invokes| SD["slackdump binary"]
-    SD -->|archive then resume| SL["Slack API"]
-    W -->|reads/writes| AR["Private Archive Repo"]
-    AR -->|contains| BK["backups/&lt;channel-slug&gt;/slackdump.sqlite"]
+flowchart LR
+    subgraph Slack["Slack (cloud)"]
+        API["Slack Web API"]
+    end
+
+    subgraph Bin["slackdump binary (3rd-party — github.com/rusq/slackdump)"]
+        SD["workspace import/select/list · list channels\narchive · resume · convert -f export\nsearch messages · search files"]
+    end
+
+    subgraph App["this app — src/slackbackup/"]
+        SDPY["slackdump.py\n(the only subprocess boundary)"]
+        WSL["workspace_logic.py"]
+        CHL["channel_logic.py"]
+        CATL["catalog_logic.py"]
+        BKL["backup_logic.py"]
+        EXPL["export_logic.py"]
+        SRCHL["search_logic.py"]
+    end
+
+    subgraph Disk["Local files this app reads/writes"]
+        TOK["~/.slackdump-tokens.json\n(xoxc- tokens, gitignored)"]
+        CHJSON["channels.json\n(repo root — tracked-channel list)"]
+        CACHE["~/.cache/slackbackup/\n&lt;workspace&gt;.catalog.json"]
+        ARCH["~/slack-backups/&lt;workspace&gt;/&lt;channel&gt;/\nslackdump.sqlite + __uploads/"]
+        OUT["~/slack-exports/*.json\nsearch-results.html"]
+    end
+
+    API <-->|HTTPS, browser session cookie| SD
+    SD <-->|subprocess: argv in, stdout/JSON out| SDPY
+
+    SDPY --> WSL
+    SDPY --> CHL
+    SDPY --> CATL
+    SDPY --> BKL
+    SDPY --> EXPL
+    SDPY --> SRCHL
+
+    WSL <--> TOK
+    CHL <--> CHJSON
+    CHL --> CATL
+    CATL <--> CACHE
+    BKL --> CHJSON
+    BKL --> CATL
+    BKL <--> ARCH
+    EXPL --> CHJSON
+    EXPL --> CATL
+    EXPL <--> ARCH
+    EXPL --> OUT
+    SRCHL --> OUT
 ```
+
+Reading this diagram: every arrow that touches `API` passes only through the `slackdump`
+binary — no module in `App` ever points at `Slack` directly. `slackdump.py` is the single choke
+point between this app and the binary; every other module calls *it*, never the binary directly
+(enforced by convention, not code — see `catalog_logic.py`'s own docstring: "No code outside
+this module should call `slackdump.list_channels()` directly," and the same pattern holds for
+every other `slackdump.*` function).
 
 ---
 
 ## Building Block View
 
-### Level 1 — System Overview
+### Level 1 — Module responsibilities
 
-| Component | Responsibility |
-|-----------|---------------|
-| `scripts/backup.sh` | Core trigger-agnostic logic: reads `channels.json`, archives or resumes each channel via slackdump, commits/pushes to the archive repo. Invoked directly by local cron, or wrapped by the GitHub Actions workflow. |
-| `.github/workflows/backup.yml` | (Built after local validation, `SlackBackup-dj8`) GitHub Actions trigger + secret injection wrapping `scripts/backup.sh` |
-| `channels.json` | Declares channel IDs and slugs; sole configuration source for which channels are backed up |
-| `scripts/install-slackdump.sh` | Downloads and verifies the slackdump binary at a pinned version |
-| Private archive repo | Stores one `slackdump.sqlite` archive per channel; never cloned publicly; accessed via PAT (GitHub Actions mode) or local git credentials (local cron mode) |
+| Module | Responsibility | Calls `slackdump.py`? |
+|--------|----------------|------------------------|
+| `slackdump.py` | Sole subprocess boundary to the `slackdump` binary. Every other module calls *this*, never `subprocess` directly. | — (is the boundary) |
+| `workspace_logic.py` | Registers a workspace session: looks up its `xoxc-` token in `~/.slackdump-tokens.json`, combines with a freshly-pasted `xoxd-` cookie, hands both to `slackdump workspace import`. | Yes |
+| `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked. | No (via `catalog_logic`) |
+| `catalog_logic.py` | Owns the only call site for `slackdump.list_channels()`. Two-tier cache (fast member-only / expensive full) persisted to `~/.cache/slackbackup/<workspace>.catalog.json`. Also owns `registered_at`/`last_posted`/`effective_recency` — fields with no Slack-API source at all, purely this app's own bookkeeping. | Yes |
+| `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` after a successful backup that found data; orders a multi-channel run by `effective_recency`; timestamped logging + run summary. | Yes |
+| `export_logic.py` | Three read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. | Yes (`convert_export` only) |
+| `search_logic.py` | Cross-workspace live message search → one HTML report. The only capability that makes a real API call on every invocation, no caching. | Yes |
+| `files_logic.py` | Summarizes an existing `index.json`. The producers (`files fetch`/`files index`) are **not yet ported** — see `docs/DESIGN-files.md` — this module only consumes whatever schema they'd produce. | No |
+| `cli.py` / `backup.py` / `channel.py` / `catalog.py` / `export.py` / `search.py` / `workspace.py` / `files.py` | Argparse wiring only — each non-`*_logic.py` module registers its subcommands and translates CLI args into a `*_logic` call. No business logic lives here. | No |
 
----
+### Level 2 — Local storage
 
-## Deployment View
-
-```mermaid
-graph TD
-    subgraph DevSystem["Dev System (local cron)"]
-        LC["crontab"]
-        LS["scripts/backup.sh"]
-        LSEC["local secrets file"]
-    end
-    subgraph PublicRepo["Public Repo (GitHub Actions mode)"]
-        W["backup.yml workflow"]
-        C["channels.json"]
-        SH["scripts/"]
-    end
-    subgraph Runner["GitHub Actions Runner"]
-        JB["Job: backup"]
-    end
-    subgraph ArchiveRepo["Private Archive Repo"]
-        BK["backups/&lt;channel-slug&gt;/slackdump.sqlite"]
-    end
-    LC -->|triggers| LS
-    LSEC -->|read by| LS
-    LS -->|clone + commit + push| BK
-    W -->|runs on| JB
-    C -->|read by| JB
-    SH -->|executed by| JB
-    JB -->|clone + commit + push| BK
-```
-
----
-
-## Crosscutting Concepts
-
-### Secrets Management
-
-Credentials differ by trigger mode but are never written into the archive repo in either case:
-- **GitHub Actions mode**: credentials stored as GitHub repository secrets on the public repo, base64-encoded session file, injected as environment variables into the workflow job.
-- **Local cron mode**: credentials stored in a local secrets file outside the repo (not committed), readable only by the invoking user; slackdump's own per-workspace credential store (`~/.cache/slackdump`) handles the session itself once `workspace new` has been run interactively.
-
-### State Management
-
-Each channel's archive is a single `slackdump.sqlite` database (slackdump's native **archive** format), stored in the private archive repo at `backups/<channel-slug>/slackdump.sqlite`. Absence of the file triggers `slackdump archive` (full fetch) on first run. On subsequent runs, `slackdump resume <path>` (without `-dedupe` — see Known Gaps) fetches only new/changed activity since the last archive. There is no separate timestamp-tracking file; the database itself is the state.
-
-### TDD Test Plan
-
-**E2E Acceptance Tests** — run against the real slackdump binary and a real disposable test channel, not a stub (DevStandard T14):
-1. Incremental logic (UC-1, `SlackBackup-4a8`): `archive` then `resume` a real test channel; verify only new messages are added and no existing messages are lost or duplicated.
-2. Full re-sync (UC-2, `SlackBackup-03m`): verify `archive` (ignoring any prior state) reproduces full channel history.
-3. Idempotency / partial-failure recovery: run the backup twice in sequence, including one run interrupted mid-write, against the real test channel; assert no duplicate or missing messages (T8/T22 — see Known Gaps).
-
-**Fixture-based tests** (no external boundary, real-channel realism not required):
-4. Multi-channel (UC-3, `SlackBackup-c86`): verify exactly N archive files are created/updated for an N-channel `channels.json`.
-5. Commit/push: verify git detects changes and pushes to the archive repo.
-
-**Unit Tests** (`scripts/`, `SlackBackup-jcf`):
-1. `parse_channels`: validate channels.json schema — array of objects with `id` (string) and `name` (string) fields.
+| Location | Owner | Contents | Disposable? |
+|----------|-------|----------|-------------|
+| `~/.slackdump-tokens.json` | Operator (manual) | `{workspace: xoxc-token}` — gitignored, lives outside the repo | No — re-acquiring a token is a manual browser step |
+| `channels.json` (repo root) | `channel_logic.py` | `[{id, name, workspace}, ...]` — the tracked-channel list, intentionally minimal | No — this *is* the configuration |
+| `~/.cache/slackbackup/<workspace>.catalog.json` | `catalog_logic.py` | Per-channel: member/name/description/is_private/is_archived/creator/created (Slack-mirrored) + registered_at/last_posted (this app's own) | **Yes** — deleting it just forces a rebuild via `list channels` on next use; `registered_at`/`last_posted` history is lost, not catastrophic |
+| `~/slack-backups/<workspace>/<channel>/slackdump.sqlite` (+`__uploads/`) | `slackdump` binary, orchestrated by `backup_logic.py` | The durable source of truth — full message history + downloaded file blobs | **No** — this is the actual backup; nothing else replaces it |
+| `~/slack-exports/*.json`, `search-results.html` | `export_logic.py` / `search_logic.py` | Fully derived, regenerable any time from the archive + catalog | Yes — pure output, never read back as input |
 
 ---
 
 ## Known Gaps & Recommendations
 
-Identified during a design review against `../DevStandard` SDLC/ATDD standards and the current (v4.4.0) capabilities of slackdump. Scoped to the project's actual goal — reliable, lossless extraction and storage; search/analysis is out of scope (see CONTEXT.md Non-Goals).
-
-### P1 — Address before further implementation
-
 | Gap | Assessment | Recommendation |
 |-----|-----------|-----------------|
-| Bespoke incremental logic duplicates a slackdump built-in | slackdump natively supports resuming a previous archive (adding only new messages), built for the exact 90-day free-workspace constraint this project targets. The original `scripts/incremental-dump.sh` + `last_ts.txt` design reimplemented that logic in custom shell. | **Resolved.** `SlackBackup-d3r` spike confirmed native `archive`/`resume` covers UC-1/UC-2; `SlackBackup-4i2` (custom logic) closed as superseded. The spike also surfaced a real bug: `resume -dedupe` deletes thread-root message rows (verified by diffing against an independent fresh archive — 9/9 thread parents missing). Decision: use `resume` without `-dedupe`. |
-| E2E test plan mocks the external boundary | DESIGN.md's TDD Test Plan stubs slackdump for E2E tests. DevStandard `sdlc-testing-principles.md` T14 prohibits mocking external platform boundaries — for a tool whose only job is "don't lose messages," the real slackdump↔Slack API boundary is exactly the thing that must be exercised for real. | **Resolved in design.** TDD Test Plan above now specifies real slackdump + a real disposable test channel for UC-1/UC-2; the spike itself demonstrated why — the `-dedupe` bug was only visible against real data, a stub would have hidden it entirely. |
-| No idempotency / partial-failure-recovery test coverage | Rerunning after a partial failure is the actual data-loss scenario this project exists to prevent, per T8 (idempotency) and T22 (risk-ordered coverage). | **Resolved in design.** TDD Test Plan above adds an explicit idempotency/partial-failure scenario (item 3). |
-| Twin-track lifecycle (I2) not reflected in bd issues | All 9 open issues have empty descriptions/acceptance criteria and are sequenced waterfall-style (red-phase test issues block implementation issues) rather than DevStandard's twin-track `[IMP]`/`[TST]` pairs built in parallel against a shared pre-code contract (I4). | Add the I4 contract (entry-point signature, completion signal, output schema) to each issue's description before claiming it; restructure as parallel `[IMP]`/`[TST]` pairs if continuing to follow the framework strictly. |
-| No ADRs recorded | `docs/adr/` is empty. Of the three candidate decisions, only the **public/private repo credential split** clearly earns an ADR on its own (real security tradeoff, costly to silently violate later). NDJSON-format-no-conversion is pending the `SlackBackup-d3r` spike outcome; wiz-only auth is a direct consequence of the "no admin access" constraint already in CONTEXT.md and would mostly restate it. | Hold off on ADRs until the spike resolves; reconsider whether an ADR is worth the overhead at all for a project this size, versus the credential-split ADR being the one clear exception. |
-
-### P2 — Operational risks, lower urgency
-
-| Gap | Assessment | Recommendation |
-|-----|-----------|-----------------|
-| No failure-alerting use case | Quality Goal #1 promises "no silent data loss," but slackdump's session cookie will eventually expire or be revoked (password change, periodic re-auth), and a scheduled job that just logs and exits on auth failure is silent from the operator's perspective. | Add a UC/AC: operator is notified (e.g. failed-run GitHub notification, or a check that fails loudly) when a scheduled run fails, not just "failure is logged." |
-| GitHub Actions disables idle scheduled workflows | GitHub auto-disables `schedule:`-triggered workflows after 60 days with no repo activity — a real risk for a low-traffic personal fork. "Activity" is not human login — confirmed (GitHub Discussions, community reports) to mean repo-level events: commits/pushes, PRs, and issues. A second, independently-active GitHub project can keep this repo alive by using a PAT to push a real commit (or open/close an issue) on a schedule, which resets the clock. A *self-referencing* keepalive schedule in the same repo does not reliably bootstrap itself — if this repo's own scheduled triggers are ever disabled, that keepalive schedule is disabled along with everything else, so the reset has to come from outside. | **Resolved by design:** local cron is now a first-class trigger mode (see Solution Strategy), not a fallback — it sidesteps the rule entirely since there's no GitHub-side schedule to disable. GitHub Actions remains a second, redundant trigger mode built after the local path is proven. Document the dormancy constraint in OPERATIONS.md once written, for anyone relying on the GitHub Actions mode alone. |
-| `docs/OPERATIONS.md` does not exist yet | Failure modes, recovery procedures, and the alerting/dormancy items above have no home yet. | Create `docs/OPERATIONS.md` per this project's document map before implementing UC-1, so failure-mode behavior is specified alongside the happy path rather than added after the fact. |
+| `files fetch`/`files index` not ported to Python | Designed in `docs/DESIGN-files.md`, implemented as shell (`scripts/fetch-files.sh`, `scripts/build-file-index.sh`) but never ported — `files.py`'s handlers still raise `NotImplementedError`. | Port when the cross-channel file-harvesting use case is actually needed; `files_logic.py`'s `summarize()` already works against whatever `index.json` they'd produce. |
+| What happens if `archive` is killed mid-fetch is unverified | Each channel's own state is self-healing across a clean stop/restart (idempotent per-channel archive/resume), but an interrupted `archive` call's partial-write behavior hasn't been tested against the real binary. | Worth a real test before relying on "Ctrl-C anytime" as a hard guarantee for a long multi-channel `backup run`. |
+| No alerting on a failed unattended run | The nightly Windows Task Scheduler job logs to `~/slack-backups/nightly.log`, but nothing notifies the operator if it fails — failure is silent until someone checks. | Add a simple failure notification (e.g. a check that fails loudly, or a notification step) if unattended reliability becomes a real concern. |
 
 ---
 
 ## References
 
-| Document | Location | Covers |
-|----------|----------|--------|
-| slackdump | https://github.com/rusq/slackdump | CLI flags, wiz auth, output format |
+| Document | Covers |
+|----------|--------|
+| `docs/CONTEXT.md` | Purpose, capabilities, use cases, non-goals |
+| `docs/DESIGN-export.md` | `export monthly`/`export digest`/`export users` — schemas, sealing, leadership inference, file content extraction |
+| `docs/DESIGN-files.md` | Channel catalog (implemented) + Canvas/file harvesting (designed, not yet ported) |
+| `docs/references/slackdump-cli-notes.md` | slackdump CLI behavior/cost/gotchas confirmed empirically — read before re-deriving anything about how slackdump itself behaves |
+| slackdump | https://github.com/rusq/slackdump — CLI flags, auth, output formats |

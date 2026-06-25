@@ -17,3 +17,12 @@ __pycache__/
 *.slackdump-tokens.json
 *token*.json
 *cookie*
+
+# Generated outputs (real Slack content) - belong in ~/slack-backups /
+# ~/slack-exports, never in this repo.
+search-results.html
+
+# Operator's real tracked-channel list - grows via `channel register`/
+# `channel register-matching`, reveals which real workspaces/channels are
+# being backed up. Not source; never committed.
+channels.json

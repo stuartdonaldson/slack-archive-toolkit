@@ -1,6 +1,6 @@
 [project]
 name = "slackbackup"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local backup/export/catalog/search tooling for slackdump-archived Slack workspaces"
 requires-python = ">=3.10"
 dependencies = []

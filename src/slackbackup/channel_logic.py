@@ -5,14 +5,27 @@ parts. Channel lookup-by-name/id is delegated to catalog_logic.lookup().
 """
 from __future__ import annotations
 
+import fnmatch
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import catalog_logic
+from . import catalog_logic, workspace_logic
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class ChannelError(RuntimeError):
     pass
+
+
+_GLOB_CHARS = set("*?[")
+
+
+def is_glob(query: str) -> bool:
+    return any(c in _GLOB_CHARS for c in query)
 
 
 def validate(channels_file: Path) -> list[dict]:
@@ -52,7 +65,10 @@ def save(channels_file: Path, entries: list[dict]) -> None:
     tmp.replace(channels_file)
 
 
-def register(workspace: str, query: str, channels_file: Path) -> tuple[str, str, bool]:
+def register(
+    workspace: str, query: str, channels_file: Path,
+    cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+) -> tuple[str, str, bool]:
     """Looks up `query` (a channel name, optionally with a leading '#', or a
     raw channel id) in `workspace` via the catalog, and appends it to
     `channels_file` if not already present.
@@ -61,7 +77,7 @@ def register(workspace: str, query: str, channels_file: Path) -> tuple[str, str,
     Raises ChannelError on no match or an ambiguous (>1) match.
     """
     query = query.lstrip("#")
-    matches = catalog_logic.lookup(workspace, query)
+    matches = catalog_logic.lookup(workspace, query, cache_dir=cache_dir)
 
     if not matches:
         raise ChannelError(f"no channel matching '{query}' found in workspace '{workspace}'")
@@ -79,7 +95,69 @@ def register(workspace: str, query: str, channels_file: Path) -> tuple[str, str,
 
     entries.append({"id": channel_id, "name": channel_name, "workspace": workspace})
     save(channels_file, entries)
+    catalog_logic.set_registered_at(cache_dir, workspace, channel_id, _now_iso())
     return channel_id, channel_name, False
+
+
+def register_matching(
+    workspace_glob: str, channel_glob: str, channels_file: Path,
+    cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+) -> dict:
+    """Bulk variant of register(): registers every not-yet-tracked, public,
+    non-archived channel whose name matches `channel_glob`, in every
+    known+registered workspace matching `workspace_glob` (e.g.
+    workspace_glob="f3*", channel_glob="*" picks up every new public
+    channel across all f3* workspaces - run nightly to stop catching
+    missed channels like "disc-it" by hand).
+
+    Always matches against the FULL catalog tier (every public channel,
+    not just ones we're a member of) - membership isn't required to read
+    or archive a public channel (confirmed empirically, see
+    docs/DESIGN-files.md). Private and archived channels are always
+    skipped regardless of the glob - this is meant to catch newly-created
+    *public* channels, not to silently sweep in archived/closed-out
+    channels (confirmed ~30% of a real workspace's full channel list) or
+    private ones the session happens to be a member of. Channels named
+    "shuttered*" are also always skipped - this F3 community's own naming
+    convention for a closed-out AO, which Slack's is_archived flag does
+    not reliably reflect (confirmed: most shuttered-named channels are
+    not actually archived in Slack's own data). Returns {"added": [...],
+    "workspaces_checked": [...], "workspaces_skipped_unregistered": [...]}.
+    """
+    status = workspace_logic.status()
+    matched_workspaces = [w for w in status["known"] if fnmatch.fnmatch(w["name"], workspace_glob)]
+    workspaces_checked = sorted(w["name"] for w in matched_workspaces if w["registered"])
+    workspaces_skipped = sorted(w["name"] for w in matched_workspaces if not w["registered"])
+
+    entries = load(channels_file)
+    existing = {(e["id"], e["workspace"]) for e in entries}
+    added = []
+    now = _now_iso()
+
+    for workspace in workspaces_checked:
+        catalog = catalog_logic.refresh_full(workspace, cache_dir=cache_dir)
+        for channel_id, channel in catalog["channels"].items():
+            if channel.get("is_private") or channel.get("is_archived"):
+                continue
+            if channel["name"].lower().startswith("shuttered"):
+                continue
+            if not fnmatch.fnmatch(channel["name"], channel_glob):
+                continue
+            if (channel_id, workspace) in existing:
+                continue
+            entries.append({"id": channel_id, "name": channel["name"], "workspace": workspace})
+            existing.add((channel_id, workspace))
+            added.append({"id": channel_id, "name": channel["name"], "workspace": workspace})
+            catalog_logic.set_registered_at(cache_dir, workspace, channel_id, now)
+
+    if added:
+        save(channels_file, entries)
+
+    return {
+        "added": added,
+        "workspaces_checked": workspaces_checked,
+        "workspaces_skipped_unregistered": workspaces_skipped,
+    }
 
 
 def list_for_workspace(workspace: str, channels_file: Path) -> list[dict]:

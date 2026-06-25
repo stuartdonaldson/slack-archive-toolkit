@@ -4,12 +4,28 @@ backup.sh + run-backups.sh.
 """
 from __future__ import annotations
 
+import heapq
+import shutil
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import catalog_logic, channel_logic, slackdump
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _log(msg: str, file=None) -> None:
+    # flush=True: stdout is fully block-buffered (not line-buffered) once
+    # redirected to a file/pipe rather than a tty - without this, a log
+    # tailed via `tail -f` during a long-running backup looks stale for
+    # minutes at a time, only catching up when the buffer fills or the
+    # process exits.
+    print(f"{_ts()} {msg}", file=file, flush=True)
 
 
 def channel_dir(archive_root: Path, workspace: str, channel_slug: str) -> Path:
@@ -19,56 +35,199 @@ def channel_dir(archive_root: Path, workspace: str, channel_slug: str) -> Path:
     return archive_root / workspace / channel_slug
 
 
+def _max_message_ts(db_path: Path) -> str | None:
+    """Real last-post time (ISO8601 UTC) from this archive's own message
+    data, or None if there's no data to read (0 messages, or a malformed/
+    placeholder file) - the caller falls back to registered_at instead of
+    writing a bogus value in that case."""
+    if not db_path.exists():
+        # sqlite3.connect() would silently create an empty file here -
+        # never do that as a side effect of just reading.
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT MAX(ts) FROM MESSAGE").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    return datetime.fromtimestamp(float(row[0]), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def backup_channel(
     channel_id: str,
     channel_slug: str,
     workspace: str,
     archive_root: Path,
     full: bool = False,
-) -> None:
+    cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+) -> str:
+    """Returns "archive" or "resume" - which path was taken, for the
+    caller's own summary/tally. A full re-sync always counts as "archive"."""
     slackdump.select_workspace_or_die(workspace)
     archive_root.mkdir(parents=True, exist_ok=True)
 
     if full:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         full_dir = archive_root / workspace / f"{channel_slug}-full-{stamp}"
-        print(
+        _log(
             f"backup: full re-sync requested — archiving into fresh dir {full_dir} "
             "(incremental archive untouched)"
         )
         slackdump.archive(channel_id, full_dir)
-        return
+        return "archive"
 
     channel_directory = channel_dir(archive_root, workspace, channel_slug)
     db_path = channel_directory / "slackdump.sqlite"
 
-    if db_path.exists():
-        print(f"backup: existing archive found at {db_path} — resuming")
-        # -dedupe deliberately never passed: confirmed to delete thread-root
-        # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles.
-        slackdump.resume(channel_directory)
-    else:
-        print(f"backup: no existing archive — running full archive into {channel_directory}")
+    if not db_path.exists():
+        _log(f"backup: no existing archive — running full archive into {channel_directory}")
         slackdump.archive(channel_id, channel_directory)
+        catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+        return "archive"
+
+    try:
+        count = _message_count(db_path)
+    except sqlite3.Error:
+        # Malformed/unreadable local file - treat the same as "empty",
+        # since there's no usable checkpoint for resume either way.
+        count = 0
+
+    if count == 0:
+        # resume reads its continuation point from this file's own session/
+        # chunk bookkeeping; a 0-message archive has none, so resume always
+        # errors before even calling the API (see SlackBackup-8ew) - it can
+        # never self-heal even after the channel gets real posts. archive
+        # is only safe against an empty/new directory (re-running it over an
+        # existing one duplicates data - slackdump-cli-notes.md), so wipe
+        # the stale empty dir first rather than archiving on top of it.
+        _log(
+            f"backup: existing archive at {db_path} has 0 messages — resume cannot "
+            "continue from an empty checkpoint; wiping and re-archiving fresh"
+        )
+        shutil.rmtree(channel_directory)
+        slackdump.archive(channel_id, channel_directory)
+        catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+        return "archive"
+
+    _log(f"backup: existing archive found at {db_path} — resuming")
+    # -dedupe deliberately never passed: confirmed to delete thread-root
+    # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles.
+    slackdump.resume(channel_directory)
+    catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+    return "resume"
 
 
-def run(channels_file: Path, archive_root: Path, full: bool = False) -> bool:
-    """Returns True if every channel backed up successfully."""
+def _interleave_by_workspace(entries: list[dict]) -> list[dict]:
+    """Reorders entries (each already sorted most-recent-first *within* its
+    own workspace by the caller) so consecutive channels alternate across
+    workspaces as much as possible, minimizing back-to-back calls against
+    the same workspace's Slack rate-limit bucket - confirmed per-workspace,
+    not global, so spreading calls across workspaces lets one workspace's
+    bucket refill while we work another. Greedy: always take next from
+    whichever workspace currently has the most entries left (classic
+    "task scheduler" / "reorganize string" approach - optimal spacing for
+    uneven group sizes), only repeating the immediately preceding workspace
+    when no other workspace has anything left."""
+    queues: dict[str, list[dict]] = {}
+    for entry in entries:
+        queues.setdefault(entry["workspace"], []).append(entry)
+
+    heap = [(-len(items), ws) for ws, items in queues.items()]
+    heapq.heapify(heap)
+
+    result: list[dict] = []
+    last_ws: str | None = None
+    while heap:
+        neg_count, ws = heapq.heappop(heap)
+        if ws == last_ws and heap:
+            neg_count2, ws2 = heapq.heappop(heap)
+            heapq.heappush(heap, (neg_count, ws))
+            neg_count, ws = neg_count2, ws2
+
+        result.append(queues[ws].pop(0))
+        last_ws = ws
+        if queues[ws]:
+            heapq.heappush(heap, (-len(queues[ws]), ws))
+
+    return result
+
+
+def run(
+    channels_file: Path,
+    archive_root: Path,
+    full: bool = False,
+    cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+) -> bool:
+    """Returns True if every channel backed up successfully. Within each
+    workspace, channels are ordered most-recently-active first (real
+    last_posted if a backup has ever found message data, else the
+    registered_at fallback - see catalog_logic.effective_recency) - so if
+    the run is interrupted, the channels we have the most reason to care
+    about have already been covered. Across workspaces, channels are then
+    interleaved (see _interleave_by_workspace) rather than processed one
+    workspace at a time, since Slack's rate limit is per-workspace - this
+    spreads calls out so one workspace's bucket has time to refill while
+    others are being worked, instead of exhausting one bucket completely
+    before moving to the next."""
     entries = channel_logic.validate(channels_file)
 
     for workspace in sorted({entry["workspace"] for entry in entries}):
-        catalog_logic.refresh_fast(workspace)
+        catalog_logic.refresh_fast(workspace, cache_dir=cache_dir)
+
+    catalog_cache: dict[str, dict] = {}
+    for entry in entries:
+        workspace = entry["workspace"]
+        if workspace not in catalog_cache:
+            catalog_cache[workspace] = catalog_logic.load(cache_dir, workspace)
+    entries = sorted(
+        entries,
+        key=lambda e: catalog_logic.effective_recency(catalog_cache[e["workspace"]], e["id"]),
+        reverse=True,
+    )
+    entries = _interleave_by_workspace(entries)
 
     all_ok = True
-    for entry in entries:
-        print(f"backup run: backing up {entry['name']} ({entry['id']}) in {entry['workspace']}")
-        try:
-            backup_channel(entry["id"], entry["name"], entry["workspace"], archive_root, full)
-        except slackdump.SlackdumpError as exc:
-            print(f"backup run: backup failed for {entry['name']} ({entry['id']}): {exc}", file=sys.stderr)
-            all_ok = False
+    counts = {"archive": 0, "resume": 0, "failed": 0}
+    run_start = time.monotonic()
 
+    for entry in entries:
+        _log(f"backup run: backing up {entry['name']} ({entry['id']}) in {entry['workspace']}")
+        channel_start = time.monotonic()
+        try:
+            kind = backup_channel(
+                entry["id"], entry["name"], entry["workspace"], archive_root, full, cache_dir=cache_dir
+            )
+            elapsed = time.monotonic() - channel_start
+            _log(f"backup run: finished {entry['name']} in {entry['workspace']} ({kind}, {elapsed:.1f}s)")
+            counts[kind] += 1
+        except slackdump.SlackdumpError as exc:
+            elapsed = time.monotonic() - channel_start
+            _log(
+                f"backup run: backup failed for {entry['name']} ({entry['id']}) after {elapsed:.1f}s: {exc}",
+                file=sys.stderr,
+            )
+            all_ok = False
+            counts["failed"] += 1
+
+    total_elapsed = time.monotonic() - run_start
+    _log(
+        f"backup run: done - {len(entries)} channel(s), {counts['archive']} archive(s), "
+        f"{counts['resume']} resume(s), {counts['failed']} failure(s), "
+        f"{total_elapsed / 60:.1f} min total"
+    )
     return all_ok
+
+
+def _message_count(db_path: Path) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM MESSAGE").fetchone()[0]
+    finally:
+        conn.close()
 
 
 def _local_status(db_path: Path) -> dict:
@@ -77,12 +236,7 @@ def _local_status(db_path: Path) -> dict:
     if not db_path.exists():
         return {"archived": False, "message_count": None, "last_modified": None}
 
-    conn = sqlite3.connect(db_path)
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM MESSAGE").fetchone()[0]
-    finally:
-        conn.close()
-
+    count = _message_count(db_path)
     mtime = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc)
     return {
         "archived": True,
@@ -101,3 +255,35 @@ def list_status(channels_file: Path, archive_root: Path) -> list[dict]:
         status = _local_status(db_path)
         rows.append({**entry, **status})
     return rows
+
+
+def sync_catalog_from_local(
+    channels_file: Path,
+    archive_root: Path,
+    cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+) -> dict:
+    """Backfills the catalog's last_posted/registered_at purely from local
+    archives already on disk - no API calls, safe to run any time (e.g.
+    after interrupting a `backup run` mid-flight, when many channels were
+    actually backed up by the now-dead process before it had this
+    bookkeeping wired in). For each tracked channel: if its local archive
+    has real message data, stamp last_posted from MAX(ts); otherwise stamp
+    registered_at with now (set_registered_at is idempotent - a no-op if
+    a real registered_at is already on record, so this never clobbers a
+    true earlier value, it just ensures every channel has *some* recency
+    signal). Returns {"last_posted": n, "registered_at": m, "total": t}."""
+    entries = channel_logic.validate(channels_file)
+    counts = {"last_posted": 0, "registered_at": 0, "total": len(entries)}
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for entry in entries:
+        db_path = channel_dir(archive_root, entry["workspace"], entry["name"]) / "slackdump.sqlite"
+        last_posted = _max_message_ts(db_path)
+        if last_posted:
+            catalog_logic.update_last_posted(cache_dir, entry["workspace"], entry["id"], last_posted)
+            counts["last_posted"] += 1
+        else:
+            catalog_logic.set_registered_at(cache_dir, entry["workspace"], entry["id"], now)
+            counts["registered_at"] += 1
+
+    return counts

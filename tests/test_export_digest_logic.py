@@ -5,11 +5,21 @@ same underlying fixtures.
 """
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 
-from slackbackup import export_logic
+from slackbackup import catalog_logic, export_logic
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
+
+
+def _make_file_db(path: Path, files: list[dict]) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT)")
+    for f in files:
+        conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (f["id"], json.dumps(f)))
+    conn.commit()
+    conn.close()
 
 A_TS = "1775811600.000100"
 A1_TS = "1775811900.000100"
@@ -89,6 +99,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
 
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
     )
 
     assert result["schema_version"] == "slack-llm-digest-v1"
@@ -108,7 +119,445 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
     assert "authors" not in result
 
     # Fixture display names ("Al", "Caz", ...) carry no leadership signal.
-    assert result["leadership"] == {"raw_profile_matches": [], "by_region": []}
+    assert result["leadership"] == {"profile_role_matches": [], "by_region": []}
+
+
+def test_build_digest_thread_rollup_fields_on_parent_message(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    parent_a = next(m for m in result["messages"] if m["ts"] == A_TS)
+    # parent_a (U0A) has two replies, both from U0B - 2 distinct
+    # participants across root + replies, not 3.
+    assert parent_a["reply_count"] == 2
+    assert parent_a["thread_participant_count"] == 2
+    assert parent_a["thread_last_reply_utc"] == "2026-04-11T10:00:00Z"
+
+    parent_b = next(m for m in result["messages"] if m["ts"] == B_TS)
+    assert parent_b["reply_count"] == 1
+    assert parent_b["thread_participant_count"] == 2
+    assert parent_b["thread_last_reply_utc"] == "2026-05-02T08:00:00Z"
+
+    standalone_c = next(m for m in result["messages"] if m["ts"] == C_TS)
+    assert "reply_count" not in standalone_c
+
+
+def test_build_digest_manifest_describes_counting_rules(tmp_path):
+    archive_root = tmp_path / "archive"
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["manifest"]["workspaces_included"] == 0
+    assert "root_message_count" in result["manifest"]["counting_rules"]
+    assert result["manifest"]["known_limitations"]
+
+
+def test_build_digest_workspace_activity_index_excludes_bot_channel_from_human_variant(tmp_path):
+    archive_root = tmp_path / "archive"
+    active_dir = archive_root / "f3pugetsound" / "helpdesk"
+    active_dir.mkdir(parents=True)
+    (active_dir / "slackdump.sqlite").write_bytes(b"")
+    bot_dir = archive_root / "f3pugetsound" / "bot-logs"
+    bot_dir.mkdir(parents=True)
+    (bot_dir / "slackdump.sqlite").write_bytes(b"")
+    quiet_dir = archive_root / "f3pugetsound" / "quiet"
+    quiet_dir.mkdir(parents=True)
+    (quiet_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "bot-logs", "workspace": "f3pugetsound"},
+        {"id": "C3", "name": "quiet", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_fn(channel_dir: Path, out_dir: Path) -> None:
+        if channel_dir.name == "bot-logs":
+            (out_dir / "bot-logs").mkdir(parents=True)
+            day = out_dir / "bot-logs" / "2026-06-01.json"
+            day.write_text(json.dumps([
+                {"type": "message", "bot_id": "BBOT1", "username": "Log Bot", "ts": "1780300800.000100",
+                 "text": "bot-only channel, 500 messages worth of logs"},
+            ]))
+            (out_dir / "users.json").write_text("[]")
+        elif channel_dir.name == "quiet":
+            (out_dir / "quiet").mkdir(parents=True)
+            (out_dir / "users.json").write_text("[]")
+        else:
+            _fake_convert(channel_dir, out_dir)
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    index = next(w for w in result["workspace_activity_index"] if w["workspace"] == "f3pugetsound")
+    assert index["channel_count"] == 3
+    assert index["active_channel_count"] == 2
+    assert index["inactive_channel_count"] == 1
+    assert index["inactive_channels"] == ["quiet"]
+    # bot-logs has more total messages than helpdesk would on its own in a
+    # single-message comparison, but here helpdesk (8) beats bot-logs (1)
+    # on total_message_count, so most_active_channel is still helpdesk -
+    # the human-exclusion only matters when a bot channel would otherwise win.
+    assert index["most_active_channel"]["channel"] == "helpdesk"
+    assert index["most_active_human_channel"]["channel"] == "helpdesk"
+
+
+def test_build_digest_most_active_human_channel_excludes_bot_posting_as_ordinary_user(tmp_path):
+    """Regression for the real f3kirkland nation_bot_logs bot: it posts
+    via an ordinary "U..." user account flagged is_bot in the roster, not
+    via Slack's legacy bot_id field, so only the roster's is_bot flag (not
+    a bot_id-prefix check) catches it."""
+    archive_root = tmp_path / "archive"
+    quiet_human_dir = archive_root / "f3pugetsound" / "quiet-human"
+    quiet_human_dir.mkdir(parents=True)
+    (quiet_human_dir / "slackdump.sqlite").write_bytes(b"")
+    bot_dir = archive_root / "f3pugetsound" / "bot-logs"
+    bot_dir.mkdir(parents=True)
+    (bot_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "quiet-human", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "bot-logs", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_fn(channel_dir: Path, out_dir: Path) -> None:
+        out = out_dir / channel_dir.name
+        out.mkdir(parents=True)
+        (out_dir / "users.json").write_text(json.dumps([
+            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
+            {"id": "U0BOT", "name": "f3_nation", "real_name": "F3 Nation", "profile": {}, "is_bot": True},
+        ]))
+        if channel_dir.name == "bot-logs":
+            (out / "2026-06-01.json").write_text(json.dumps([
+                {"type": "message", "user": "U0BOT", "ts": f"178030{i:04d}.000100", "text": f"log line {i}"}
+                for i in range(5)
+            ]))
+        else:
+            (out / "2026-06-02.json").write_text(json.dumps([
+                {"type": "message", "user": "U0A", "ts": "1780387200.000100", "text": "one human post"},
+            ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    index = next(w for w in result["workspace_activity_index"] if w["workspace"] == "f3pugetsound")
+    assert index["most_active_channel"]["channel"] == "bot-logs"
+    assert index["most_active_human_channel"]["channel"] == "quiet-human"
+
+
+def test_build_digest_most_active_channel_excludes_bot_only_channel_when_it_would_otherwise_win(tmp_path):
+    archive_root = tmp_path / "archive"
+    quiet_human_dir = archive_root / "f3pugetsound" / "quiet-human"
+    quiet_human_dir.mkdir(parents=True)
+    (quiet_human_dir / "slackdump.sqlite").write_bytes(b"")
+    bot_dir = archive_root / "f3pugetsound" / "bot-logs"
+    bot_dir.mkdir(parents=True)
+    (bot_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "quiet-human", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "bot-logs", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_fn(channel_dir: Path, out_dir: Path) -> None:
+        out = out_dir / channel_dir.name
+        out.mkdir(parents=True)
+        (out_dir / "users.json").write_text(json.dumps([
+            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
+        ]))
+        if channel_dir.name == "bot-logs":
+            (out / "2026-06-01.json").write_text(json.dumps([
+                {"type": "message", "bot_id": "BBOT1", "username": "Log Bot", "ts": f"178030{i:04d}.000100",
+                 "text": f"log line {i}"}
+                for i in range(5)
+            ]))
+        else:
+            (out / "2026-06-02.json").write_text(json.dumps([
+                {"type": "message", "user": "U0A", "ts": "1780387200.000100", "text": "one human post"},
+            ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    index = next(w for w in result["workspace_activity_index"] if w["workspace"] == "f3pugetsound")
+    assert index["most_active_channel"]["channel"] == "bot-logs"
+    assert index["most_active_human_channel"]["channel"] == "quiet-human"
+
+
+CANVAS_FILE = {
+    "id": "F05KESM0B7C", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q/Schedule",
+    "mimetype": "application/vnd.slack-docs", "filetype": "quip", "pretty_type": "Canvas",
+    "user": "U77PPNBFD", "created": 1690756854, "size": 2776,
+    "permalink": "https://f3pugetsound.slack.com/docs/T78NKT50E/F05KESM0B7C",
+}
+IMAGE_FILE = {
+    "id": "F0BBJTND1KR", "name": "1014.jpg", "title": "1014.jpg", "mimetype": "image/jpeg",
+    "filetype": "jpg", "pretty_type": "JPEG", "user": "U01FVGV2QJZ", "created": 1700000500, "size": 605011,
+    "permalink": "https://f3pugetsound.slack.com/files/U05DA6X8ZUZ/F0BBJTND1KR/1014.jpg",
+}
+
+
+def test_load_channel_files_excludes_images_and_includes_canvases(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert [f["id"] for f in files] == ["F05KESM0B7C"]
+    canvas = files[0]
+    assert canvas["name"] == "Upcoming_Q_Schedule"
+    assert canvas["title"] == "Upcoming Q/Schedule"
+    assert canvas["pretty_type"] == "Canvas"
+    assert canvas["creator"] == "U77PPNBFD"
+    assert canvas["created_at"] == "2023-07-30T22:40:54Z"
+    assert canvas["permalink"] == CANVAS_FILE["permalink"]
+
+
+def test_load_channel_files_sets_local_path_only_when_file_exists_on_disk(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<html>schedule</html>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["local_path"] == "f3pugetsound/ao-active-book-club/__uploads/F05KESM0B7C/Upcoming_Q_Schedule"
+
+
+def test_html_to_text_extracts_blocks_and_table_cells():
+    raw = (
+        "<div class=\"quip-canvas-content\"><h1>Schedule</h1>"
+        "<p>Intro line.</p>"
+        "<table><tr><td>Date</td><td>Q</td></tr>"
+        "<tr><td>May 31</td><td><a>@U123</a></td></tr></table></div>"
+    )
+    text = export_logic._html_to_text(raw)
+    assert "Schedule" in text.splitlines()
+    assert "Intro line." in text
+    assert "Date | Q" in text
+    assert "May 31 | @U123" in text
+
+
+def test_extract_file_content_parses_html_like_mimetype(tmp_path):
+    path = tmp_path / "Upcoming_Q_Schedule"
+    path.write_text("<p>Read this</p>")
+    content = export_logic._extract_file_content("application/vnd.slack-docs", path)
+    assert content == "Read this"
+
+
+def test_extract_file_content_reads_plain_text_verbatim(tmp_path):
+    path = tmp_path / "notes.txt"
+    path.write_text("plain notes\nline two")
+    content = export_logic._extract_file_content("text/plain", path)
+    assert content == "plain notes\nline two"
+
+
+def test_extract_file_content_none_for_unsupported_mimetype(tmp_path):
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"%PDF-1.4 fake")
+    assert export_logic._extract_file_content("application/pdf", path) is None
+
+
+def test_extract_file_content_none_when_no_local_path():
+    assert export_logic._extract_file_content("text/plain", None) is None
+
+
+def test_load_channel_files_includes_extracted_content_for_canvas(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<h1>Upcoming Q/Schedule</h1><p>Coverage needed.</p>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert "Upcoming Q/Schedule" in files[0]["content"]
+    assert "Coverage needed." in files[0]["content"]
+
+
+def test_load_channel_files_content_is_none_when_blob_never_downloaded(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["content"] is None
+
+
+def test_load_channel_files_local_path_is_none_when_blob_was_never_downloaded(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["local_path"] is None
+
+
+def test_load_channel_files_dedupes_by_id_across_resume_cycles(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert len(files) == 1
+
+
+def test_load_channel_files_returns_empty_for_malformed_or_missing_archive(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    assert export_logic._load_channel_files(channel_dir) == []  # no slackdump.sqlite at all
+
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")  # 0-byte placeholder
+    assert export_logic._load_channel_files(channel_dir) == []
+
+
+def test_build_digest_includes_non_image_files_per_channel(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+
+    db_path = channel_dir / "slackdump.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT)")
+    conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (CANVAS_FILE["id"], json.dumps(CANVAS_FILE)))
+    conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (IMAGE_FILE["id"], json.dumps(IMAGE_FILE)))
+    conn.commit()
+    conn.close()
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert [f["id"] for f in meta["files"]] == ["F05KESM0B7C"]
+
+
+def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    cache_dir = tmp_path / "cache"
+    catalog = catalog_logic.load(cache_dir, "f3pugetsound")
+    catalog["channels"]["C1"] = {
+        "member": True, "name": "helpdesk", "description": "Ask anything here",
+        "is_private": False, "is_archived": False, "creator": "U999", "created": 1700000000,
+    }
+    catalog_logic.save(cache_dir, "f3pugetsound", catalog)
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=cache_dir,
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta["description"] == "Ask anything here"
+    assert meta["creator"] == "U999"
+    assert meta["created_at"] == "2023-11-14T22:13:20Z"
+
+
+def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "never-warmed-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta == {
+        "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok", "files": [],
+        "description": None, "creator": None, "created_at": None,
+        "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
+        "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
+        "activity_status": "active", "activity_status_basis": "has messages during export_scope",
+    }
+
+
+def test_build_digest_leadership_includes_workspace_admin_without_title_match(tmp_path):
+    """A Slack workspace admin/owner is an authoritative leadership signal
+    on its own - they should surface in leadership even if their display
+    name carries no F3 title keyword."""
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_with_admin(channel_dir: Path, out_dir: Path) -> None:
+        _fake_convert(channel_dir, out_dir)
+        users = json.loads((out_dir / "users.json").read_text())
+        users.append({
+            "id": "UADMIN", "name": "plainjane", "real_name": "Plain Jane",
+            "profile": {"display_name": "Jane"}, "is_admin": True, "is_owner": False,
+        })
+        (out_dir / "users.json").write_text(json.dumps(users))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_admin,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    matches = result["leadership"]["profile_role_matches"]
+    admin_entry = next(m for m in matches if m["id"] == "UADMIN")
+    assert admin_entry["slack_roles"] == ["admin"]
+    assert admin_entry["derived"] is None
+    # No derived role/region to group by - doesn't appear in by_region.
+    assert result["leadership"]["by_region"] == []
 
 
 def test_derive_leadership_none_for_plain_display_name():
@@ -202,19 +651,20 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
 
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_leader,
+        catalog_cache_dir=tmp_path / "empty-cache",
     )
 
     # The leader never posted in-range, so doesn't appear in messages...
     assert not any(m.get("user") == "ULEADER" for m in result["messages"])
     # ...but still surfaces in leadership, since that's scanned from the
     # full roster, not just posters.
-    assert result["leadership"]["raw_profile_matches"] == [
+    assert result["leadership"]["profile_role_matches"] == [
         {
             "id": "ULEADER",
             "workspace": "f3pugetsound",
             "display_name": "Columbia - Cascades Region Nantan",
             "real_name": "Real Columbia",
-            "is_bot": False,
+            "slack_roles": [],
             "derived": {
                 "possible_f3_name": "Columbia",
                 "possible_region": "F3 Cascades",
@@ -271,9 +721,10 @@ def test_build_digest_leadership_dedupes_same_person_across_workspaces(tmp_path)
 
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_leader,
+        catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert len(result["leadership"]["raw_profile_matches"]) == 2  # one per workspace account
+    assert len(result["leadership"]["profile_role_matches"]) == 2  # one per workspace account
     by_region = result["leadership"]["by_region"]
     assert len(by_region) == 1
     role = by_region[0]["roles"][0]
@@ -294,9 +745,13 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
 
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
     )
 
     assert result["channels"] == [
-        {"workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive"}
+        {
+            "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
+            "files": [], "description": None, "creator": None, "created_at": None,
+        }
     ]
     assert result["messages"] == []

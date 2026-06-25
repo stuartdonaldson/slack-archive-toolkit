@@ -25,8 +25,32 @@ def test_description_empty_when_both_empty():
 
 def test_fast_merge_into_empty_catalog_produces_member_rows():
     data = catalog_logic.merge_fast(_fresh(), [CH1, CH2])
-    assert data["channels"]["C1"] == {"member": True, "name": "general", "description": "T1"}
-    assert data["channels"]["C2"] == {"member": True, "name": "helpdesk", "description": "P2"}
+    assert data["channels"]["C1"] == {
+        "member": True, "name": "general", "description": "T1", "topic": "T1", "is_private": False, "is_archived": False,
+        "creator": None, "created": None,
+    }
+    assert data["channels"]["C2"] == {
+        "member": True, "name": "helpdesk", "description": "P2", "topic": None, "is_private": False, "is_archived": False,
+        "creator": None, "created": None,
+    }
+
+
+def test_merge_carries_private_and_archived_flags():
+    private_ch = {"id": "C4", "name": "leadership", "topic": {"value": ""}, "purpose": {"value": ""}, "is_private": True}
+    archived_ch = {"id": "C5", "name": "shuttered-ao", "topic": {"value": ""}, "purpose": {"value": ""}, "is_archived": True}
+    data = catalog_logic.merge_full(_fresh(), [private_ch, archived_ch])
+    assert data["channels"]["C4"]["is_private"] is True
+    assert data["channels"]["C5"]["is_archived"] is True
+
+
+def test_merge_carries_creator_and_created():
+    ch = {
+        "id": "C6", "name": "ao-foo", "topic": {"value": ""}, "purpose": {"value": ""},
+        "creator": "U123", "created": 1700000000,
+    }
+    data = catalog_logic.merge_full(_fresh(), [ch])
+    assert data["channels"]["C6"]["creator"] == "U123"
+    assert data["channels"]["C6"]["created"] == 1700000000
 
 
 def test_full_merge_adds_new_channel_as_not_member():
@@ -39,7 +63,10 @@ def test_full_merge_refreshes_description_without_clobbering_member_flag():
     data = catalog_logic.merge_fast(_fresh(), [CH1])
     updated_ch1 = {"id": "C1", "name": "general", "topic": {"value": "T1-updated"}, "purpose": {"value": ""}}
     data = catalog_logic.merge_full(data, [updated_ch1])
-    assert data["channels"]["C1"] == {"member": True, "name": "general", "description": "T1-updated"}
+    assert data["channels"]["C1"] == {
+        "member": True, "name": "general", "description": "T1-updated", "topic": "T1-updated",
+        "is_private": False, "is_archived": False, "creator": None, "created": None,
+    }
 
 
 def test_rerunning_fast_tier_never_demotes_a_full_tier_only_channel():
@@ -97,7 +124,12 @@ def test_lookup_falls_back_to_full_tier_on_fast_miss(tmp_path, monkeypatch):
     monkeypatch.setattr(catalog_logic.slackdump, "list_channels", fake_list_channels)
 
     matches = catalog_logic.lookup("f3test", "new-public", cache_dir=tmp_path)
-    assert matches == [("C3", {"member": False, "name": "new-public", "description": "P3"})]
+    assert matches == [
+        ("C3", {
+            "member": False, "name": "new-public", "description": "P3", "topic": None,
+            "is_private": False, "is_archived": False, "creator": None, "created": None,
+        })
+    ]
     assert calls == [True, False]
 
 
@@ -112,3 +144,62 @@ def test_name_by_id_is_read_only_and_never_calls_slackdump(tmp_path, monkeypatch
 
     assert catalog_logic.name_by_id("f3test", "C1", cache_dir=tmp_path) == "general"
     assert catalog_logic.name_by_id("f3test", "C404", cache_dir=tmp_path) == ""
+
+
+def test_set_registered_at_stamps_when_unset(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.set_registered_at(tmp_path, "f3test", "C1", "2026-06-24T00:00:00Z")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["registered_at"] == "2026-06-24T00:00:00Z"
+
+
+def test_set_registered_at_does_not_overwrite_existing_value(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.set_registered_at(tmp_path, "f3test", "C1", "2020-01-01T00:00:00Z")
+    catalog_logic.set_registered_at(tmp_path, "f3test", "C1", "2026-06-24T00:00:00Z")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["registered_at"] == "2020-01-01T00:00:00Z"
+
+
+def test_set_registered_at_is_noop_for_unknown_channel(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", _fresh())
+    catalog_logic.set_registered_at(tmp_path, "f3test", "C404", "2026-06-24T00:00:00Z")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert "C404" not in data["channels"]
+
+
+def test_update_last_posted_sets_value(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.update_last_posted(tmp_path, "f3test", "C1", "2026-06-20T12:00:00Z")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["last_posted"] == "2026-06-20T12:00:00Z"
+
+
+def test_update_last_posted_overwrites_previous_value(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.update_last_posted(tmp_path, "f3test", "C1", "2026-01-01T00:00:00Z")
+    catalog_logic.update_last_posted(tmp_path, "f3test", "C1", "2026-06-20T12:00:00Z")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["last_posted"] == "2026-06-20T12:00:00Z"
+
+
+def test_update_last_posted_is_noop_for_none(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.update_last_posted(tmp_path, "f3test", "C1", None)
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert "last_posted" not in data["channels"]["C1"]
+
+
+def test_effective_recency_prefers_last_posted_over_registered_at():
+    catalog = {"channels": {"C1": {"last_posted": "2026-06-20T00:00:00Z", "registered_at": "2020-01-01T00:00:00Z"}}}
+    assert catalog_logic.effective_recency(catalog, "C1") == "2026-06-20T00:00:00Z"
+
+
+def test_effective_recency_falls_back_to_registered_at():
+    catalog = {"channels": {"C1": {"registered_at": "2020-01-01T00:00:00Z"}}}
+    assert catalog_logic.effective_recency(catalog, "C1") == "2020-01-01T00:00:00Z"
+
+
+def test_effective_recency_empty_string_when_totally_unknown():
+    catalog = {"channels": {}}
+    assert catalog_logic.effective_recency(catalog, "C1") == ""

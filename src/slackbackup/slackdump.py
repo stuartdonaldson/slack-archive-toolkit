@@ -65,7 +65,17 @@ def list_channels(member_only: bool) -> list[dict]:
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump list channels failed: {result.stderr}")
     text = result.stdout.strip()
-    return json.loads(text) if text else []
+    entries = json.loads(text) if text else []
+    # Confirmed empirically (even with -member-only): this also returns DM
+    # conversations - is_channel:false, blank name, id prefixed D instead of
+    # C. Multi-person DMs (group chats) are sneakier: Slack reports
+    # is_channel:true for them too, with a C-prefixed id - the only
+    # reliable signal is the name, which Slack always prefixes "mpdm-" and
+    # embeds the real usernames of every participant in (a privacy leak,
+    # not just noise, if these slip into channels.json). Filter both out
+    # here so no caller (catalog/channel registration) ever sees them, on
+    # either tier.
+    return [e for e in entries if e.get("is_channel") and not e.get("name", "").startswith("mpdm-")]
 
 
 def search_files(term: str, out_dir: Path) -> bool:

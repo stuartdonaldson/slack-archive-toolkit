@@ -9,12 +9,26 @@ def register(groups: argparse._SubParsersAction) -> None:
     group = groups.add_parser("workspace", help="manage slackdump workspace sessions")
     sub = group.add_subparsers(dest="command", required=True)
 
-    p_register = sub.add_parser("register", help="register a workspace from a saved token + fresh cookie")
+    p_register = sub.add_parser(
+        "register",
+        help="register a workspace from a saved token + fresh cookie",
+        epilog=(
+            "Example:\n  ./slackbackup workspace register f3pugetsound xoxd-...\n"
+            "Output: no file written - registers a session with the local slackdump\n"
+            "        binary itself (see `slackdump workspace list`); confirmation printed to stdout."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_register.add_argument("name", help="workspace name or URL, e.g. f3pugetsound")
     p_register.add_argument("cookie", help="fresh xoxd- session cookie")
     p_register.set_defaults(handler=_register)
 
-    p_list = sub.add_parser("list", help="show known workspaces and registration status")
+    p_list = sub.add_parser(
+        "list",
+        help="show known workspaces and registration status",
+        epilog="Example:\n  ./slackbackup workspace list\nOutput: printed to stdout only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_list.set_defaults(handler=_list)
 
 

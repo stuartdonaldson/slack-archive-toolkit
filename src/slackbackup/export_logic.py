@@ -19,11 +19,15 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import sqlite3
 import tempfile
 from calendar import monthrange
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
+
+from . import catalog_logic
 
 _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
 
@@ -285,6 +289,146 @@ def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
     return f"https://{workspace}.slack.com/archives/{channel_id}/p{ts.replace('.', '')}"
 
 
+def _channel_context(catalog: dict, channel_id: str) -> dict:
+    """description/creator/created_at for one channel, read-only from an
+    already-loaded catalog cache (no API call, no refresh - the digest
+    stays local-only; if the cache was never warmed for this channel, e.g.
+    a fresh checkout, these are just None rather than triggering a live
+    fetch). created_at is an ISO8601 string, not the raw epoch, matching
+    this module's posted_at_utc convention elsewhere."""
+    channel = catalog["channels"].get(channel_id, {})
+    created = channel.get("created")
+    return {
+        "description": channel.get("description") or None,
+        "creator": channel.get("creator") or None,
+        "created_at": (
+            datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
+        ),
+    }
+
+
+_BLOCK_TAGS = {"p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "br"}
+_CELL_TAGS = {"td", "th"}
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Minimal HTML-to-text, stdlib only (no new dependency for what's
+    currently just one content type - Slack Canvases, which are real HTML
+    on disk despite the "application/vnd.slack-docs" mimetype). Not a full
+    renderer: block tags become newlines, table cells become " | "
+    separators, everything else is just text content concatenated in
+    document order. Good enough for an LLM to read a Canvas's table/text
+    structure - not pixel-perfect reflow."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in _CELL_TAGS:
+            self._parts.append(" | ")
+        elif tag in _BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self._parts)
+        lines = [re.sub(r"[ \t]+", " ", line).strip(" |") for line in raw.splitlines()]
+        return "\n".join(line for line in lines if line)
+
+
+def _html_to_text(raw_html: str) -> str:
+    parser = _HTMLTextExtractor()
+    parser.feed(raw_html)
+    return parser.text()
+
+
+# Content is only extracted for types we can read without a new dependency:
+# Slack Canvases (real HTML on disk despite this pseudo-mimetype) and plain
+# text/*. Everything else (PDF, video, external Google Sheets links with no
+# downloadable blob at all, ...) stays metadata-only - content: None.
+_HTML_LIKE_MIMETYPES = {"application/vnd.slack-docs", "text/html"}
+
+
+def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if mimetype in _HTML_LIKE_MIMETYPES:
+        return _html_to_text(raw)
+    if mimetype.startswith("text/"):
+        return raw
+    return None
+
+
+def _clean_file(data: dict) -> dict:
+    created = data.get("created")
+    return {
+        "id": data["id"],
+        "name": data.get("name"),
+        "title": data.get("title"),
+        "filetype": data.get("filetype"),
+        "mimetype": data.get("mimetype"),
+        "pretty_type": data.get("pretty_type"),
+        "creator": data.get("user") or None,
+        "created_at": (
+            datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
+        ),
+        "size": data.get("size"),
+        "permalink": data.get("permalink") or None,
+    }
+
+
+def _load_channel_files(channel_dir: Path) -> list[dict]:
+    """Reads channel_dir's slackdump.sqlite FILE table directly - not via
+    convert_fn's message-anchored export, which never surfaces these at
+    all for an unattached channel Canvas (FILE.MESSAGE_ID is "EMPTY FOR
+    CHANNEL CANVAS FILES" per the table's own comment - a Canvas isn't a
+    reply to anything). Read-only, local-only, no API call. Non-image
+    only (mimetype not image/*), matching docs/DESIGN-files.md's existing
+    non-image filtering convention. Deduped by file id - the same row can
+    repeat across resume cycles, like MESSAGE.
+    """
+    db_path = channel_dir / "slackdump.sqlite"
+    if not db_path.exists():
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute("SELECT DATA FROM FILE").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Malformed/placeholder archive (e.g. a 0-byte file) - no FILE
+        # table to read, same as "no files" rather than a hard failure.
+        return []
+
+    by_id: dict[str, dict] = {}
+    for (raw,) in rows:
+        data = json.loads(raw)
+        if (data.get("mimetype") or "").startswith("image/"):
+            continue
+        by_id[data["id"]] = data
+
+    files = []
+    for data in by_id.values():
+        cleaned = _clean_file(data)
+        local_path = channel_dir / "__uploads" / cleaned["id"] / (cleaned["name"] or "")
+        exists = local_path.exists()
+        cleaned["local_path"] = str(local_path.relative_to(channel_dir.parent.parent)) if exists else None
+        cleaned["content"] = _extract_file_content(cleaned["mimetype"] or "", local_path if exists else None)
+        files.append(cleaned)
+
+    files.sort(key=lambda f: f["created_at"] or "")
+    return files
+
+
 # --- leadership inference: best-effort, display-name-only signal per
 # docs/llm-export-suggestion.md's "profile-inferred roles" proposal, tuned
 # per docs/llm-leadership-improvement.md's feedback (dedup, wider role
@@ -411,6 +555,11 @@ def _build_leadership_by_region(raw_matches: list[dict]) -> list[dict]:
     groups: dict[tuple[str, str, str], dict] = {}
     for record in raw_matches:
         derived = record["derived"]
+        if derived is None:
+            # Admin/owner-only entries (no display-name title match) have
+            # no role/region to group by - they still appear in
+            # profile_role_matches, just not in this rollup.
+            continue
         region = derived["possible_region"] or "Unknown"
         f3_name = derived["possible_f3_name"]
         for role in derived["possible_roles"]:
@@ -482,16 +631,152 @@ def select_messages_in_range(
     return messages
 
 
+def _format_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str) -> None:
     msg["workspace"] = workspace
     msg["channel"] = channel
     msg["channel_id"] = channel_id
     msg["message_url"] = digest_message_url(workspace, channel_id, msg["ts"])
-    msg["posted_at_utc"] = datetime.fromtimestamp(float(msg["ts"]), tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
+    msg["posted_at_utc"] = _format_utc(float(msg["ts"]))
+    replies = msg.get("replies")
+    if replies:
+        # Thread rollups so a consumer can answer "how active was this
+        # thread" without re-walking replies[] - the root author counts as
+        # a thread participant too, not just repliers.
+        participants = {msg.get("user")} | {r.get("user") for r in replies}
+        msg["reply_count"] = len(replies)
+        msg["thread_participant_count"] = len(participants - {None})
+        msg["thread_last_reply_utc"] = _format_utc(max(float(r["ts"]) for r in replies))
+        for reply in replies:
+            _enrich_for_digest(reply, workspace, channel, channel_id)
+
+
+_BOT_ID_PREFIX = "B"
+
+
+def _is_bot_author(uid: str | None, bot_ids: set[str]) -> bool:
+    # Two authoritative signals, neither name-based: Slack's own id
+    # convention for messages with no resolvable user (bot ids start with
+    # "B", human user ids with "U"), and the workspace roster's own is_bot
+    # flag (folded into slack_roles by _clean_user) for the common case of
+    # a bot posting through an ordinary "U..." user account.
+    return uid is not None and (uid.startswith(_BOT_ID_PREFIX) or uid in bot_ids)
+
+
+def _channel_activity(messages: list[dict], bot_ids: set[str] = frozenset()) -> dict:
+    """Precomputed counts for one channel's already range-filtered,
+    thread-nested message list (the same shape build_digest already
+    produces per channel) - so a digest consumer doesn't have to recount
+    root/reply messages itself to answer "which channels are active" or
+    "most active channel" questions. Returns both the fields exposed on
+    the channel's digest entry and the extra (set/human-only) data
+    build_digest needs to aggregate workspace_activity_index, since that
+    aggregation can't be done correctly from counts alone (set union,
+    not sum, avoids double-counting a participant across channels)."""
+    participants: set[str] = set()
+    human_participants: set[str] = set()
+    timestamps: list[float] = []
+    human_total = 0
+    for msg in messages:
+        timestamps.append(float(msg["ts"]))
+        uid = msg.get("user")
+        if uid is not None:
+            participants.add(uid)
+            if not _is_bot_author(uid, bot_ids):
+                human_participants.add(uid)
+                human_total += 1
+        elif not _is_bot_author(uid, bot_ids):
+            human_total += 1
+        for reply in msg.get("replies", ()):
+            timestamps.append(float(reply["ts"]))
+            ruid = reply.get("user")
+            if ruid is not None:
+                participants.add(ruid)
+                if not _is_bot_author(ruid, bot_ids):
+                    human_participants.add(ruid)
+                    human_total += 1
+            elif not _is_bot_author(ruid, bot_ids):
+                human_total += 1
+
+    root_count = len(messages)
+    reply_count = len(timestamps) - root_count
+    total = root_count + reply_count
+    fields = (
+        {
+            "root_message_count": 0, "reply_count": 0, "total_message_count": 0,
+            "participant_count": 0, "first_message_utc": None, "last_message_utc": None,
+            "activity_status": "inactive",
+            "activity_status_basis": "zero root messages and zero nested replies during export_scope",
+        }
+        if total == 0
+        else {
+            "root_message_count": root_count, "reply_count": reply_count, "total_message_count": total,
+            "participant_count": len(participants), "first_message_utc": _format_utc(min(timestamps)),
+            "last_message_utc": _format_utc(max(timestamps)),
+            "activity_status": "active", "activity_status_basis": "has messages during export_scope",
+        }
     )
-    for reply in msg.get("replies", ()):
-        _enrich_for_digest(reply, workspace, channel, channel_id)
+    return {
+        **fields,
+        "_participants": participants,
+        "_human_total_message_count": human_total,
+    }
+
+
+def _build_workspace_activity_index(channels_meta: list[dict], activity_by_channel: dict[tuple, dict]) -> list[dict]:
+    """One record per workspace, aggregated from each "ok" channel's
+    _channel_activity() output - keyed by (workspace, channel_id) so a
+    workspace with two channels sharing a name still aggregates correctly."""
+    by_workspace: dict[str, list[dict]] = {}
+    for meta in channels_meta:
+        by_workspace.setdefault(meta["workspace"], []).append(meta)
+
+    index: list[dict] = []
+    for workspace in sorted(by_workspace):
+        entries = by_workspace[workspace]
+        ok_entries = [e for e in entries if e["status"] == "ok"]
+        active = [e for e in ok_entries if e["activity_status"] == "active"]
+        inactive = [e for e in ok_entries if e["activity_status"] == "inactive"]
+
+        participants: set[str] = set()
+        human_totals: dict[str, int] = {}
+        for entry in ok_entries:
+            activity = activity_by_channel[(workspace, entry["channel_id"])]
+            participants |= activity["_participants"]
+            human_totals[entry["channel_id"]] = activity["_human_total_message_count"]
+
+        def _channel_summary(entry: dict) -> dict:
+            return {
+                "channel": entry["channel"],
+                "root_message_count": entry["root_message_count"],
+                "reply_count": entry["reply_count"],
+                "total_message_count": entry["total_message_count"],
+            }
+
+        most_active = max(active, key=lambda e: e["total_message_count"], default=None)
+        human_candidates = [e for e in active if human_totals[e["channel_id"]] > 0]
+        most_active_human = max(human_candidates, key=lambda e: human_totals[e["channel_id"]], default=None)
+
+        index.append(
+            {
+                "workspace": workspace,
+                "channel_count": len(entries),
+                "active_channel_count": len(active),
+                "inactive_channel_count": len(inactive),
+                "root_message_count": sum(e["root_message_count"] for e in ok_entries),
+                "reply_count": sum(e["reply_count"] for e in ok_entries),
+                "total_message_count": sum(e["total_message_count"] for e in ok_entries),
+                "participant_count": len(participants),
+                "most_active_channel": _channel_summary(most_active) if most_active else None,
+                "most_active_human_channel": _channel_summary(most_active_human) if most_active_human else None,
+                "inactive_channels": sorted(e["channel"] for e in inactive),
+                "inactive_definition": "zero root messages and zero nested replies during export_scope",
+            }
+        )
+    return index
 
 
 def build_digest(
@@ -501,6 +786,7 @@ def build_digest(
     months: int,
     as_of: str,
     convert_fn: Callable[[Path, Path], None],
+    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
 ) -> dict:
     """Reads every (workspace, channel) in `channels_file` matching
     `workspace_glob`, converts each channel's archive (via `convert_fn` -
@@ -514,20 +800,49 @@ def build_digest(
     Slack user id (or display name) in two different workspaces is not the
     same identity, so author info stays embedded per-message, scoped to
     that message's own workspace, exactly as `_clean()` already resolves it.
+
+    Each "ok" channel's entry also carries its non-image files/Canvases
+    (see _load_channel_files) - read directly from the channel's own
+    archive, not via convert_fn, since an unattached channel Canvas never
+    surfaces in a message-anchored export.
     """
     date_from, date_to = trailing_months_range(months, as_of)
     from_epoch = _date_epoch(date_from, "00:00:00")
     to_epoch = _date_epoch(date_to, "23:59:59")
 
+    # Built up front (not after the channel loop) because per-channel
+    # activity needs each workspace's bot-id set to tell a bot/log channel
+    # apart from a human one - is_bot is on the user roster, not on the
+    # cleaned message, and a bot frequently posts as an ordinary "U..."
+    # user account rather than via Slack's legacy bot_id field, so a
+    # bot_id-prefix check alone misses it (see SlackBackup follow-up: the
+    # f3kirkland nation_bot_logs bot posts as user U0A3GF12LEA).
+    profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn)
+    bot_ids_by_workspace: dict[str, set[str]] = {
+        ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+
     channels_meta: list[dict] = []
     messages: list[dict] = []
+    activity_by_channel: dict[tuple, dict] = {}
+
+    catalog_cache: dict[str, dict] = {}
 
     for entry in select_channels(channels_file, workspace_glob):
         workspace, channel, channel_id = entry["workspace"], entry["name"], entry["id"]
+        if workspace not in catalog_cache:
+            catalog_cache[workspace] = catalog_logic.load(catalog_cache_dir, workspace)
+        channel_info = _channel_context(catalog_cache[workspace], channel_id)
+
         channel_dir = archive_root / workspace / channel
         if not (channel_dir / "slackdump.sqlite").exists():
             channels_meta.append(
-                {"workspace": workspace, "channel": channel, "channel_id": channel_id, "status": "missing_archive"}
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "missing_archive", "files": [], **channel_info,
+                }
             )
             continue
 
@@ -538,11 +853,18 @@ def build_digest(
             users_map = _load_users_map(export_dir_path)
 
         cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch)
+        activity = _channel_activity(cleaned, bot_ids_by_workspace.get(workspace, set()))
+        activity_by_channel[(workspace, channel_id)] = activity
+        activity_fields = {k: v for k, v in activity.items() if not k.startswith("_")}
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
         messages.extend(cleaned)
         channels_meta.append(
-            {"workspace": workspace, "channel": channel, "channel_id": channel_id, "status": "ok"}
+            {
+                "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                "status": "ok", "files": _load_channel_files(channel_dir), **channel_info,
+                **activity_fields,
+            }
         )
 
     messages.sort(key=lambda m: float(m["ts"]))
@@ -553,13 +875,18 @@ def build_digest(
     # the digest's *only* profile data; everyone else in the roster is
     # intentionally left out (see build_user_profiles for the full list).
     leadership: list[dict] = []
-    profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn)
     for ws_entry in profiles_doc["workspaces"]:
         if ws_entry["status"] != "ok":
             continue
         for profile in ws_entry["profiles"]:
             signal = derive_leadership(profile["display_name"])
-            if signal is None:
+            # admin/owner/primary_owner is an authoritative Slack-platform
+            # role, not an inferred one - include the profile even when its
+            # display name doesn't match any F3 title pattern, so a
+            # workspace admin/owner is never silently dropped from the
+            # leadership list just because derive_leadership() found nothing.
+            has_workspace_role = bool({"admin", "owner", "primary_owner"} & set(profile["slack_roles"]))
+            if signal is None and not has_workspace_role:
                 continue
             leadership.append(
                 {
@@ -567,7 +894,7 @@ def build_digest(
                     "workspace": ws_entry["workspace"],
                     "display_name": profile["display_name"],
                     "real_name": profile["real_name"],
-                    "is_bot": profile["is_bot"],
+                    "slack_roles": profile["slack_roles"],
                     "derived": signal,
                 }
             )
@@ -576,10 +903,25 @@ def build_digest(
         "schema_version": "slack-llm-digest-v1",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": {"from": date_from, "to": date_to, "months": months, "workspace_glob": workspace_glob},
+        "manifest": {
+            "workspaces_included": len({c["workspace"] for c in channels_meta}),
+            "counting_rules": {
+                "root_message_count": "top-level messages only",
+                "reply_count": "nested replies under root messages",
+                "total_message_count": "root_message_count plus reply_count",
+                "activity_status": "active when total_message_count > 0 in export_scope, else inactive",
+            },
+            "known_limitations": [
+                "Private or inaccessible channels may be absent",
+                "User profile completeness depends on Slack profile data",
+                "Leadership roles may be inferred from display names unless explicitly confirmed",
+            ],
+        },
         "channels": channels_meta,
+        "workspace_activity_index": _build_workspace_activity_index(channels_meta, activity_by_channel),
         "messages": messages,
         "leadership": {
-            "raw_profile_matches": leadership,
+            "profile_role_matches": leadership,
             "by_region": _build_leadership_by_region(leadership),
         },
     }
@@ -589,6 +931,28 @@ def build_digest(
 # cached, not just digest posters), kept as a separate document since
 # profile identity does not carry across workspaces - see build_digest's
 # docstring. ---
+
+
+# Slack-platform role/account-type flags, folded into one "slack_roles"
+# list rather than a pile of individual is_* booleans. Distinct from the
+# digest's inferred F3-leadership-position scan - these are authoritative,
+# not inferred, and already present on the raw user object. Excludes
+# is_invited_user/is_email_confirmed (account status, not a role) per the
+# same noise-stripping philosophy as the rest of _clean_user.
+_SLACK_ROLE_FLAGS = (
+    ("is_primary_owner", "primary_owner"),
+    ("is_owner", "owner"),
+    ("is_admin", "admin"),
+    ("is_bot", "bot"),
+    ("is_app_user", "app_user"),
+    ("is_restricted", "restricted"),
+    ("is_ultra_restricted", "ultra_restricted"),
+    ("is_stranger", "stranger"),
+)
+
+
+def _slack_roles(user: dict) -> list[str]:
+    return [role for flag, role in _SLACK_ROLE_FLAGS if user.get(flag, False)]
 
 
 def _clean_user(user: dict) -> dict:
@@ -601,8 +965,8 @@ def _clean_user(user: dict) -> dict:
         "name": user.get("name"),
         "real_name": user.get("real_name"),
         "display_name": profile.get("display_name") or None,
-        "is_bot": user.get("is_bot", False),
         "deleted": user.get("deleted", False),
+        "slack_roles": _slack_roles(user),
     }
 
 
