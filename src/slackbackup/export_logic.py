@@ -460,6 +460,10 @@ _LEADERSHIP_TITLE_PATTERNS: list[tuple[str, re.Pattern]] = [
 
 _SPECIFIC_Q_TITLES = {"Q Lead", "Site Q", "Region Q", "AOQ"}
 
+# Roles scoped to a specific AO/channel rather than the whole region.
+# "Redmond Ridge Site Q" → Site Q for the ao-redmond-ridge channel.
+_AO_SCOPED_ROLES = {"Site Q", "AOQ", "OIC"}
+
 _REGION_NAMES = {
     "f3pugetsound": "Puget Sound",
     "f3kirkland": "Kirkland",
@@ -509,11 +513,25 @@ def _split_possible_name(display_name: str) -> tuple[str, bool]:
     return display_name.strip(), False
 
 
+def _title_segment_prefix(segment: str, position: str) -> str | None:
+    """Text before the role keyword in a title segment — the location part
+    of '<Location> <Role>', e.g. 'Redmond Ridge' from 'Redmond Ridge Site Q'."""
+    _, pattern = next(((p, r) for p, r in _LEADERSHIP_TITLE_PATTERNS if p == position), (None, None))
+    if pattern is None:
+        return None
+    m = pattern.search(segment)
+    return segment[: m.start()].strip() or None if m else None
+
+
 def _parse_title_segments(title: str) -> list[dict]:
     """Parse a Slack profile title field into per-segment role entries.
     Each comma-separated segment is treated as '<Location> <Role>', e.g.
     'Redmond Ridge Site Q, Redmond Comz Q'. Title is explicitly set so
-    these roles carry higher confidence than display-name inference."""
+    these roles carry higher confidence than display-name inference.
+
+    AO-scoped roles (Site Q, AOQ, OIC) emit possible_ao (the AO/channel
+    name, e.g. 'Redmond Ridge') alongside possible_region. Regional roles
+    emit only possible_region."""
     roles = []
     for segment in re.split(r"\s*,\s*", title):
         segment = segment.strip()
@@ -527,13 +545,16 @@ def _parse_title_segments(title: str) -> list[dict]:
             None,
         )
         for position in matched:
-            roles.append({
+            entry: dict = {
                 "position": position,
                 "basis": "title",
                 "confidence": "high",
                 "needs_confirmation": False,
                 "possible_region": f"F3 {matched_region}" if matched_region else None,
-            })
+            }
+            if position in _AO_SCOPED_ROLES:
+                entry["possible_ao"] = _title_segment_prefix(segment, position)
+            roles.append(entry)
     return roles
 
 

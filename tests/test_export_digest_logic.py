@@ -636,12 +636,17 @@ def test_derive_leadership_title_two_segments_different_regions():
     roles = signal["possible_roles"]
     site_q = next(r for r in roles if r["position"] == "Site Q")
     comz = next(r for r in roles if r["position"] == "Comz")
+    # Site Q is AO-scoped: emits possible_ao for the workout location and
+    # possible_region derived from known region names within the prefix.
     assert site_q["basis"] == "title"
     assert site_q["confidence"] == "high"
     assert site_q["needs_confirmation"] is False
+    assert site_q["possible_ao"] == "Redmond Ridge"
     assert site_q["possible_region"] == "F3 Redmond"
+    # Comz Q is region-scoped: possible_region only, no possible_ao.
     assert comz["basis"] == "title"
     assert comz["possible_region"] == "F3 Redmond"
+    assert "possible_ao" not in comz
 
 
 def test_derive_leadership_title_only_no_display_name_match():
