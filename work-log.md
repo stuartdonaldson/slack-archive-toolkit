@@ -52,3 +52,11 @@ Built the operational tooling to recover from an interrupted backup and make sub
 
 ### Key Learnings:
 Don't trust a plausible-sounding explanation for a performance bottleneck without checking the actual distribution of the data - "archive scales with channel history" sounded right but a single data point (a 0-message channel taking the same 12.7s as everything else) disproved it immediately, and the real driver (rate-limit backoff, quantized into 1x/3x/5x bands) was visible just from `uniq -c` on the duration column. Also: Python silently full-buffers stdout once it's not a tty - any long-running process whose progress is being tailed from a redirected log needs an explicit flush or PYTHONUNBUFFERED, or the log looks broken even though nothing is actually wrong.
+
+## 2026-06-26 15:42:15
+
+### Summary:
+Added Slack profile `title` as a leadership signal: `_clean_user()` now emits `title`, and `derive_leadership()` parses comma-separated title segments as independent role entries (each with basis=title, confidence=high). Distinguished AO-scoped vs regional roles in title parsing: Site Q, AOQ, OIC now emit `possible_ao` (workout location) alongside `possible_region`; regional roles (Nantan, Weasel Shaker, Comz Q, etc.) emit only `possible_region`. Wired `export users` into the nightly digest script and updated docs/newsletter-prompt.md with guidance on separating regional vs AO/Site Q roles in leadership snapshots. Fixed two bugs in export_logic.py: guarded None in sort key (`r["f3_name"] or ""`) and updated type annotations to use `AbstractSet[str]` instead of bare `set[str]`.
+
+### Key Learnings:
+Profile `title` fields often contain comma-separated multi-role entries (e.g., "Redmond Ridge Site Q, Redmond Comz Q") that should be parsed as independent roles per segment so they group correctly by region in leadership rollups. AO-scoped role detection (Site Q vs regional Comz Q) requires prefix detection — the role name alone doesn't carry the scope; the location segment (e.g., "Redmond Ridge") must map to a known AO to disambiguate.
