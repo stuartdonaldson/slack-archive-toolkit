@@ -1,7 +1,9 @@
 # Slack Archive Toolkit
 
 A local Python CLI (`./slackbackup`) that backs up Slack channel history via slackdump, then
-exports it into LLM-ready digests, per-month archives, and a user-profile roster — no Slack
+exports it into two LLM-ready documents for newsletter generation — a cross-workspace **digest**
+(messages, activity counts, inferred leadership) and a **user profile report** (full membership
+roster with titles and Slack roles) — plus per-month channel archives and a live search. No Slack
 admin access, no app install, no cloud infrastructure. See [docs/DESIGN.md](docs/DESIGN.md) for
 the full architecture and a data-flow diagram of what this app does versus what slackdump does.
 
@@ -85,23 +87,43 @@ also available: `./slackbackup export monthly --from ... --to ... --workspace ..
 
 ```bash
 ./slackbackup export digest --archive-root ~/slack-backups
-# -> ~/slack-exports/f3-digest-<today>.json — last 3 months, every f3* workspace,
-#    one merged document with messages, channels, and inferred leadership roles
+# -> ~/slack-exports/f3-digest-<today>.json
+# Defaults: last 3 months, every f3* workspace.
+# Override with --workspace-glob, --months, --as-of, --out.
 ```
 
-### 6. Generate the newsletter report
+One merged JSON document: all in-range messages with thread nesting, per-channel and
+per-workspace activity counts, inferred leadership roles (from display names and profile
+titles), and non-image file/Canvas content.
 
-Feed the digest JSON plus [`docs/newsletter-prompt.md`](docs/newsletter-prompt.md) to an
-LLM (e.g. paste both into Claude/ChatGPT, or use the Claude CLI/API with the digest as an
-attachment) to produce the actual newsletter. The prompt defines the regional structure,
-event/leadership handling, and sourcing rules — it expects the digest's schema
-(`messages`, `channels`, `leadership.by_region`) as-is, so don't reshape the JSON first.
+### 6. Generate the user profile report
 
-### 7. Generate a new-member "Start Here" guide (optional)
+```bash
+./slackbackup export users --archive-root ~/slack-backups
+# -> ~/slack-exports/f3-user-profiles-<today>.json
+# Defaults: every f3* workspace.
+# Override with --workspace-glob, --out.
+```
+
+The full per-workspace user roster — display names, profile titles, Slack account roles
+(admin/owner/bot/etc.) — for every workspace matching the glob, not just recent posters.
+This is a separate document from the digest and covers the complete cross-region membership
+picture, including people who haven't posted in the digest window.
+
+### 7. Generate the newsletter
+
+Feed **both** the digest JSON and the user profile JSON, plus
+[`docs/newsletter-prompt.md`](docs/newsletter-prompt.md), to an LLM (e.g. paste all three
+into Claude, or use the Claude CLI/API with the files as attachments) to produce the actual
+newsletter. The prompt defines the regional structure, event/leadership handling, and sourcing
+rules — it expects the digest's `messages`/`channels`/`leadership.by_region` schema and the
+user profiles' per-workspace `profiles` list as-is, so don't reshape the JSON first.
+
+### 8. Generate a new-member "Start Here" guide (optional)
 
 Feed the digest JSON plus [`docs/fng-getting-started-prompt.md`](docs/fng-getting-started-prompt.md)
 to an LLM to produce a "Slack: Start Here / FAQ" guide for new members, sourced only from the
-digest's actual channels/roles/events — same pattern as the newsletter prompt above.
+digest's actual channels/roles/events — same pattern as the newsletter above.
 
 Run `./slackbackup help` for the full command list.
 
