@@ -25,7 +25,7 @@ from calendar import monthrange
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Callable, AbstractSet
 
 from . import catalog_logic
 
@@ -645,7 +645,7 @@ def _build_leadership_by_region(raw_matches: list[dict]) -> list[dict]:
         )
 
     return [
-        {"region": region, "roles": sorted(by_region[region], key=lambda r: (r["position"], r["f3_name"]))}
+        {"region": region, "roles": sorted(by_region[region], key=lambda r: (r["position"], r["f3_name"] or ""))}
         for region in sorted(by_region)
     ]
 
@@ -708,7 +708,7 @@ def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str)
 _BOT_ID_PREFIX = "B"
 
 
-def _is_bot_author(uid: str | None, bot_ids: set[str]) -> bool:
+def _is_bot_author(uid: str | None, bot_ids: AbstractSet[str]) -> bool:
     # Two authoritative signals, neither name-based: Slack's own id
     # convention for messages with no resolvable user (bot ids start with
     # "B", human user ids with "U"), and the workspace roster's own is_bot
@@ -717,7 +717,7 @@ def _is_bot_author(uid: str | None, bot_ids: set[str]) -> bool:
     return uid is not None and (uid.startswith(_BOT_ID_PREFIX) or uid in bot_ids)
 
 
-def _channel_activity(messages: list[dict], bot_ids: set[str] = frozenset()) -> dict:
+def _channel_activity(messages: list[dict], bot_ids: AbstractSet[str] = frozenset()) -> dict:
     """Precomputed counts for one channel's already range-filtered,
     thread-nested message list (the same shape build_digest already
     produces per channel) - so a digest consumer doesn't have to recount

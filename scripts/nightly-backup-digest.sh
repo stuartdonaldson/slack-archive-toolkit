@@ -24,15 +24,19 @@ export PATH="$HOME/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
 mkdir -p "$ARCHIVE_ROOT"
+mkdir -p "$HOME/slack-exports"
 {
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
 
-    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
-    echo "----- backup run exited $? -----"
+#    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
+#    echo "----- backup run exited $? -----"
 
     ./slackbackup export digest --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
     echo "----- digest exited $? -----"
+
+    ./slackbackup export users --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
+    echo "----- users export exited $? -----"
 
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest finished ====="
 } >> "$LOG_FILE" 2>&1
