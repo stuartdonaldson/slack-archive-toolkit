@@ -24,8 +24,17 @@ def test_clean_user_strips_noise_and_resolves_display_name():
     cleaned = export_logic._clean_user(raw)
     assert cleaned == {
         "id": "U0A", "name": "alice.a", "real_name": "Alice Anderson",
-        "display_name": "Al", "deleted": False, "slack_roles": [],
+        "display_name": "Al", "title": None, "deleted": False, "slack_roles": [],
     }
+
+
+def test_clean_user_includes_title_when_present():
+    raw = {
+        "id": "U0X", "name": "combine", "real_name": "Combine", "deleted": False,
+        "profile": {"display_name": "Combine", "title": "Redmond Ridge Site Q, Redmond Comz Q"},
+    }
+    cleaned = export_logic._clean_user(raw)
+    assert cleaned["title"] == "Redmond Ridge Site Q, Redmond Comz Q"
 
 
 def test_clean_user_collects_slack_roles():

@@ -509,37 +509,67 @@ def _split_possible_name(display_name: str) -> tuple[str, bool]:
     return display_name.strip(), False
 
 
-def derive_leadership(display_name: str | None) -> dict | None:
-    """Display names are visible and self-correcting, so they're a
-    practical working signal for "who currently holds this role" even
-    without a maintained roster - but they're never confirmation. Returns
-    None for the common case (no known title keyword present). basis is
-    always "display_name" and needs_confirmation always True here: this
-    function has no maintained-reference signal to upgrade either field -
-    that would be a different basis this digest does not have access to.
-    """
-    if not display_name:
+def _parse_title_segments(title: str) -> list[dict]:
+    """Parse a Slack profile title field into per-segment role entries.
+    Each comma-separated segment is treated as '<Location> <Role>', e.g.
+    'Redmond Ridge Site Q, Redmond Comz Q'. Title is explicitly set so
+    these roles carry higher confidence than display-name inference."""
+    roles = []
+    for segment in re.split(r"\s*,\s*", title):
+        segment = segment.strip()
+        if not segment:
+            continue
+        matched = _match_titles(segment)
+        if not matched:
+            continue
+        matched_region = next(
+            (region for region in _REGION_NAMES.values() if region.lower() in segment.lower()),
+            None,
+        )
+        for position in matched:
+            roles.append({
+                "position": position,
+                "basis": "title",
+                "confidence": "high",
+                "needs_confirmation": False,
+                "possible_region": f"F3 {matched_region}" if matched_region else None,
+            })
+    return roles
+
+
+def derive_leadership(display_name: str | None, title: str | None = None) -> dict | None:
+    """Display names and profile titles are both practical working signals
+    for "who currently holds this role". Display-name inference is
+    best-effort (needs_confirmation=True); title-field roles carry higher
+    confidence since the field is set explicitly. Returns None when neither
+    source matches any known F3 role pattern."""
+    dn_roles: list[dict] = []
+    dn_region: str | None = None
+    possible_f3_name: str | None = None
+
+    if display_name:
+        matched_titles = _match_titles(display_name)
+        possible_f3_name, structured = _split_possible_name(display_name)
+        if matched_titles:
+            confidence = "medium_high" if structured else "medium"
+            dn_region = next(
+                (region for region in _REGION_NAMES.values() if region.lower() in display_name.lower()),
+                None,
+            )
+            dn_roles = [
+                {"position": t, "basis": "display_name", "confidence": confidence, "needs_confirmation": True}
+                for t in matched_titles
+            ]
+
+    title_roles = _parse_title_segments(title) if title else []
+
+    if not dn_roles and not title_roles:
         return None
-
-    matched_titles = _match_titles(display_name)
-    if not matched_titles:
-        return None
-
-    possible_f3_name, structured = _split_possible_name(display_name)
-    confidence = "medium_high" if structured else "medium"
-
-    matched_region = next(
-        (region for region in _REGION_NAMES.values() if region.lower() in display_name.lower()),
-        None,
-    )
 
     return {
         "possible_f3_name": possible_f3_name,
-        "possible_region": f"F3 {matched_region}" if matched_region else None,
-        "possible_roles": [
-            {"position": title, "basis": "display_name", "confidence": confidence, "needs_confirmation": True}
-            for title in matched_titles
-        ],
+        "possible_region": f"F3 {dn_region}" if dn_region else None,
+        "possible_roles": dn_roles + title_roles,
     }
 
 
@@ -560,9 +590,9 @@ def _build_leadership_by_region(raw_matches: list[dict]) -> list[dict]:
             # no role/region to group by - they still appear in
             # profile_role_matches, just not in this rollup.
             continue
-        region = derived["possible_region"] or "Unknown"
         f3_name = derived["possible_f3_name"]
         for role in derived["possible_roles"]:
+            region = role.get("possible_region") or derived["possible_region"] or "Unknown"
             key = (region, f3_name, role["position"])
             group = groups.setdefault(
                 key, {"workspaces": set(), "display_names": set(), "profile_ids": set(), "confidence": role["confidence"]}
@@ -879,7 +909,7 @@ def build_digest(
         if ws_entry["status"] != "ok":
             continue
         for profile in ws_entry["profiles"]:
-            signal = derive_leadership(profile["display_name"])
+            signal = derive_leadership(profile["display_name"], profile.get("title"))
             # admin/owner/primary_owner is an authoritative Slack-platform
             # role, not an inferred one - include the profile even when its
             # display name doesn't match any F3 title pattern, so a
@@ -894,6 +924,7 @@ def build_digest(
                     "workspace": ws_entry["workspace"],
                     "display_name": profile["display_name"],
                     "real_name": profile["real_name"],
+                    "title": profile.get("title"),
                     "slack_roles": profile["slack_roles"],
                     "derived": signal,
                 }
@@ -965,6 +996,7 @@ def _clean_user(user: dict) -> dict:
         "name": user.get("name"),
         "real_name": user.get("real_name"),
         "display_name": profile.get("display_name") or None,
+        "title": profile.get("title") or None,
         "deleted": user.get("deleted", False),
         "slack_roles": _slack_roles(user),
     }

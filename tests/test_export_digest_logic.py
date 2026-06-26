@@ -629,6 +629,37 @@ def test_derive_leadership_specific_q_variant_suppresses_bare_q():
     assert "Q" not in positions
 
 
+def test_derive_leadership_title_two_segments_different_regions():
+    # "Redmond Ridge Site Q, Redmond Comz Q" — real title format per user feedback.
+    signal = export_logic.derive_leadership("Combine", title="Redmond Ridge Site Q, Redmond Comz Q")
+    assert signal["possible_f3_name"] == "Combine"
+    roles = signal["possible_roles"]
+    site_q = next(r for r in roles if r["position"] == "Site Q")
+    comz = next(r for r in roles if r["position"] == "Comz")
+    assert site_q["basis"] == "title"
+    assert site_q["confidence"] == "high"
+    assert site_q["needs_confirmation"] is False
+    assert site_q["possible_region"] == "F3 Redmond"
+    assert comz["basis"] == "title"
+    assert comz["possible_region"] == "F3 Redmond"
+
+
+def test_derive_leadership_title_only_no_display_name_match():
+    # Title alone (plain display name) should still surface roles.
+    signal = export_logic.derive_leadership("Dude", title="Kirkland Nantan")
+    assert signal is not None
+    positions = {r["position"] for r in signal["possible_roles"]}
+    assert "Nantan" in positions
+    title_roles = [r for r in signal["possible_roles"] if r["basis"] == "title"]
+    assert all(r["confidence"] == "high" for r in title_roles)
+    assert all(r["needs_confirmation"] is False for r in title_roles)
+
+
+def test_derive_leadership_none_when_both_sources_empty():
+    assert export_logic.derive_leadership("Dude", title="Community Manager") is None
+    assert export_logic.derive_leadership(None, title=None) is None
+
+
 def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_path):
     archive_root = tmp_path / "archive"
     channel_dir = archive_root / "f3pugetsound" / "helpdesk"
@@ -664,6 +695,7 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
             "workspace": "f3pugetsound",
             "display_name": "Columbia - Cascades Region Nantan",
             "real_name": "Real Columbia",
+            "title": None,
             "slack_roles": [],
             "derived": {
                 "possible_f3_name": "Columbia",
