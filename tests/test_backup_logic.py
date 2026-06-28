@@ -204,6 +204,33 @@ def test_run_continues_on_per_channel_failure_and_reports_overall_failure(tmp_pa
     assert all_ok is False
 
 
+def test_run_skips_workspace_whose_catalog_refresh_fails_and_backs_up_the_rest(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "A1", "name": "a1", "workspace": "f3live"},
+        {"id": "B1", "name": "b1", "workspace": "f3dead"},
+        {"id": "A2", "name": "a2", "workspace": "f3live"},
+    ]))
+
+    def fake_refresh(ws, cache_dir=None):
+        if ws == "f3dead":
+            raise slackdump.SlackdumpError("authentication error: invalid_auth")
+
+    attempted = []
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", fake_refresh)
+    monkeypatch.setattr(
+        backup_logic, "backup_channel",
+        lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append((ws, slug)) or "archive",
+    )
+
+    all_ok = backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
+
+    # one workspace's expired session must not abort the others
+    assert ("f3live", "a1") in attempted and ("f3live", "a2") in attempted
+    assert all(ws != "f3dead" for ws, _ in attempted)  # dead workspace's channels skipped
+    assert all_ok is False  # but a skipped workspace marks the run not-ok
+
+
 def test_run_processes_most_recently_active_channels_first(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     channels_file = tmp_path / "channels.json"
