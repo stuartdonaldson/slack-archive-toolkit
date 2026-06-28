@@ -1,6 +1,7 @@
-#!/mnt/c/dev/venvs/uv1/bin/python
-"""Repo-root convenience entry point - equivalent to `python -m slackbackup.cli`,
-run with the project's WSL2/Linux venv interpreter (see ~/.claude/CLAUDE.md §9).
+#!/usr/bin/env python3
+"""Repo-root convenience entry point - equivalent to `python -m slackbackup.cli`.
+Runs under whatever `python3` is on PATH (activate the project venv first); it
+inserts ./src itself, so no install is strictly required.
 """
 import sys
 from pathlib import Path
