@@ -175,8 +175,23 @@ def run(
     before moving to the next."""
     entries = channel_logic.validate(channels_file)
 
+    # Warm each workspace's fast-tier catalog, but don't let one workspace with
+    # an expired session abort the whole multi-workspace run - skip it and carry
+    # on with the rest (its channels would only fail downstream anyway).
+    skipped_workspaces: dict[str, str] = {}
     for workspace in sorted({entry["workspace"] for entry in entries}):
-        catalog_logic.refresh_fast(workspace, cache_dir=cache_dir)
+        try:
+            catalog_logic.refresh_fast(workspace, cache_dir=cache_dir)
+        except slackdump.SlackdumpError as exc:
+            _log(
+                f"backup run: skipping workspace '{workspace}' - catalog refresh failed "
+                f"(session likely expired; re-register it): {exc}",
+                file=sys.stderr,
+            )
+            skipped_workspaces[workspace] = str(exc)
+
+    if skipped_workspaces:
+        entries = [e for e in entries if e["workspace"] not in skipped_workspaces]
 
     catalog_cache: dict[str, dict] = {}
     for entry in entries:
@@ -190,7 +205,7 @@ def run(
     )
     entries = _interleave_by_workspace(entries)
 
-    all_ok = True
+    all_ok = not skipped_workspaces
     counts = {"archive": 0, "resume": 0, "failed": 0}
     run_start = time.monotonic()
 
@@ -214,9 +229,12 @@ def run(
             counts["failed"] += 1
 
     total_elapsed = time.monotonic() - run_start
+    skipped_note = (
+        f", {len(skipped_workspaces)} workspace(s) skipped" if skipped_workspaces else ""
+    )
     _log(
         f"backup run: done - {len(entries)} channel(s), {counts['archive']} archive(s), "
-        f"{counts['resume']} resume(s), {counts['failed']} failure(s), "
+        f"{counts['resume']} resume(s), {counts['failed']} failure(s){skipped_note}, "
         f"{total_elapsed / 60:.1f} min total"
     )
     return all_ok
