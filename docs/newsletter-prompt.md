@@ -1,4 +1,4 @@
-Generate an F3 Puget Sound regional newsletter from the attached Slack digest export.
+Generate an F3 Puget Sound regional newsletter from the Slack digest export.
 
 Use only information present in the export. Do not invent details. The digest may include messages, channels, direct Slack message URLs, and leadership information inferred from visible Slack display names.
 
@@ -8,19 +8,38 @@ Mention only briefly that this is a proof of concept newletter and was built fro
 
 Output a concise Markdown newsletter.
 
+
 # Requirements
 
 ## General style
 
 * Write in an engaging, practical, community-oriented newsletter style.
 * Do not write a data report.
-* Avoid duplicate reports. Merge repeated posts, reminders, replies, and follow-ups into one coherent update per event/topic.
-* Prefer useful regional awareness over exhaustive coverage.
+* Use only digest/profile data.
 * Use F3 names/display names as shown in the export.
 * Use direct Slack message links from `message_url` when available.
+* Resolve `<@USERID>` through the same-workspace profile export.
 * When referencing a Slack post or channel, embed the actual Slack message link using Markdown syntax, for example: `[1st-f](https://...)`.
 * Cite the F3 name/display name of the person who posted the source item.
 * If source details are unknown or a link is unavailable, say so briefly.
+* Prefer useful regional awareness over exhaustive coverage.
+* Avoid duplicate reports. Merge repeated posts, reminders, replies, and follow-ups into one coherent update per event/topic.
+* Include only items likely to matter beyond the immediate channel: regional events, AO changes, CSAUPs, 2.0/family events, service opportunities, major announcements, useful outcomes, and broadly relevant words of wisdom. Omit routine backblasts unless they confirm an event outcome or include broadly useful information.
+* If a fact comes from a channel description, topic, canvas/file, or structured digest field rather than a message, cite the channel/source.
+
+## Verifying outcomes
+
+* Do not assume a planned or promoted item (event, talk, beatdown, fundraiser) went as described just because an announcement exists. Check for later messages in the same thread/channel that confirm what actually happened.
+* If later messages show a different outcome than what was planned (canceled, rescheduled, poor turnout, changed format), report the actual outcome, not the plan. Note the change explicitly if it's noteworthy (e.g., "the session was canceled due to low turnout, despite a strong announcement").
+* If no follow-up confirming the outcome exists, describe the item as upcoming/planned rather than implying it happened successfully. Use phrasing like "was scheduled for" or "was promoted as" rather than "drew a packed crowd," unless a post-event message actually confirms that.
+* When summarizing a recurring series (e.g., a monthly talk series) don't generalize the tone of one instance (e.g., "well-attended") to a later instance without checking that instance's own follow-up messages.
+
+## Identity handling
+
+* People profiles are not unified across regions/workspaces, they have different identifiers and typically similar display names or a display name matching an email address or personal name.
+* Do not merge people across workspaces unless the export strongly supports the match through matching F3 name, role, or derived leadership fields.
+* Prefer F3 name/display name over real name in newsletter copy.
+* Exclude bots from leadership and author attribution unless the bot post is the only available source for an item.
 
 ## Regional structure
 
@@ -43,43 +62,81 @@ Output a concise Markdown newsletter.
 * If other regions reference the same event, merge those references into one event item and cite the canonical source first.
 * Include the event under the host/canonical region. Also mention it in a short “Cross-region events to know” section if it is broadly relevant to Puget Sound PAX.
 * Do not lose event details from the canonical source just because another region’s repost or reference is less complete.
+* When merging multiple posts about the same event, preserve meaningful event variants such as ruck option, 2.0/family option, pre-ruck/pre-run, coffeeteria, alternate start time, or separate track. Include these as brief notes under the event rather than treating them as duplicates.
+
+For each region, provide a leadership team snapshot:
 
 ## Leadership Team Snapshot
 
-* Include a “Leadership Team Snapshot” section for each regional section.
-* Use the digest’s leadership section when present.
-* If `leadership.by_region` exists, use that first.
-* If only raw leadership matches exist, aggregate by `possible_region + possible_f3_name + position`.
-* Leadership may be inferred from Slack display names, profile fields, channel descriptions,channel files/canvas content, channel topic, or digest-derived leadership fields. Treat visible role signals as practical working information, but do not overstate confidence.
-* Distinguish **regional roles** from **AO / Site Q roles**:
-  * Regional roles belong to the region/workspace, such as Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, Comz, IT Q, or other regional Q roles.
-  * Site Q roles belong to a specific AO, workout location, or channel. When possible, correlate the Site Q to the matching AO/channel, for example: `Redmond Ridge / #ao-redmond-ridge — Combine`.
-* In each leadership snapshot, use separate bullets or labels for:
-  * **Regional leadership**
-  * **Site Q**
-* Do not list duplicate workspace-local accounts separately.
-* Do not merge people across workspaces unless the export strongly supports the match.
-* Use concise basis language such as “inferred from display name,” “listed in channel description,” or “matched to AO channel.”
-* If no leadership information is available for a region, write: “No leadership info found. Need a maintained regional leadership reference.”
+For each region, include a **Leadership Team Snapshot** with separate tables for:
 
-## Identity handling
+* **Current Regional leadership**
 
-* People profiles are not unified across regions/workspaces.
-* Do not merge people across workspaces unless the export strongly supports the match through matching F3 name, role, or derived leadership fields.
-* Prefer F3 name/display name over real name in newsletter copy.
-* Exclude bots from leadership and author attribution unless the bot post is the only available source for an item.
+Use this table format:  List positions that are identified in order of Nantan, Weazel Shaker, 1st F, 2nd F, 3rd F, IT Q, Commz Q, F3 Nation Admin, ...
+
+| Position | F3 Name | Source / confidence |
+| -------- | ------- | ------------------- |
+
+### Rules
+Do not include a leadership row based only on profile/display-name unless it clearly identifies a regional role. Prefer omitting weak leadership signals over cluttering the snapshot.
+
+Use sources in this priority order:
+
+1. Channel canvas/file, topic, or description
+2. `leadership.by_region`
+3. Message text
+4. Profile title or display name
+5. Name similarity, only as weak cleanup signal
+
+Use concise confidence language:
+
+* `Confirmed — leadership.by_region`
+* `High — channel description/topic/canvas`
+* `Medium — message announcement`
+* `Working signal — profile/display name; may be stale`
+* `Former — modifier/status/profile text`
+* `Unresolved — Slack ID not found`
+
+If no leadership info is found, write:
+
+`No leadership info found. Need a maintained regional leadership reference.`
+
+## Site Overview
+
+For each region, include a **Site Overview**.
+* Sort Site Overview rows by site/channel name unless the source provides an intentional regional order.
+
+List only AOs/sites with both a Site Q and location in the digest/profile data.
+
+| Site / Channel | Site Q | Time | Location |
+| -------------- | ------ | ---- | -------- |
+
+Rules:
+
+* Scope each AO to the region/workspace where its channel appears.
+* Prefer channel description, topic, canvas/file, and structured digest fields over profile-title inference.
+* Omit sites missing either Site Q or location.
+* Do not infer missing time/location/Site Q.
+
+After the table, add:
+
+**Notable regional announcements / words of wisdom**
+
+Include only non-duplicate, site-specific items of broader regional interest: regional convergences/challenges, region-hosted CSAUPs/events, 2.0/family events, major AO changes, Site Q transitions, or broadly useful words of wisdom.
+
+Do not include cross-region items here unless hosted by or directly tied to that region. Cross-region items belong in the separate cross-region section.
 
 # Suggested structure
 
 # F3 Puget Sound Regional Newsletter — [Month Year]
 
-*Built from Slack postings.*
+*Proof-of-concept newsletter built from Slack postings and AI analysis. Please verify details before relying on them.*
 
 ## F3 Puget Sound
 
-### What’s been happening
+### What has been happening
 
-### What’s coming up
+### What is coming up
 
 ### Leadership Team Snapshot
 
@@ -87,9 +144,9 @@ Output a concise Markdown newsletter.
 
 Create one section like this for each additional regional workspace with meaningful newsletter-worthy content.
 
-### What’s been happening
+### What has been happening
 
-### What’s coming up
+### What is coming up
 
 ### Leadership Team Snapshot
 

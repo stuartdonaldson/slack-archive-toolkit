@@ -464,6 +464,42 @@ _SPECIFIC_Q_TITLES = {"Q Lead", "Site Q", "Region Q", "AOQ"}
 # "Redmond Ridge Site Q" → Site Q for the ao-redmond-ridge channel.
 _AO_SCOPED_ROLES = {"Site Q", "AOQ", "OIC"}
 
+# Ordered by specificity — emeritus/retired before the generic "former" bucket.
+# "\bex-" (no closing \b) intentionally matches "ex-" as a prefix modifier
+# (e.g. "Ex-Nantan") without requiring a word boundary after the hyphen.
+_MODIFIER_TO_STATUS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bemeritus\b", re.I), "emeritus"),
+    (re.compile(r"\bretired\b", re.I), "retired"),
+    (re.compile(
+        r"\bformer\b|\bex-|\bpast\b|\bprevious\b|\boutgoing\b"
+        r"|\bstepping\s+down\b|\bwas\b|\bused\s+to\s+be\b",
+        re.I,
+    ), "former"),
+]
+
+
+def _detect_modifier(text: str) -> tuple[str | None, str | None]:
+    """Returns (matched_text, status) for the first tenure modifier found in
+    `text`, or (None, None) if none present. Checks emeritus/retired before
+    the generic "former" bucket so they keep their own label."""
+    for pattern, status in _MODIFIER_TO_STATUS:
+        m = pattern.search(text)
+        if m:
+            return m.group(0), status
+    return None, None
+
+
+def _role_status(modifier_status: str | None, confidence: str) -> tuple[str, bool | None]:
+    """Derive (status, is_current) from modifier presence and confidence.
+    Modifier always wins: is_current=False, status from the modifier.
+    No modifier: confidence="high" → "current"/True; lower → "unclear"/None
+    (display-name sources are not maintained so we can't assert is_current)."""
+    if modifier_status is not None:
+        return modifier_status, False
+    if confidence == "high":
+        return "current", True
+    return "unclear", None
+
 _REGION_NAMES = {
     "f3pugetsound": "Puget Sound",
     "f3kirkland": "Kirkland",
@@ -531,7 +567,11 @@ def _parse_title_segments(title: str) -> list[dict]:
 
     AO-scoped roles (Site Q, AOQ, OIC) emit possible_ao (the AO/channel
     name, e.g. 'Redmond Ridge') alongside possible_region. Regional roles
-    emit only possible_region."""
+    emit only possible_region.
+
+    Modifier words (Emeritus, Former, Retired, etc.) detected per segment
+    set status/is_current so former roles don't pollute the current
+    leadership summary."""
     roles = []
     for segment in re.split(r"\s*,\s*", title):
         segment = segment.strip()
@@ -544,6 +584,8 @@ def _parse_title_segments(title: str) -> list[dict]:
             (region for region in _REGION_NAMES.values() if region.lower() in segment.lower()),
             None,
         )
+        modifier_detected, modifier_status = _detect_modifier(segment)
+        status, is_current = _role_status(modifier_status, "high")
         for position in matched:
             entry: dict = {
                 "position": position,
@@ -551,6 +593,10 @@ def _parse_title_segments(title: str) -> list[dict]:
                 "confidence": "high",
                 "needs_confirmation": False,
                 "possible_region": f"F3 {matched_region}" if matched_region else None,
+                "status": status,
+                "is_current": is_current,
+                "modifier_detected": modifier_detected,
+                "source_text": segment,
             }
             if position in _AO_SCOPED_ROLES:
                 entry["possible_ao"] = _title_segment_prefix(segment, position)
@@ -577,8 +623,19 @@ def derive_leadership(display_name: str | None, title: str | None = None) -> dic
                 (region for region in _REGION_NAMES.values() if region.lower() in display_name.lower()),
                 None,
             )
+            modifier_detected, modifier_status = _detect_modifier(display_name)
+            status, is_current = _role_status(modifier_status, confidence)
             dn_roles = [
-                {"position": t, "basis": "display_name", "confidence": confidence, "needs_confirmation": True}
+                {
+                    "position": t,
+                    "basis": "display_name",
+                    "confidence": confidence,
+                    "needs_confirmation": True,
+                    "status": status,
+                    "is_current": is_current,
+                    "modifier_detected": modifier_detected,
+                    "source_text": display_name,
+                }
                 for t in matched_titles
             ]
 
@@ -597,13 +654,21 @@ def derive_leadership(display_name: str | None, title: str | None = None) -> dic
 _CONFIDENCE_RANK = {"medium": 1, "medium_high": 2}
 
 
-def _build_leadership_by_region(raw_matches: list[dict]) -> list[dict]:
+def _build_leadership_by_region(raw_matches: list[dict]) -> tuple[list[dict], list[dict]]:
     """Dedupes raw_matches by (region, f3_name, position) - the same
     person commonly has a separate Slack account per workspace, each
     independently matching the same self-reported role; without this, the
     same leader is repeated once per workspace (reported in
-    docs/llm-leadership-improvement.md)."""
-    groups: dict[tuple[str, str, str], dict] = {}
+    docs/llm-leadership-improvement.md).
+
+    Returns (by_region, former_by_region): roles where is_current is not
+    False go to by_region (current/unclear); roles where is_current is False
+    go to former_by_region. When the same (region, f3_name, position) key
+    has both former and non-former sources (unusual but possible across
+    workspace accounts), they land in separate groups."""
+    current_groups: dict[tuple, dict] = {}
+    former_groups: dict[tuple, dict] = {}
+
     for record in raw_matches:
         derived = record["derived"]
         if derived is None:
@@ -615,39 +680,56 @@ def _build_leadership_by_region(raw_matches: list[dict]) -> list[dict]:
         for role in derived["possible_roles"]:
             region = role.get("possible_region") or derived["possible_region"] or "Unknown"
             key = (region, f3_name, role["position"])
-            group = groups.setdefault(
-                key, {"workspaces": set(), "display_names": set(), "profile_ids": set(), "confidence": role["confidence"]}
+            target = former_groups if role.get("is_current") is False else current_groups
+            group = target.setdefault(
+                key,
+                {
+                    "workspaces": set(), "display_names": set(), "profile_ids": set(),
+                    "confidence": role["confidence"], "statuses": set(),
+                },
             )
             group["workspaces"].add(record["workspace"])
             group["display_names"].add(record["display_name"])
             group["profile_ids"].add(record["id"])
+            group["statuses"].add(role.get("status", "unclear"))
             if _CONFIDENCE_RANK.get(role["confidence"], 0) > _CONFIDENCE_RANK.get(group["confidence"], 0):
                 group["confidence"] = role["confidence"]
 
-    by_region: dict[str, list[dict]] = {}
-    for (region, f3_name, position), group in groups.items():
-        by_region.setdefault(region, []).append(
-            {
-                "position": position,
-                "f3_name": f3_name,
-                "confidence": group["confidence"],
-                "basis": "display_name",
-                "seen_in_workspaces": sorted(group["workspaces"]),
-                "source_display_names": sorted(group["display_names"]),
-                "source_profile_ids": sorted(group["profile_ids"]),
-                # Always True, deliberately not matching the literal example
-                # in docs/llm-leadership-improvement.md: the same self-
-                # reported display name repeated across a person's per-
-                # workspace accounts is not independent corroboration, so it
-                # doesn't earn "confirmed" - basis is still display_name-only.
-                "needs_confirmation": True,
-            }
-        )
+    def _groups_to_list(groups: dict, *, is_current: bool | None) -> list[dict]:
+        by_region: dict[str, list[dict]] = {}
+        # Most-specific-wins ordering for status label within a group.
+        _STATUS_PRIORITY = ("emeritus", "retired", "former", "current", "unclear")
+        for (region, f3_name, position), group in groups.items():
+            statuses = group["statuses"]
+            status = next((s for s in _STATUS_PRIORITY if s in statuses), "unclear")
+            by_region.setdefault(region, []).append(
+                {
+                    "position": position,
+                    "f3_name": f3_name,
+                    "status": status,
+                    "is_current": is_current,
+                    "confidence": group["confidence"],
+                    "basis": "display_name",
+                    "seen_in_workspaces": sorted(group["workspaces"]),
+                    "source_display_names": sorted(group["display_names"]),
+                    "source_profile_ids": sorted(group["profile_ids"]),
+                    # Always True, deliberately not matching the literal example
+                    # in docs/llm-leadership-improvement.md: the same self-
+                    # reported display name repeated across a person's per-
+                    # workspace accounts is not independent corroboration, so it
+                    # doesn't earn "confirmed" - basis is still display_name-only.
+                    "needs_confirmation": True,
+                }
+            )
+        return [
+            {"region": r, "roles": sorted(by_region[r], key=lambda x: (x["position"], x["f3_name"] or ""))}
+            for r in sorted(by_region)
+        ]
 
-    return [
-        {"region": region, "roles": sorted(by_region[region], key=lambda r: (r["position"], r["f3_name"] or ""))}
-        for region in sorted(by_region)
-    ]
+    return (
+        _groups_to_list(current_groups, is_current=None),
+        _groups_to_list(former_groups, is_current=False),
+    )
 
 
 def select_messages_in_range(
@@ -951,6 +1033,8 @@ def build_digest(
                 }
             )
 
+    by_region, former_by_region = _build_leadership_by_region(leadership)
+
     return {
         "schema_version": "slack-llm-digest-v1",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -974,7 +1058,8 @@ def build_digest(
         "messages": messages,
         "leadership": {
             "profile_role_matches": leadership,
-            "by_region": _build_leadership_by_region(leadership),
+            "by_region": by_region,
+            "former_by_region": former_by_region,
         },
     }
 

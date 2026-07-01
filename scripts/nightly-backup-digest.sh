@@ -29,8 +29,8 @@ mkdir -p "$HOME/slack-exports"
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
 
-#    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
-#    echo "----- backup run exited $? -----"
+    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
+    echo "----- backup run exited $? -----"
 
     ./slackbackup export digest --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
     echo "----- digest exited $? -----"
