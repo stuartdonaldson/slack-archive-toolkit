@@ -29,7 +29,13 @@ mkdir -p "$HOME/slack-exports"
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
 
-    # Announce expired-session workspaces up front (bd SlackBackup-d70) rather
+    # Keep slackdump credentials in sync with Slack's cookie rotation before the
+    # backup (bd SlackBackup-5df): headless re-capture from the persistent browser
+    # profile so sessions don't silently expire between nightly runs. Non-fatal -
+    # a hard logout still needs an interactive `npm run refresh`.
+    "$REPO_ROOT/scripts/auth-refresh/keepalive.sh" || echo "----- keepalive exited $? (continuing) -----"
+
+    # Announce any still-expired workspaces up front (bd SlackBackup-d70) rather
     # than discovering them channel-by-channel mid-run. Informational only -
     # always exits 0, so it never blocks the backup below.
     "$REPO_ROOT/scripts/preflight-auth.sh" channels.json

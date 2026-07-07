@@ -93,6 +93,23 @@ Repeat the browser capture from README §1 (a fresh cookie, and a fresh token if
 rotated), then re-run `./slackbackup workspace register <workspace> <xoxd-cookie>`. Use
 this if Node/Playwright isn't set up.
 
+### 4. Preventing expiry (headless keep-alive)
+
+Slack invalidates a session by **rotating** the shared cookie forward, not by hitting
+its expiry timestamp (the cookie's own `expires` attribute is ~13 months out, yet
+slackdump sessions die in ~2–3 weeks). A browser follows the rotation automatically;
+slackdump keeps a static snapshot and falls behind. `scripts/auth-refresh/keepalive.sh`
+(`refresh-auth.mjs --keepalive`) closes that gap: headlessly, on a schedule, it loads
+Slack on the persistent profile — keeping the session active and picking up any
+rotation — then re-captures the current cookie + tokens and re-registers every
+workspace present in the profile. No prompts.
+
+It is wired into `nightly-backup-digest.sh` (before the pre-flight and backup), so a
+running nightly job keeps credentials fresh with no human involvement. Requirements: the
+persistent profile must still be logged in (a hard logout — password change / forced
+sign-out — drops back to interactive §3), and the cadence must beat Slack's inactivity
+window (nightly is comfortably inside the observed ~2–3 week expiry).
+
 ### Failure modes
 
 | Symptom | Cause | Recovery |
@@ -108,7 +125,8 @@ this if Node/Playwright isn't set up.
 ## Nightly Backup
 
 `scripts/nightly-backup-digest.sh` is invoked by a Windows Scheduled Task
-(`wsl.exe -d Ubuntu -- .../scripts/nightly-backup-digest.sh`) at 2am. It runs the auth
-pre-flight, then `backup run`, then the digest / users / job-digest exports, appending
-everything to `~/slack-backups/nightly.log`. It deliberately does **not** `set -e`: a
-single workspace or channel failure must not stop the rest of the run.
+(`wsl.exe -d Ubuntu -- .../scripts/nightly-backup-digest.sh`) at 2am. It runs the
+headless auth keep-alive (§4), then the auth pre-flight (§2), then `backup run`, then the
+digest / users / job-digest exports, appending everything to `~/slack-backups/nightly.log`.
+It deliberately does **not** `set -e`: a single workspace or channel failure — or the
+keep-alive itself — must not stop the rest of the run.
