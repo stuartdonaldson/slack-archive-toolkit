@@ -29,6 +29,11 @@ mkdir -p "$HOME/slack-exports"
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
 
+    # Announce expired-session workspaces up front (bd SlackBackup-d70) rather
+    # than discovering them channel-by-channel mid-run. Informational only -
+    # always exits 0, so it never blocks the backup below.
+    "$REPO_ROOT/scripts/preflight-auth.sh" channels.json
+
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"
 
