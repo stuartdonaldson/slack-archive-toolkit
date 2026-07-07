@@ -65,6 +65,11 @@ workspace import` under the hood, which needs both the token (from the file) and
 cookie (passed fresh — slackdump doesn't persist cookies, since they expire) every time
 you register or re-register.
 
+> **Sessions expire.** When they do, backups fail with `authentication details expired`.
+> The full re-auth workflow — detecting which workspaces are stale and the one-command
+> `scripts/auth-refresh` helper — is documented in
+> [docs/OPERATIONS.md](docs/OPERATIONS.md) §Authorization / Session Lifecycle.
+
 ### 3. Register channels to track
 
 ```bash
