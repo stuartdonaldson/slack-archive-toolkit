@@ -130,3 +130,16 @@ headless auth keep-alive (§4), then the auth pre-flight (§2), then `backup run
 digest / users / job-digest exports, appending everything to `~/slack-backups/nightly.log`.
 It deliberately does **not** `set -e`: a single workspace or channel failure — or the
 keep-alive itself — must not stop the rest of the run.
+
+### Tiered cadence (why most channels are "skipped" nightly)
+
+`backup run` no longer opens slackdump for every tracked channel each night. A cadence
+filter (`backup_logic.should_check_tonight`, table `BACKUP_CADENCE_TIERS` in
+`backup_logic.py`) skips dormant and empty channels on nights they are not due: active
+channels (last post < 8 wk) stay nightly, 8–12 wk go every other day, and > 12 wk / empty
+channels every 10 days, deterministically staggered so a tier never all runs on one night.
+The run summary line reports the not-due skip count. This is safe — the max 10-day cadence
+is far inside Slack's ~90-day retention, so a skipped channel that suddenly gets traffic is
+still re-checked while every post is live. To force a full sweep regardless of cadence, run
+`backup run` with `-f/--full`. To retune, edit the single `BACKUP_CADENCE_TIERS` constant.
+Deleting a workspace's catalog resets `last_checked`, so the next run checks everything once.

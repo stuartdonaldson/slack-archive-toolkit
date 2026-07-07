@@ -203,3 +203,26 @@ def test_effective_recency_falls_back_to_registered_at():
 def test_effective_recency_empty_string_when_totally_unknown():
     catalog = {"channels": {}}
     assert catalog_logic.effective_recency(catalog, "C1") == ""
+
+
+def test_record_check_stamps_last_checked_and_last_action(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.record_check(tmp_path, "f3test", "C1", "2026-07-07", "skip")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["last_checked"] == "2026-07-07"
+    assert data["channels"]["C1"]["last_action"] == "skip"
+
+
+def test_record_check_does_not_touch_last_posted(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.update_last_posted(tmp_path, "f3test", "C1", "2026-06-20T00:00:00Z")
+    catalog_logic.record_check(tmp_path, "f3test", "C1", "2026-07-07", "skip")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data["channels"]["C1"]["last_posted"] == "2026-06-20T00:00:00Z"
+
+
+def test_record_check_is_noop_for_unknown_channel(tmp_path):
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), [CH1]))
+    catalog_logic.record_check(tmp_path, "f3test", "C-unknown", "2026-07-07", "skip")
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert "C-unknown" not in data["channels"]

@@ -200,6 +200,25 @@ def update_last_posted(cache_dir: Path, workspace: str, channel_id: str, last_po
     save(cache_dir, workspace, data)
 
 
+def record_check(
+    cache_dir: Path, workspace: str, channel_id: str, last_checked: str, last_action: str
+) -> None:
+    """Audit trail written for every channel a backup run considers, whether
+    it was actually backed up or skipped by the cadence filter. `last_checked`
+    (ISO8601 date) drives whether the channel is due on a future run;
+    `last_action` is `resume` | `archive` | `skip` - what the run did with it.
+    Deliberately separate from last_posted (real message age, only bumped when
+    data is found) so a skipped channel still "ages" toward its next check
+    without ever looking falsely fresh. No-op if the channel isn't catalogued."""
+    data = load(cache_dir, workspace)
+    channel = data["channels"].get(channel_id)
+    if channel is None:
+        return
+    channel["last_checked"] = last_checked
+    channel["last_action"] = last_action
+    save(cache_dir, workspace, data)
+
+
 def effective_recency(catalog: dict, channel_id: str) -> str:
     """Sort key for backup ordering: real last_posted if a backup has ever
     found message data, else registered_at (when we started tracking it),

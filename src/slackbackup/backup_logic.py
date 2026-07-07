@@ -4,15 +4,31 @@ backup.sh + run-backups.sh.
 """
 from __future__ import annotations
 
+import hashlib
 import heapq
 import shutil
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import catalog_logic, channel_logic, slackdump
+
+
+# Tiered backup cadence (SlackBackup-2ut). MODIFIABLE — the whole point is
+# this is easy to tune. Each row is (min_age_weeks, cadence_days); the oldest
+# (last) row whose min_age_weeks <= the channel's last-activity age wins.
+# Rows must stay ordered youngest -> oldest (ascending min_age_weeks) and the
+# first must be (0, ...) so every channel matches at least one row.
+# Channels with no recorded last activity (empty / never posted) use the LAST
+# (oldest) row's cadence. Max cadence sits far inside Slack's ~90-day retention,
+# so backing off can never lose messages - only delay detection by a few days.
+BACKUP_CADENCE_TIERS = [
+    (0, 1),    # < 8 wk  -> every night
+    (8, 2),    # 8-12 wk -> every other day
+    (12, 10),  # > 12 wk -> every 10 days
+]
 
 
 def _ts() -> str:
@@ -26,6 +42,59 @@ def _log(msg: str, file=None) -> None:
     # minutes at a time, only catching up when the buffer fills or the
     # process exits.
     print(f"{_ts()} {msg}", file=file, flush=True)
+
+
+def _cadence_days_for_age(age_weeks: float | None) -> int:
+    """How many days apart this channel should be checked, given its
+    last-activity age in weeks. `None` (empty / never posted) -> the oldest
+    tier's cadence. See BACKUP_CADENCE_TIERS."""
+    if age_weeks is None:
+        return BACKUP_CADENCE_TIERS[-1][1]
+    for min_age_weeks, cadence_days in reversed(BACKUP_CADENCE_TIERS):
+        if age_weeks >= min_age_weeks:
+            return cadence_days
+    return BACKUP_CADENCE_TIERS[0][1]  # unreachable while first row is (0, ...)
+
+
+def _parse_date(value: str | None) -> date | None:
+    """Date portion of an ISO8601 catalog timestamp ('2026-06-20T00:00:00Z' or
+    a bare '2026-06-20'), or None if absent/blank. Week granularity is all the
+    cadence math needs, so the time-of-day and 'Z' suffix are ignored."""
+    if not value:
+        return None
+    return date.fromisoformat(value[:10])
+
+
+def _stagger_due(channel_id: str, cadence_days: int, epoch_day: int) -> bool:
+    """Deterministic phase so a tier's members spread evenly across their
+    interval instead of all firing on the same night: due iff
+    hash(channel_id) mod cadence_days == epoch_day mod cadence_days. Uses a
+    stable hash (not Python's salted hash()) so a channel's due-night is the
+    same across processes and runs."""
+    if cadence_days <= 1:
+        return True
+    phase = int(hashlib.sha1(channel_id.encode()).hexdigest(), 16) % cadence_days
+    return epoch_day % cadence_days == phase
+
+
+def should_check_tonight(entry: dict, record: dict | None, today: date) -> bool:
+    """Pure cadence filter: should this channel be backed up on `today`?
+    Answerable entirely from the catalog record (last_posted drives the tier;
+    last_checked the backstop) - the channel's sqlite is never opened on a
+    skip. Active channels (youngest tier, 1-day cadence) are always due.
+    Dormant/empty channels are due on their staggered night, and unconditionally
+    due if last_checked has aged past their cadence (downtime backstop) or was
+    never recorded - so a skip can never push a channel past Slack's retention
+    window."""
+    record = record or {}
+    last_posted = _parse_date(record.get("last_posted"))
+    age_weeks = None if last_posted is None else (today - last_posted).days / 7.0
+    cadence_days = _cadence_days_for_age(age_weeks)
+
+    last_checked = _parse_date(record.get("last_checked"))
+    if last_checked is None or (today - last_checked).days >= cadence_days:
+        return True
+    return _stagger_due(entry["id"], cadence_days, today.toordinal())
 
 
 def channel_dir(archive_root: Path, workspace: str, channel_slug: str) -> Path:
@@ -161,6 +230,7 @@ def run(
     archive_root: Path,
     full: bool = False,
     cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    today: date | None = None,
 ) -> bool:
     """Returns True if every channel backed up successfully. Within each
     workspace, channels are ordered most-recently-active first (real
@@ -206,19 +276,46 @@ def run(
     entries = _interleave_by_workspace(entries)
 
     all_ok = not skipped_workspaces
-    counts = {"archive": 0, "resume": 0, "failed": 0}
+    counts = {"archive": 0, "resume": 0, "failed": 0, "skipped": 0}
     run_start = time.monotonic()
+    today = datetime.now(timezone.utc).date() if today is None else today
+    today_iso = today.isoformat()
+
+    # Per-workspace progress: X/Y where Y is how many channels this run handles
+    # for the workspace and X the running position within it. Entries interleave
+    # across workspaces (see _interleave_by_workspace), so a workspace's X values
+    # are not consecutive in the log - the counter is what makes progress through
+    # each workspace legible.
+    ws_totals: dict[str, int] = {}
+    for entry in entries:
+        ws_totals[entry["workspace"]] = ws_totals.get(entry["workspace"], 0) + 1
+    ws_seen: dict[str, int] = {ws: 0 for ws in ws_totals}
 
     for entry in entries:
-        _log(f"backup run: backing up {entry['name']} ({entry['id']}) in {entry['workspace']}")
+        workspace = entry["workspace"]
+        ws_seen[workspace] += 1
+        progress = f"[{ws_seen[workspace]}/{ws_totals[workspace]} in {workspace}]"
+        record = catalog_cache[workspace].get("channels", {}).get(entry["id"], {})
+        # -full always re-syncs; the cadence filter only governs incremental runs.
+        if not full and not should_check_tonight(entry, record, today):
+            _log(
+                f"backup run: skipping {entry['name']} ({entry['id']}) in {workspace} "
+                f"{progress} - not due tonight (cadence)"
+            )
+            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "skip")
+            counts["skipped"] += 1
+            continue
+
+        _log(f"backup run: backing up {entry['name']} ({entry['id']}) in {workspace} {progress}")
         channel_start = time.monotonic()
         try:
             kind = backup_channel(
-                entry["id"], entry["name"], entry["workspace"], archive_root, full, cache_dir=cache_dir
+                entry["id"], entry["name"], workspace, archive_root, full, cache_dir=cache_dir
             )
             elapsed = time.monotonic() - channel_start
-            _log(f"backup run: finished {entry['name']} in {entry['workspace']} ({kind}, {elapsed:.1f}s)")
+            _log(f"backup run: finished {entry['name']} in {workspace} ({kind}, {elapsed:.1f}s)")
             counts[kind] += 1
+            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, kind)
         except slackdump.SlackdumpError as exc:
             elapsed = time.monotonic() - channel_start
             _log(
@@ -227,6 +324,7 @@ def run(
             )
             all_ok = False
             counts["failed"] += 1
+            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "failed")
 
     total_elapsed = time.monotonic() - run_start
     skipped_note = (
@@ -234,8 +332,8 @@ def run(
     )
     _log(
         f"backup run: done - {len(entries)} channel(s), {counts['archive']} archive(s), "
-        f"{counts['resume']} resume(s), {counts['failed']} failure(s){skipped_note}, "
-        f"{total_elapsed / 60:.1f} min total"
+        f"{counts['resume']} resume(s), {counts['skipped']} not-due skip(s), "
+        f"{counts['failed']} failure(s){skipped_note}, {total_elapsed / 60:.1f} min total"
     )
     return all_ok
 
