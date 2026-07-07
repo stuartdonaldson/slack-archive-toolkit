@@ -88,6 +88,16 @@ shipped local-CLI architecture.
   see `docs/DESIGN-export.md`.
 - **User profile export** (`export users`) — full per-workspace user roster with `slack_roles`
   (admin/owner/bot/etc.) — see `docs/DESIGN-export.md`.
+- **Report jobs** (`export digest --jobs 'jobs/*.json'`) — drive one or more digests (each with an
+  optional companion user roster) from operator-owned, gitignored `jobs/*.json` files that fully
+  specify their own archive root, channels file, workspaces, day window, output path
+  (`{as_of}`-templated), and leadership handler — instead of command-line flags. Wired into the
+  nightly script; F3 leadership tagging is pluggable per job — see `docs/DESIGN-export.md`.
+- **Untracked-channel digest** (`channel-digest run`) — an on-demand tool that archives every
+  channel matching an fnmatch glob (e.g. `shuttered-*`) and writes a single merge-aware JSON
+  digest of surviving messages/files/orphaned Canvases — for recovering content from channels
+  outside `channels.json` (e.g. Canvases stranded by a region migration) — see
+  `docs/DESIGN-files.md`.
 - **Cross-workspace message search** (`search messages`) — search every registered workspace
   matching a name, glob, or comma-separated selector list for a query, rendered as one HTML
   report, most recent first, linking to each channel/message. The one capability that makes a

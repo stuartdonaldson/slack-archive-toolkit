@@ -48,10 +48,15 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
   fires on one night, with `last_checked` as a downtime backstop. Skips are a pure catalog lookup —
   the channel's sqlite is never opened. Safe because the max 10-day cadence sits far inside Slack's
   ~90-day retention. `-full` bypasses the filter entirely.
-- **Export pipeline** (`export_logic.py`) — three derived, read-only products built from the
-  archive + catalog, detailed in `docs/DESIGN-export.md`: bounded per-channel-month JSON,
-  a cross-workspace digest (with per-channel context and non-image file/Canvas content pulled
-  in), and a full user-profile roster.
+- **Export pipeline** (`export_logic.py`) — read-only products built from the archive + catalog,
+  detailed in `docs/DESIGN-export.md`: bounded per-channel-month JSON, a cross-workspace digest
+  (with per-channel context and non-image file/Canvas content pulled in), a full user-profile
+  roster, and operator-owned report jobs (`--jobs`). F3-specific leadership tagging is delegated
+  to a pluggable handler (`handlers/`), keeping the engine general-purpose.
+- **Untracked-channel digest** (`channel_digest_logic.py`) — an on-demand tool that archives
+  channels by glob and writes a merge-aware JSON digest of surviving messages/files/orphaned
+  Canvases, for content outside `channels.json` — see `docs/DESIGN-files.md`. Not in the nightly
+  cadence.
 - **Search** (`search_logic.py`) — the one capability that *does* make a live call per
   invocation (`slackdump search messages`), rendered to one HTML report.
 
@@ -135,10 +140,13 @@ every other `slackdump.*` function).
 | `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob- or comma-list-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked. | No (via `catalog_logic`) |
 | `catalog_logic.py` | Owns the only call site for `slackdump.list_channels()`. Two-tier cache (fast member-only / expensive full) persisted to `~/.cache/slackbackup/<workspace>.catalog.json`. Also owns `registered_at`/`last_posted`/`effective_recency` — fields with no Slack-API source at all, purely this app's own bookkeeping. | Yes |
 | `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` after a successful backup that found data; orders a multi-channel run by `effective_recency`; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; timestamped logging + run summary. | Yes |
-| `export_logic.py` | Three read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. | Yes (`convert_export` only) |
+| `export_logic.py` | Read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster, and report-job (`--jobs`) loading/path-templating. General-purpose: all F3-specific leadership logic is delegated to a pluggable handler (`handlers/`), not inline. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. | Yes (`convert_export` only) |
+| `handlers/` (`__init__.py`, `f3.py`) | Region/workspace-specific digest processing pulled out of `export_logic.py`. `f3.py` holds every F3 title/role regex + leadership rollup behind a two-function protocol (`annotate_profile`, `build_leadership`); `__init__.py` is the registry (`get`/`NAMES`). Selected via `export digest --leadership-handler` or a job's `leadership_handler` field — see `docs/DESIGN-export.md`. | No |
+| `channel_digest_logic.py` | On-demand `channel-digest run`: archives channels matching an fnmatch glob (e.g. `shuttered-*`, untracked) and writes/merges a schema-versioned (`slack-channel-digest-v2`) JSON of surviving messages/files/orphaned Canvases — for recovering content outside `channels.json`. Not in the nightly cadence — see `docs/DESIGN-files.md`. | Yes (`archive` + `convert_export`) |
 | `search_logic.py` | Cross-workspace live message search → one HTML report. The only capability that makes a real API call on every invocation, no caching. | Yes |
 | `files_logic.py` | Summarizes an existing `index.json`. The producers (`files fetch`/`files index`) are **not yet ported** — see `docs/DESIGN-files.md` — this module only consumes whatever schema they'd produce. | No |
-| `cli.py` / `backup.py` / `channel.py` / `catalog.py` / `export.py` / `search.py` / `workspace.py` / `files.py` | Argparse wiring only — each non-`*_logic.py` module registers its subcommands and translates CLI args into a `*_logic` call. No business logic lives here. | No |
+| `selector_logic.py` | Shared comma-separated-list + glob matching (`matches_selector`/`split_selector_list` for workspace/channel selectors; `expand_path_selector` for `--jobs` filesystem-path expansion). | No |
+| `cli.py` / `backup.py` / `channel.py` / `catalog.py` / `export.py` / `search.py` / `workspace.py` / `files.py` / `channel_digest.py` | Argparse wiring only — each non-`*_logic.py` module registers its subcommands and translates CLI args into a `*_logic` call. No business logic lives here. | No |
 
 ### Level 2 — Local storage
 

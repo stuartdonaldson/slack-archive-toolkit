@@ -303,11 +303,11 @@ directly from the digest's existing `text` and `permalink` fields.
 
 Two distinct, deliberately separate signals appear in the digest:
 
-- `leadership` (top-level, `derive_leadership`) — **inferred** from display-name patterns this
-  F3 community uses to self-report a role in their own display name (e.g. `"Jane Doe - Kirkland
-  Region Nantan"`), pattern-matched against a curated title list and grouped `by_region`. This
-  is a heuristic over free text, not a Slack-platform fact — a display name can be wrong, stale,
-  or just not contain a title at all.
+- `leadership` (top-level) — **inferred** from display-name and profile-`title` patterns this
+  F3 community uses to self-report a role (e.g. `"Jane Doe - Kirkland Region Nantan"`),
+  pattern-matched against a curated title list and grouped `by_region`. This is a heuristic over
+  free text, not a Slack-platform fact — a display name can be wrong, stale, or just not contain
+  a title at all.
 - `slack_roles` (per-user, on every cleaned user object — see §User Profiles Export below) —
   **authoritative**, read directly off the raw Slack user object's own `is_owner`/`is_admin`/
   `is_bot`/etc. flags. Unrelated to leadership inference; a workspace `admin` and an F3 `Nantan`
@@ -317,6 +317,30 @@ No top-level merged "users"/"authors" table exists in the digest by design — t
 `user` id (and even the same `display_name`) in two different workspaces is **not** the same
 identity, each workspace has its own user namespace, so author info stays embedded per-message,
 scoped to that message's own workspace.
+
+#### Pluggable leadership handlers (`handlers/`)
+
+All F3-specific role logic (title/display-name regexes, AO-vs-region scoping, tenure modifiers,
+`derive_leadership`, `_build_leadership_by_region`) lives in `src/slackbackup/handlers/f3.py`,
+**not** in `export_logic.py` — the export engine stays general-purpose and delegates the whole
+`leadership` section to a handler. A handler is a module implementing two functions:
+
+- `annotate_profile(display_name, title) -> dict | None` — per-profile tagging, called once per
+  user in `build_user_profiles()`; the result is stashed on the profile as `derived_leadership`.
+- `build_leadership(profiles_doc) -> dict` — aggregates the tagged profiles into the digest's
+  top-level `leadership` section (`profile_role_matches`, `by_region`, `former_by_region`),
+  called once per `build_digest()`.
+
+`handlers/__init__.py` is a small registry (`handlers.get(name)`, `handlers.NAMES`); add a
+non-F3 region/workspace by dropping in a sibling module and registering it, without touching the
+export engine. Handler selection:
+
+- `build_user_profiles(..., handler=None)` and `build_digest(..., handler=None)` default to **no
+  handler** (empty leadership structure) — the general-purpose library default.
+- `export digest --leadership-handler <name>` defaults to `f3` for a plain (non-`--jobs`) run,
+  preserving this project's historically F3-only documented workflow.
+- Report jobs (below) default their `leadership_handler` to `none` (opt-in per job), since a job
+  may target a non-F3 workspace where F3 regexes would just produce noise.
 
 ### Output shape
 
@@ -383,10 +407,11 @@ roster's own `is_bot` flag — needed because a bot commonly posts through an or
 user account rather than the legacy `bot_id` field (e.g. the real `f3kirkland` `nation_bot_logs`
 bot posts as user `U0A3GF12LEA`, "F3 Nation").
 
-`profile_role_matches` is **inferred** role-matching output (from `derive_leadership`/workspace-
-role flags), not a raw Slack profile export — the raw per-workspace profile roster lives in
-`export users`'s own output (see §User Profiles Export below). The name was changed from the
-earlier `raw_profile_matches`, which read as if it held raw profile data when it never did.
+`profile_role_matches` is **inferred** role-matching output (from the leadership handler's
+`build_leadership`, see §Pluggable leadership handlers above), not a raw Slack profile export —
+the raw per-workspace profile roster lives in `export users`'s own output (see §User Profiles
+Export below). The name was changed from the earlier `raw_profile_matches`, which read as if it
+held raw profile data when it never did.
 
 ---
 
@@ -417,6 +442,50 @@ from `is_primary_owner`, `is_owner`, `is_admin`, `is_bot`, `is_app_user`, `is_re
 `is_ultra_restricted`, `is_stranger` (account-status flags like `is_invited_user` are excluded —
 not a role). `_clean_user` otherwise strips avatar URLs, email/phone, presence, and
 `enterprise_user` — identity fields only, same noise-stripping philosophy as message cleaning.
+
+---
+
+## Report jobs (`export digest --jobs`)
+
+A digest run can be driven by operator-owned **job files** instead of command-line flags, so
+each recipient/region gets its own fully-specified digest (and optionally a companion user
+roster) from one nightly invocation. Job files live in `jobs/*.json` and are **gitignored**
+(they name real workspaces/paths) — see `.gitignore`'s "Operator's real report/digest job
+definitions" entry.
+
+```bash
+./slackbackup export digest --jobs 'jobs/*.json'   # quote the glob so the shell doesn't expand it
+```
+
+`--jobs` takes a comma-separated list of globs and does its own comma+glob-to-filesystem
+expansion (`selector_logic.expand_path_selector`, mirroring the `matches_selector`/
+`split_selector_list` paradigm used for workspace/channel selectors): a literal path that
+matches nothing is passed through as-is (so a typo surfaces as a clear "file not found" rather
+than vanishing), while a genuinely-empty wildcard match is dropped. One digest is produced per
+matched job. When `--jobs` is given, `--archive-root`/`--channels-file`/`--leadership-handler`
+on the command line become only **fallbacks** for a job that omits the corresponding field.
+
+Each job file (`export_logic.load_job` validates `type: "digest"`, raising loudly on any
+unsupported type) can specify:
+
+| Field | Meaning | Fallback if absent |
+|-------|---------|--------------------|
+| `type` | Must be `"digest"` | — (required) |
+| `archive_root` | Archive root to read | `--archive-root` |
+| `channels_file` | `channels.json` to select from | `--channels-file` |
+| `workspaces` | Explicit workspace list (used as the selector) | `--workspace-glob` |
+| `channels` | Channel selector within those workspaces | `*` |
+| `days` | Trailing-day window (`null` = no lower bound / all history) | `--days` |
+| `out` | Output path; supports an `{as_of}` template placeholder | — (required) |
+| `users_out` | Companion user-profiles JSON path (also `{as_of}`-templated) | none — no roster written |
+| `leadership_handler` | Handler name for tagging/leadership (see §Pluggable leadership handlers) | `none` (opt-in per job) |
+
+Path handling: `expand_job_path` does `~`/`$VAR` expansion on any path read from a job file, and
+`resolve_job_out` applies `{as_of}` templating before that expansion. When `users_out` is set,
+the companion roster is written from **one shared** `build_user_profiles` call also used to build
+the digest, avoiding converting every workspace's archive twice. All job-file parsing lives in
+Python, not bash/jq. The nightly script (`scripts/nightly-backup-digest.sh`) forwards
+`--jobs "$REPO_ROOT/jobs/*.json"` after its blanket digest/users export.
 
 ---
 
