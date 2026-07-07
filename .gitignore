@@ -30,3 +30,15 @@ search-results.html
 # `channel register-matching`, reveals which real workspaces/channels are
 # being backed up. Not source; never committed.
 channels.json
+
+# DM channel-id -> user-id maps (mild PII). The repo's git history was squashed
+# once already to purge these; ignore defensively so they can never be
+# re-published from the working tree.
+channels-T*.txt
+scripts/auth-refresh/channels-T*.txt
+
+# Operator's real report/digest job definitions - reveal which real
+# workspaces/channels feed which report. Not source; never committed.
+# jobs/example-*.json is the one exception, kept tracked as a template.
+jobs/*.json
+!jobs/example-*.json

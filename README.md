@@ -93,8 +93,8 @@ also available: `./slackbackup export monthly --from ... --to ... --workspace ..
 ```bash
 ./slackbackup export digest --archive-root ~/slack-backups
 # -> ~/slack-exports/f3-digest-<today>.json
-# Defaults: last 3 months, every f3* workspace.
-# Override with --workspace-glob, --months, --as-of, --out.
+# Defaults: trailing 180 days, every f3* workspace.
+# Override with --workspace-glob, --days, --as-of, --out.
 ```
 
 One merged JSON document: all in-range messages with thread nesting, per-channel and

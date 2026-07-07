@@ -5,12 +5,11 @@ parts. Channel lookup-by-name/id is delegated to catalog_logic.lookup().
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import catalog_logic, workspace_logic
+from . import catalog_logic, selector_logic, workspace_logic
 
 
 def _now_iso() -> str:
@@ -25,7 +24,7 @@ _GLOB_CHARS = set("*?[")
 
 
 def is_glob(query: str) -> bool:
-    return any(c in _GLOB_CHARS for c in query)
+    return "," in query or any(c in _GLOB_CHARS for c in query)
 
 
 def validate(channels_file: Path) -> list[dict]:
@@ -125,7 +124,7 @@ def register_matching(
     "workspaces_checked": [...], "workspaces_skipped_unregistered": [...]}.
     """
     status = workspace_logic.status()
-    matched_workspaces = [w for w in status["known"] if fnmatch.fnmatch(w["name"], workspace_glob)]
+    matched_workspaces = [w for w in status["known"] if selector_logic.matches_selector(workspace_glob, w["name"])]
     workspaces_checked = sorted(w["name"] for w in matched_workspaces if w["registered"])
     workspaces_skipped = sorted(w["name"] for w in matched_workspaces if not w["registered"])
 
@@ -141,7 +140,7 @@ def register_matching(
                 continue
             if channel["name"].lower().startswith("shuttered"):
                 continue
-            if not fnmatch.fnmatch(channel["name"], channel_glob):
+            if not selector_logic.matches_selector(channel_glob, channel["name"]):
                 continue
             if (channel_id, workspace) in existing:
                 continue

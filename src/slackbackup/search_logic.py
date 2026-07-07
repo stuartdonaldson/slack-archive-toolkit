@@ -9,7 +9,6 @@ treats multiple query words as an implicit AND (no OR operator).
 """
 from __future__ import annotations
 
-import fnmatch
 import html
 import json
 import re
@@ -19,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from . import workspace_logic
+from . import selector_logic, workspace_logic
 
 
 class NoWorkspaceMatchError(RuntimeError):
@@ -28,10 +27,10 @@ class NoWorkspaceMatchError(RuntimeError):
 
 def select_workspaces(workspace_glob: str, tokens_file: Path = workspace_logic.DEFAULT_TOKENS_FILE) -> list[dict]:
     """Workspaces from the tokens file matching `workspace_glob` (exact
-    name or fnmatch wildcard, e.g. "f3*") - registered or not; callers
+    name, glob, or comma-separated list of selectors - registered or not; callers
     decide whether to skip unregistered ones."""
     data = workspace_logic.status(tokens_file)
-    return [w for w in data["known"] if fnmatch.fnmatch(w["name"], workspace_glob)]
+    return [w for w in data["known"] if selector_logic.matches_selector(workspace_glob, w["name"])]
 
 
 def _read_search_results(db_path: Path, workspace: str) -> list[dict]:

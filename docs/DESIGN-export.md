@@ -9,7 +9,7 @@ modifies the archive or makes a Slack API call; all three are implemented in
 | Command | Covers below | Scope |
 |---------|---------------|-------|
 | `export monthly` | §Monthly Export | One channel, bounded date range, sealed/idempotent per-month files |
-| `export digest` | §Digest Export | Many workspaces, trailing N months, one merged chronological document |
+| `export digest` | §Digest Export | Many workspaces, trailing 180 days by default (or a different N), one merged chronological document |
 | `export users` | §User Profiles Export | Full per-workspace user roster, not just digest posters |
 
 ---
@@ -256,14 +256,20 @@ boundary needed, this tool has none):
 
 ## Digest Export (`export digest`)
 
-A single merged document covering the trailing N months across every workspace matching a
-glob, intended as direct LLM input (e.g. for a newsletter-generation prompt) — unlike `export
-monthly`'s many small per-channel-month files, this is one document, one read.
+A single merged document covering the trailing 180 days by default (or a different N via
+`--days`, or every message ever archived if a job sets `"days": null`) across every workspace
+matching a glob or comma-separated selector list, intended as
+direct LLM input (e.g. for a newsletter-generation prompt) — unlike `export monthly`'s many
+small per-channel-month files, this is one document, one read.
 
 ```
 ./slackbackup export digest --archive-root <path> --channels-file ./channels.json \
-    [--workspace-glob f3*] [--months 3] [--as-of YYYY-MM-DD] --out <file.json>
+    [--workspace-glob f3*] [--days N] [--as-of YYYY-MM-DD] --out <file.json>
 ```
+
+`--days` defaults to 180 (the trailing 180 days ending at `--as-of`). Pass `--days N` to scope it
+to a different trailing window, or set a job's own `"days": null` to span everything ever archived
+instead.
 
 Best-effort across channels: a channel with no local archive is recorded with
 `status: "missing_archive"` in the `channels` array rather than aborting the run — one
@@ -318,7 +324,7 @@ scoped to that message's own workspace.
 {
   "schema_version": "slack-llm-digest-v1",
   "generated_at": "2026-06-23T18:00:00Z",
-  "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "months": 3, "workspace_glob": "f3*" },
+  "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
     "workspaces_included": 7,
     "counting_rules": {

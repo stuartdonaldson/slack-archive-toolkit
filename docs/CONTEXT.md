@@ -62,9 +62,11 @@ shipped local-CLI architecture.
 - **Workspace registration** (`workspace register/list`) — imports a session for a workspace
   from a tokens file + pasted cookie.
 - **Channel registration** (`channel register/register-matching/list/validate`) — track a
-  channel by exact name/id, or bulk-discover every new public channel matching a glob across a
-  workspace glob (e.g. nightly `channel register-matching 'f3*' '*'`), automatically excluding
-  private, archived, and `shuttered*`-named channels.
+  channel by exact name/id, or bulk-discover every new public channel matching a glob or
+  comma-separated selector list across a workspace glob (e.g. nightly `channel
+  register-matching 'f3*' '*'` or `channel register-matching 'f3pugetsound,f3kirkland'
+  'helpdesk,event-*'`), automatically excluding private, archived, and `shuttered*`-named
+  channels.
 - **Channel catalog** (`catalog show`) — a persistent, two-tier (fast member-only / explicit
   full) cache of channel metadata (description, creator, created, private/archived flags) plus
   this app's own recency bookkeeping (`registered_at`, `last_posted`) — see `docs/DESIGN-files.md`.
@@ -76,7 +78,8 @@ shipped local-CLI architecture.
   idempotent per-month JSON files with thread replies nested under their parent — see
   `docs/DESIGN-export.md`.
 - **Cross-workspace digest** (`export digest`) — one merged, chronological JSON document
-  covering the trailing N months across every workspace matching a glob, enriched with
+  covering the trailing 180 days by default (or a different N via `--days`) across every
+  workspace matching a glob or comma-separated selector list, enriched with
   per-channel context, non-image file/Canvas content, and both inferred leadership roles and
   authoritative Slack account roles — designed as direct LLM input, e.g. for a newsletter
   prompt. Also carries precomputed per-channel and per-workspace activity counts (message/
@@ -86,9 +89,9 @@ shipped local-CLI architecture.
 - **User profile export** (`export users`) — full per-workspace user roster with `slack_roles`
   (admin/owner/bot/etc.) — see `docs/DESIGN-export.md`.
 - **Cross-workspace message search** (`search messages`) — search every registered workspace
-  matching a name or glob for a query, rendered as one HTML report, most recent first, linking
-  to each channel/message. The one capability that makes a live Slack API call (via slackdump)
-  on every invocation rather than working off a local cache.
+  matching a name, glob, or comma-separated selector list for a query, rendered as one HTML
+  report, most recent first, linking to each channel/message. The one capability that makes a
+  live Slack API call (via slackdump) on every invocation rather than working off a local cache.
 - **Canvas/file catalog** — designed (`docs/DESIGN-files.md`) but **not yet ported to Python**;
   the shell implementation (`scripts/fetch-files.sh`, `scripts/build-file-index.sh`) is the only
   one that exists today.
@@ -172,9 +175,10 @@ Preconditions:
 
 Primary Flow:
 1. Operator runs `./slackbackup export digest --archive-root <path> [--workspace-glob f3*]
-   [--months 3]`
+   [--days N]`
 2. The tool selects channels matching the workspace glob from `channels.json`, computes the
-   trailing N-month range, and for each channel with a local archive: converts it via slackdump,
+   date range (the trailing 180 days by default, or the trailing N days if `--days` was given), and
+   for each channel with a local archive: converts it via slackdump,
    extracts in-range messages with thread nesting, enriches with channel context from the
    catalog (read-only, no live API call) and non-image file/Canvas content read directly from
    the archive
@@ -222,6 +226,6 @@ Acceptance Criteria:
 | archive | One channel's durable local backup: a `slackdump.sqlite` database plus downloaded file blobs, at `<archive-root>/<workspace>/<channel>/` |
 | catalog | This app's own persistent cache of channel metadata, two-tier (fast member-only / explicit full), at `~/.cache/slackbackup/<workspace>.catalog.json` — see `docs/DESIGN-files.md` |
 | `registered_at` / `last_posted` | This app's own recency bookkeeping in the catalog (no Slack-API source) — when a channel was first tracked, and the real last-message time once a backup finds data — used to order multi-channel backup runs |
-| digest | The cross-workspace, trailing-N-months, single-document export meant for LLM consumption (`export digest`) — see `docs/DESIGN-export.md` |
+| digest | The cross-workspace, single-document export meant for LLM consumption, covering the trailing 180 days by default or a different trailing N days via `--days` (`export digest`) — see `docs/DESIGN-export.md` |
 | `channels.json` | Repo-root join-key list (`{id, name, workspace}`) of tracked channels — deliberately minimal; richer metadata lives in the catalog, not here |
 | tokens file | `~/.slackdump-tokens.json`, a flat `{workspace: xoxc-token}` map the operator maintains by hand; never committed |

@@ -16,18 +16,19 @@ otherwise it's rewritten even though sealed.
 """
 from __future__ import annotations
 
-import fnmatch
 import json
+import os
 import re
 import sqlite3
 import tempfile
 from calendar import monthrange
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, AbstractSet
 
-from . import catalog_logic
+from . import catalog_logic, selector_logic
+from .handlers import f3 as _default_handler
 
 _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
 
@@ -266,23 +267,61 @@ def export_transform(
     return results
 
 
-# --- digest: one merged document spanning the trailing N months across every
-# workspace matching a glob, separate from the per-channel-month exporter
-# above (different schema, different purpose - see docs/llm-export-suggestion.md). ---
+# --- digest: one merged document spanning every message ever archived (or
+# the trailing N days, via --days) across every workspace matching a glob,
+# separate from the per-channel-month exporter above (different schema,
+# different purpose - see docs/llm-export-suggestion.md). ---
+
+
+def load_job(job_file: Path) -> dict:
+    """Reads one jobs/*.json report definition (see .gitignore's comment on
+    that path - operator-specific, never committed). Currently only
+    type="digest" is implemented; other types raise so a typo'd or
+    future-schema job fails loudly instead of silently producing nothing.
+
+    Also validates "workspaces" is a list of workspace-name strings, not
+    just present - a bare string (e.g. "f3pugetsound" instead of
+    ["f3pugetsound"]) would otherwise iterate character-by-character where
+    it's joined into a glob at the call site, silently producing a nonsense
+    glob instead of failing loudly."""
+    job = json.loads(job_file.read_text())
+    if job.get("type") != "digest":
+        raise ValueError(f"{job_file}: unsupported job type {job.get('type')!r}")
+    if "workspaces" not in job:
+        raise ValueError(f"{job_file}: missing required 'workspaces' list")
+    workspaces = job["workspaces"]
+    if not isinstance(workspaces, list) or not all(isinstance(w, str) for w in workspaces):
+        raise ValueError(f"{job_file}: 'workspaces' must be a list of workspace names, got {workspaces!r}")
+    return job
+
+
+def expand_job_path(value: str) -> Path:
+    """`~`/`~user` and `$VAR`/`${VAR}` expansion for a path read out of a
+    job file - job files are hand-edited operator config, not code, so they
+    get the same shorthand a shell would give them."""
+    return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def resolve_job_out(out_template: str, as_of: str) -> Path:
+    return expand_job_path(out_template.replace("{as_of}", as_of))
 
 
 def select_channels(channels_file: Path, workspace_glob: str = "f3*") -> list[dict]:
     entries = json.loads(channels_file.read_text())
-    return [e for e in entries if fnmatch.fnmatch(e["workspace"], workspace_glob)]
+    return [e for e in entries if selector_logic.matches_selector(workspace_glob, e["workspace"])]
 
 
-def trailing_months_range(months: int, as_of: str) -> tuple[str, str]:
-    """`months` calendar months ending at `as_of`: from = the 1st of the
-    month (months - 1) before as_of's month; to = as_of itself."""
-    year, mon = (int(part) for part in as_of[:7].split("-"))
-    total = year * 12 + (mon - 1) - (months - 1)
-    from_year, from_mon = divmod(total, 12)
-    return f"{from_year}-{from_mon + 1:02d}-01", as_of
+def trailing_days_range(days: int | None, as_of: str) -> tuple[str | None, str]:
+    """Trailing `days` calendar days ending at `as_of`, inclusive of both
+    ends (days=1 means just as_of's own date). `days=None` means no lower
+    bound at all - digest every message ever archived. This function itself
+    has no default: callers (export.py's CLI and --jobs runner) supply
+    days=180 unless overridden, so `None` only reaches here when a caller
+    explicitly asks for an unbounded digest."""
+    if days is None:
+        return None, as_of
+    from_date = date.fromisoformat(as_of) - timedelta(days=days - 1)
+    return from_date.isoformat(), as_of
 
 
 def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
@@ -427,309 +466,6 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
 
     files.sort(key=lambda f: f["created_at"] or "")
     return files
-
-
-# --- leadership inference: best-effort, display-name-only signal per
-# docs/llm-export-suggestion.md's "profile-inferred roles" proposal, tuned
-# per docs/llm-leadership-improvement.md's feedback (dedup, wider role
-# coverage, compact-name-region parsing). Extend the two data lists freely
-# - they're config, not logic; the patterns list needs a regex if a new
-# title doesn't fit \bword\b matching, but most will.
-
-_LEADERSHIP_TITLE_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("Nantan", re.compile(r"nantan", re.I)),
-    ("Weasel Shaker", re.compile(r"weasel\s*shaker", re.I)),
-    ("1st F", re.compile(r"\b1st\s*f\b|\bfirst\s*f\b", re.I)),
-    ("2nd F", re.compile(r"\b2nd\s*f\b|\bsecond\s*f\b", re.I)),
-    ("3rd F", re.compile(r"\b3rd\s*f\b|\bthird\s*f\b", re.I)),
-    ("Comz", re.compile(r"\bcomz\b|\bcommunications?\b", re.I)),
-    ("Site Q", re.compile(r"\bsite[-\s]?q\b", re.I)),
-    ("Region Q", re.compile(r"\bregion\s*q\b", re.I)),
-    ("AOQ", re.compile(r"\baoq\b|\bao[-\s]q\b", re.I)),
-    ("Q Lead", re.compile(r"\bq\s*lead\b", re.I)),
-    ("SLT", re.compile(r"\bslt\b|\bshared\s+leadership\s+team\b", re.I)),
-    ("OIC", re.compile(r"\boic\b", re.I)),
-    ("EH Lead", re.compile(r"\beh\s*lead\b", re.I)),
-    ("Fight Lead", re.compile(r"\bfight\s*lead\b", re.I)),
-    ("FNG Lead", re.compile(r"\bfng\s*lead\b", re.I)),
-    # Bare "Q" last and lowest-confidence signal of the bunch - dropped
-    # below when a more specific Q-variant above already matched, so a
-    # single mention doesn't produce two redundant role entries.
-    ("Q", re.compile(r"\bq\b", re.I)),
-]
-
-_SPECIFIC_Q_TITLES = {"Q Lead", "Site Q", "Region Q", "AOQ"}
-
-# Roles scoped to a specific AO/channel rather than the whole region.
-# "Redmond Ridge Site Q" → Site Q for the ao-redmond-ridge channel.
-_AO_SCOPED_ROLES = {"Site Q", "AOQ", "OIC"}
-
-# Ordered by specificity — emeritus/retired before the generic "former" bucket.
-# "\bex-" (no closing \b) intentionally matches "ex-" as a prefix modifier
-# (e.g. "Ex-Nantan") without requiring a word boundary after the hyphen.
-_MODIFIER_TO_STATUS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bemeritus\b", re.I), "emeritus"),
-    (re.compile(r"\bretired\b", re.I), "retired"),
-    (re.compile(
-        r"\bformer\b|\bex-|\bpast\b|\bprevious\b|\boutgoing\b"
-        r"|\bstepping\s+down\b|\bwas\b|\bused\s+to\s+be\b",
-        re.I,
-    ), "former"),
-]
-
-
-def _detect_modifier(text: str) -> tuple[str | None, str | None]:
-    """Returns (matched_text, status) for the first tenure modifier found in
-    `text`, or (None, None) if none present. Checks emeritus/retired before
-    the generic "former" bucket so they keep their own label."""
-    for pattern, status in _MODIFIER_TO_STATUS:
-        m = pattern.search(text)
-        if m:
-            return m.group(0), status
-    return None, None
-
-
-def _role_status(modifier_status: str | None, confidence: str) -> tuple[str, bool | None]:
-    """Derive (status, is_current) from modifier presence and confidence.
-    Modifier always wins: is_current=False, status from the modifier.
-    No modifier: confidence="high" → "current"/True; lower → "unclear"/None
-    (display-name sources are not maintained so we can't assert is_current)."""
-    if modifier_status is not None:
-        return modifier_status, False
-    if confidence == "high":
-        return "current", True
-    return "unclear", None
-
-_REGION_NAMES = {
-    "f3pugetsound": "Puget Sound",
-    "f3kirkland": "Kirkland",
-    "f3cascades": "Cascades",
-    "f3tundra": "Tundra",
-    "f3redmond": "Redmond",
-    "f3seattle": "Seattle",
-}
-
-_NAME_SEPARATORS = (" - ", " – ", " — ", "|")
-_PAREN_RE = re.compile(r"\s*\(")
-_COMPACT_HYPHEN_REGION_RE = re.compile(
-    r"^(?P<name>[A-Za-z0-9_]+)-(?:" + "|".join(re.escape(r) for r in _REGION_NAMES.values()) + r")\b",
-    re.I,
-)
-
-
-def _match_titles(display_name: str) -> list[str]:
-    matched = [
-        canonical
-        for canonical, pattern in _LEADERSHIP_TITLE_PATTERNS
-        if pattern.search(display_name)
-    ]
-    if "Q" in matched and any(title in matched for title in _SPECIFIC_Q_TITLES):
-        matched.remove("Q")
-    return matched
-
-
-def _split_possible_name(display_name: str) -> tuple[str, bool]:
-    """Returns (possible_f3_name, structured) - structured is True when a
-    recognized name/region delimiter was found, used to set confidence.
-    Handles "<Name> - <Region> Region <Role>", "<Name> (<Region> <Role>)",
-    and the compact "<Name>-<Region> Region <Role>" form (no spaces around
-    the hyphen) - reported broken for "Montoya-Kirkland Region Nantan"."""
-    for sep in _NAME_SEPARATORS:
-        if sep in display_name:
-            return display_name.split(sep, 1)[0].strip(), True
-
-    paren_match = _PAREN_RE.search(display_name)
-    if paren_match:
-        return display_name[: paren_match.start()].strip(), True
-
-    compact_match = _COMPACT_HYPHEN_REGION_RE.match(display_name)
-    if compact_match:
-        return compact_match.group("name"), True
-
-    return display_name.strip(), False
-
-
-def _title_segment_prefix(segment: str, position: str) -> str | None:
-    """Text before the role keyword in a title segment — the location part
-    of '<Location> <Role>', e.g. 'Redmond Ridge' from 'Redmond Ridge Site Q'."""
-    _, pattern = next(((p, r) for p, r in _LEADERSHIP_TITLE_PATTERNS if p == position), (None, None))
-    if pattern is None:
-        return None
-    m = pattern.search(segment)
-    return segment[: m.start()].strip() or None if m else None
-
-
-def _parse_title_segments(title: str) -> list[dict]:
-    """Parse a Slack profile title field into per-segment role entries.
-    Each comma-separated segment is treated as '<Location> <Role>', e.g.
-    'Redmond Ridge Site Q, Redmond Comz Q'. Title is explicitly set so
-    these roles carry higher confidence than display-name inference.
-
-    AO-scoped roles (Site Q, AOQ, OIC) emit possible_ao (the AO/channel
-    name, e.g. 'Redmond Ridge') alongside possible_region. Regional roles
-    emit only possible_region.
-
-    Modifier words (Emeritus, Former, Retired, etc.) detected per segment
-    set status/is_current so former roles don't pollute the current
-    leadership summary."""
-    roles = []
-    for segment in re.split(r"\s*,\s*", title):
-        segment = segment.strip()
-        if not segment:
-            continue
-        matched = _match_titles(segment)
-        if not matched:
-            continue
-        matched_region = next(
-            (region for region in _REGION_NAMES.values() if region.lower() in segment.lower()),
-            None,
-        )
-        modifier_detected, modifier_status = _detect_modifier(segment)
-        status, is_current = _role_status(modifier_status, "high")
-        for position in matched:
-            entry: dict = {
-                "position": position,
-                "basis": "title",
-                "confidence": "high",
-                "needs_confirmation": False,
-                "possible_region": f"F3 {matched_region}" if matched_region else None,
-                "status": status,
-                "is_current": is_current,
-                "modifier_detected": modifier_detected,
-                "source_text": segment,
-            }
-            if position in _AO_SCOPED_ROLES:
-                entry["possible_ao"] = _title_segment_prefix(segment, position)
-            roles.append(entry)
-    return roles
-
-
-def derive_leadership(display_name: str | None, title: str | None = None) -> dict | None:
-    """Display names and profile titles are both practical working signals
-    for "who currently holds this role". Display-name inference is
-    best-effort (needs_confirmation=True); title-field roles carry higher
-    confidence since the field is set explicitly. Returns None when neither
-    source matches any known F3 role pattern."""
-    dn_roles: list[dict] = []
-    dn_region: str | None = None
-    possible_f3_name: str | None = None
-
-    if display_name:
-        matched_titles = _match_titles(display_name)
-        possible_f3_name, structured = _split_possible_name(display_name)
-        if matched_titles:
-            confidence = "medium_high" if structured else "medium"
-            dn_region = next(
-                (region for region in _REGION_NAMES.values() if region.lower() in display_name.lower()),
-                None,
-            )
-            modifier_detected, modifier_status = _detect_modifier(display_name)
-            status, is_current = _role_status(modifier_status, confidence)
-            dn_roles = [
-                {
-                    "position": t,
-                    "basis": "display_name",
-                    "confidence": confidence,
-                    "needs_confirmation": True,
-                    "status": status,
-                    "is_current": is_current,
-                    "modifier_detected": modifier_detected,
-                    "source_text": display_name,
-                }
-                for t in matched_titles
-            ]
-
-    title_roles = _parse_title_segments(title) if title else []
-
-    if not dn_roles and not title_roles:
-        return None
-
-    return {
-        "possible_f3_name": possible_f3_name,
-        "possible_region": f"F3 {dn_region}" if dn_region else None,
-        "possible_roles": dn_roles + title_roles,
-    }
-
-
-_CONFIDENCE_RANK = {"medium": 1, "medium_high": 2}
-
-
-def _build_leadership_by_region(raw_matches: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Dedupes raw_matches by (region, f3_name, position) - the same
-    person commonly has a separate Slack account per workspace, each
-    independently matching the same self-reported role; without this, the
-    same leader is repeated once per workspace (reported in
-    docs/llm-leadership-improvement.md).
-
-    Returns (by_region, former_by_region): roles where is_current is not
-    False go to by_region (current/unclear); roles where is_current is False
-    go to former_by_region. When the same (region, f3_name, position) key
-    has both former and non-former sources (unusual but possible across
-    workspace accounts), they land in separate groups."""
-    current_groups: dict[tuple, dict] = {}
-    former_groups: dict[tuple, dict] = {}
-
-    for record in raw_matches:
-        derived = record["derived"]
-        if derived is None:
-            # Admin/owner-only entries (no display-name title match) have
-            # no role/region to group by - they still appear in
-            # profile_role_matches, just not in this rollup.
-            continue
-        f3_name = derived["possible_f3_name"]
-        for role in derived["possible_roles"]:
-            region = role.get("possible_region") or derived["possible_region"] or "Unknown"
-            key = (region, f3_name, role["position"])
-            target = former_groups if role.get("is_current") is False else current_groups
-            group = target.setdefault(
-                key,
-                {
-                    "workspaces": set(), "display_names": set(), "profile_ids": set(),
-                    "confidence": role["confidence"], "statuses": set(),
-                },
-            )
-            group["workspaces"].add(record["workspace"])
-            group["display_names"].add(record["display_name"])
-            group["profile_ids"].add(record["id"])
-            group["statuses"].add(role.get("status", "unclear"))
-            if _CONFIDENCE_RANK.get(role["confidence"], 0) > _CONFIDENCE_RANK.get(group["confidence"], 0):
-                group["confidence"] = role["confidence"]
-
-    def _groups_to_list(groups: dict, *, is_current: bool | None) -> list[dict]:
-        by_region: dict[str, list[dict]] = {}
-        # Most-specific-wins ordering for status label within a group.
-        _STATUS_PRIORITY = ("emeritus", "retired", "former", "current", "unclear")
-        for (region, f3_name, position), group in groups.items():
-            statuses = group["statuses"]
-            status = next((s for s in _STATUS_PRIORITY if s in statuses), "unclear")
-            by_region.setdefault(region, []).append(
-                {
-                    "position": position,
-                    "f3_name": f3_name,
-                    "status": status,
-                    "is_current": is_current,
-                    "confidence": group["confidence"],
-                    "basis": "display_name",
-                    "seen_in_workspaces": sorted(group["workspaces"]),
-                    "source_display_names": sorted(group["display_names"]),
-                    "source_profile_ids": sorted(group["profile_ids"]),
-                    # Always True, deliberately not matching the literal example
-                    # in docs/llm-leadership-improvement.md: the same self-
-                    # reported display name repeated across a person's per-
-                    # workspace accounts is not independent corroboration, so it
-                    # doesn't earn "confirmed" - basis is still display_name-only.
-                    "needs_confirmation": True,
-                }
-            )
-        return [
-            {"region": r, "roles": sorted(by_region[r], key=lambda x: (x["position"], x["f3_name"] or ""))}
-            for r in sorted(by_region)
-        ]
-
-    return (
-        _groups_to_list(current_groups, is_current=None),
-        _groups_to_list(former_groups, is_current=False),
-    )
 
 
 def select_messages_in_range(
@@ -916,18 +652,21 @@ def build_digest(
     channels_file: Path,
     archive_root: Path,
     workspace_glob: str,
-    months: int,
+    days: int | None,
     as_of: str,
     convert_fn: Callable[[Path, Path], None],
     catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    handler=_default_handler,
+    profiles_doc: dict | None = None,
 ) -> dict:
     """Reads every (workspace, channel) in `channels_file` matching
     `workspace_glob`, converts each channel's archive (via `convert_fn` -
     normally `slackdump.convert_export`, injected so tests can fake it),
-    and merges the trailing `months` months of messages into one
-    chronologically-sorted document. A channel with no archive on disk is
-    recorded with status "missing_archive" and skipped - one un-archived
-    channel must not abort a digest spanning many workspaces.
+    and merges messages from the trailing `days` days (or everything ever
+    archived, when `days` is None) into one chronologically-sorted
+    document. A channel with no archive on disk is recorded with status
+    "missing_archive" and skipped - one un-archived channel must not abort
+    a digest spanning many workspaces.
 
     Deliberately has no top-level merged "users"/"authors" table: the same
     Slack user id (or display name) in two different workspaces is not the
@@ -938,9 +677,19 @@ def build_digest(
     (see _load_channel_files) - read directly from the channel's own
     archive, not via convert_fn, since an unattached channel Canvas never
     surfaces in a message-anchored export.
+
+    `handler` (see handlers/__init__.py) supplies the digest's "leadership"
+    section - defaults to the "f3" handler for backward compatibility with
+    this project's original (F3-only) purpose; pass handler=None to disable
+    leadership inference entirely (an empty leadership section), which is
+    the right choice for a non-F3 workspace. `profiles_doc`, if the caller
+    already built one (e.g. to also write it out as a standalone
+    deliverable - see export.py's job runner), is reused as-is instead of
+    re-converting every workspace's archive a second time; it must already
+    be tagged by the same `handler`.
     """
-    date_from, date_to = trailing_months_range(months, as_of)
-    from_epoch = _date_epoch(date_from, "00:00:00")
+    date_from, date_to = trailing_days_range(days, as_of)
+    from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
     to_epoch = _date_epoch(date_to, "23:59:59")
 
     # Built up front (not after the channel loop) because per-channel
@@ -950,7 +699,8 @@ def build_digest(
     # user account rather than via Slack's legacy bot_id field, so a
     # bot_id-prefix check alone misses it (see SlackBackup follow-up: the
     # f3kirkland nation_bot_logs bot posts as user U0A3GF12LEA).
-    profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn)
+    if profiles_doc is None:
+        profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
     bot_ids_by_workspace: dict[str, set[str]] = {
         ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
         for ws_entry in profiles_doc["workspaces"]
@@ -1002,43 +752,23 @@ def build_digest(
 
     messages.sort(key=lambda m: float(m["ts"]))
 
-    # Leadership candidates: scanned from the full per-workspace roster
-    # (build_user_profiles), not just this digest's posters - a leader who
-    # didn't happen to post in this window should still surface. This is
-    # the digest's *only* profile data; everyone else in the roster is
-    # intentionally left out (see build_user_profiles for the full list).
-    leadership: list[dict] = []
-    for ws_entry in profiles_doc["workspaces"]:
-        if ws_entry["status"] != "ok":
-            continue
-        for profile in ws_entry["profiles"]:
-            signal = derive_leadership(profile["display_name"], profile.get("title"))
-            # admin/owner/primary_owner is an authoritative Slack-platform
-            # role, not an inferred one - include the profile even when its
-            # display name doesn't match any F3 title pattern, so a
-            # workspace admin/owner is never silently dropped from the
-            # leadership list just because derive_leadership() found nothing.
-            has_workspace_role = bool({"admin", "owner", "primary_owner"} & set(profile["slack_roles"]))
-            if signal is None and not has_workspace_role:
-                continue
-            leadership.append(
-                {
-                    "id": profile["id"],
-                    "workspace": ws_entry["workspace"],
-                    "display_name": profile["display_name"],
-                    "real_name": profile["real_name"],
-                    "title": profile.get("title"),
-                    "slack_roles": profile["slack_roles"],
-                    "derived": signal,
-                }
-            )
-
-    by_region, former_by_region = _build_leadership_by_region(leadership)
+    # Leadership candidates come from the full per-workspace roster
+    # (build_user_profiles/profiles_doc), not just this digest's posters -
+    # a leader who didn't happen to post in this window should still
+    # surface. This is the digest's *only* profile data; everyone else in
+    # the roster is intentionally left out (see build_user_profiles for the
+    # full list). Delegated entirely to `handler` - see its module docstring
+    # in handlers/__init__.py; an empty section when no handler is set.
+    leadership = (
+        handler.build_leadership(profiles_doc)
+        if handler is not None
+        else {"profile_role_matches": [], "by_region": [], "former_by_region": []}
+    )
 
     return {
         "schema_version": "slack-llm-digest-v1",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "export_scope": {"from": date_from, "to": date_to, "months": months, "workspace_glob": workspace_glob},
+        "export_scope": {"from": date_from, "to": date_to, "days": days, "workspace_glob": workspace_glob},
         "manifest": {
             "workspaces_included": len({c["workspace"] for c in channels_meta}),
             "counting_rules": {
@@ -1056,11 +786,7 @@ def build_digest(
         "channels": channels_meta,
         "workspace_activity_index": _build_workspace_activity_index(channels_meta, activity_by_channel),
         "messages": messages,
-        "leadership": {
-            "profile_role_matches": leadership,
-            "by_region": by_region,
-            "former_by_region": former_by_region,
-        },
+        "leadership": leadership,
     }
 
 
@@ -1113,11 +839,18 @@ def build_user_profiles(
     archive_root: Path,
     workspace_glob: str,
     convert_fn: Callable[[Path, Path], None],
+    handler=None,
 ) -> dict:
     """users.json from `convert -f export` is workspace-scoped, identical
     no matter which of that workspace's channels you convert - so this
     converts just one archived channel per workspace (whichever is
-    archived first) to fetch it, rather than every channel."""
+    archived first) to fetch it, rather than every channel.
+
+    `handler` (see handlers/__init__.py), when given, tags each profile
+    with a "derived_leadership" field via handler.annotate_profile() -
+    None (the default) leaves profiles untouched, since this general-
+    purpose roster export has no reason to assume any particular region's
+    role vocabulary unless asked."""
     by_workspace: dict[str, list[dict]] = {}
     for entry in select_channels(channels_file, workspace_glob):
         by_workspace.setdefault(entry["workspace"], []).append(entry)
@@ -1139,9 +872,12 @@ def build_user_profiles(
             users_file = export_dir_path / "users.json"
             raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
 
-        workspaces_out.append(
-            {"workspace": workspace, "status": "ok", "profiles": [_clean_user(u) for u in raw_users]}
-        )
+        profiles = [_clean_user(u) for u in raw_users]
+        if handler is not None:
+            for profile in profiles:
+                profile["derived_leadership"] = handler.annotate_profile(profile["display_name"], profile["title"])
+
+        workspaces_out.append({"workspace": workspace, "status": "ok", "profiles": profiles})
 
     return {
         "schema_version": "slack-user-profiles-v1",

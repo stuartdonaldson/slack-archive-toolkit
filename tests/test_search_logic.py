@@ -38,6 +38,18 @@ def test_select_workspaces_glob_excludes_others(tmp_path, monkeypatch):
     assert {w["name"] for w in matched} == {"f3pugetsound", "f3kirkland"}
 
 
+def test_select_workspaces_accepts_comma_separated_list(tmp_path, monkeypatch):
+    tokens_file = tmp_path / "tokens.json"
+    tokens_file.write_text(json.dumps({
+        "f3pugetsound": "xoxc-a", "f3kirkland": "xoxc-b", "dungeons-of-finn-hill": "xoxc-c",
+    }))
+    monkeypatch.setattr(workspace_logic.slackdump, "workspace_list", lambda: "")
+
+    matched = search_logic.select_workspaces("f3pugetsound,f3kirkland", tokens_file)
+
+    assert {w["name"] for w in matched} == {"f3pugetsound", "f3kirkland"}
+
+
 def test_search_messages_skips_unregistered_and_collects_registered(tmp_path, monkeypatch):
     tokens_file = tmp_path / "tokens.json"
     tokens_file.write_text(json.dumps({"f3pugetsound": "xoxc-a", "f3kirkland": "xoxc-b"}))

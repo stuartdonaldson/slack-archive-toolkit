@@ -49,5 +49,14 @@ mkdir -p "$HOME/slack-exports"
     ./slackbackup export users --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
     echo "----- users export exited $? -----"
 
+    # Per-recipient report jobs (jobs/*.json, gitignored - see .gitignore's
+    # comment on that pattern): each job file names its own workspace
+    # subset, channels file, and output path. The glob is quoted so the
+    # shell passes it through literally - --jobs does its own comma+glob
+    # expansion (selector_logic.expand_path_selector), same paradigm as
+    # --workspace-glob/--channel selectors elsewhere in this CLI.
+    ./slackbackup export digest --archive-root "$ARCHIVE_ROOT" --jobs "$REPO_ROOT/jobs/*.json"
+    echo "----- job digests exited $? -----"
+
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest finished ====="
 } >> "$LOG_FILE" 2>&1

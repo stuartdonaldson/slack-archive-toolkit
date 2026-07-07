@@ -72,7 +72,7 @@ For each region, include a **Leadership Team Snapshot** with separate tables for
 
 * **Current Regional leadership**
 
-Use this table format:  List positions that are identified in order of Nantan, Weazel Shaker, 1st F, 2nd F, 3rd F, IT Q, Commz Q, F3 Nation Admin, ...
+Use this table format:  List positions that are identified in order of Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, IT Q, Comz Q, F3 Nation Admin, ...
 
 | Position | F3 Name | Source / confidence |
 | -------- | ------- | ------------------- |
