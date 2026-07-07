@@ -16,12 +16,13 @@ def register(groups: argparse._SubParsersAction) -> None:
         help="search messages across workspaces matching <workspace>, render results as one HTML report",
         epilog=(
             "Example:\n"
+            "  ./slackbackup search messages 'f3pugetsound,f3kirkland' convergence pax\n"
             "  ./slackbackup search messages 'f3*' convergence pax\n"
             "Output: ./search-results.html by default (override with --out)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_messages.add_argument("workspace", help="exact workspace name or glob, e.g. f3pugetsound or 'f3*'")
+    p_messages.add_argument("workspace", help="exact workspace name, glob, or comma-separated list, e.g. f3pugetsound or 'f3*'")
     p_messages.add_argument("query", nargs="+", help="search query words (implicit AND, no OR operator)")
     p_messages.add_argument("--out", default="./search-results.html")
     p_messages.set_defaults(handler=_messages)

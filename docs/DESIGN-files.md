@@ -106,6 +106,37 @@ search-result databases under the new `fetch-files.sh` output root):
   stdout convention follows `export_transform.sh`'s existing
   `wrote`/`skipped`/`empty` style.
 
+## Channel digest (`channel-digest run`) — implemented
+
+The file-harvesting design above (`fetch-files.sh`/`build-file-index.sh`) remains shell-only and
+best-effort. A separate, **implemented** Python command covers the specific case that motivated
+it in practice — recovering orphaned channel-level Canvases and residual messages from
+**untracked** channels (e.g. `shuttered-*` channels a region migration left behind, whose
+standalone Canvas — `FILE.MESSAGE_ID IS NULL` — never migrated with the message history):
+
+```bash
+./slackbackup channel-digest run <workspace> <pattern> <out_dir>
+# e.g. ./slackbackup channel-digest run f3pugetsound 'shuttered-*' ~/slack-backups/shuttered-digest
+```
+
+- `<pattern>` is an fnmatch glob against channel name. Every matching channel is archived (a full
+  `slackdump archive`, since these are untracked and have no prior checkpoint), then a single
+  JSON digest of surviving messages/files/canvases is written, authors resolved via the workspace
+  roster. Unlike a Canvas linked in a message, a channel-level Canvas is captured by `slackdump
+  archive` regardless of whether any message references it — but only for a channel that is
+  actually archived, which untracked channels never are under the normal backup cadence.
+- Output is a schema-versioned document (`slack-channel-digest-v2`,
+  `channel_digest_logic.SCHEMA_VERSION`) following the same `schema_version` convention as
+  `export_logic`'s digests — the primary consumer is an LLM, not a human skimming a table.
+- `merge_digests()` makes a re-run against an existing `out_dir` **merge** rather than overwrite:
+  it tracks `first_seen_at`/`last_seen_at` per channel/message/file and `content_last_changed_at`
+  per file, so a later pass can show what is new or changed. Merging across a schema-version
+  change is refused loudly.
+- **Deliberately manual/on-demand** — not wired into the nightly backup cadence, and it writes
+  outside the repo (it contains real names/chat content). Implemented in
+  `src/slackbackup/channel_digest.py` + `channel_digest_logic.py`. Tracked as `SlackBackup-ie2`
+  (closed).
+
 ## Channel catalog design
 
 Generalizes the original shell `register-channel.sh`'s `get_channel_list()` /

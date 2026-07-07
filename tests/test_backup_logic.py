@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import re
+from datetime import date, timedelta
 
 import pytest
 
@@ -341,7 +342,7 @@ def test_run_logs_a_final_summary(tmp_path, monkeypatch, capsys):
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
 
     out = capsys.readouterr().out
-    assert "done - 1 channel(s), 0 archive(s), 1 resume(s), 0 failure(s)" in out
+    assert "done - 1 channel(s), 0 archive(s), 1 resume(s), 0 not-due skip(s), 0 failure(s)" in out
 
 
 def test_run_log_lines_are_timestamped(tmp_path, monkeypatch, capsys):
@@ -414,3 +415,184 @@ def test_sync_catalog_from_local_does_not_overwrite_existing_registered_at(tmp_p
 
     catalog = backup_logic.catalog_logic.load(cache_dir, "f3a")
     assert catalog["channels"]["C1"]["registered_at"] == "2020-01-01T00:00:00Z"
+
+
+# --- Tiered backup cadence (SlackBackup-2ut) ---
+
+TODAY = date(2026, 7, 7)
+
+
+def _iso_days_ago(today, days):
+    return (today - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+
+
+def test_cadence_days_active_channel_is_nightly():
+    # posted 3 weeks ago -> youngest tier -> checked every night
+    assert backup_logic._cadence_days_for_age(3.0) == 1
+
+
+def test_cadence_days_empty_channel_uses_oldest_tier():
+    # no recorded last activity -> oldest (longest) cadence
+    oldest = backup_logic.BACKUP_CADENCE_TIERS[-1][1]
+    assert backup_logic._cadence_days_for_age(None) == oldest
+
+
+@pytest.mark.parametrize(
+    "age_weeks,expected",
+    [(0.0, 1), (5.0, 1), (7.9, 1), (8.0, 2), (10.0, 2), (11.9, 2), (12.0, 10), (30.0, 10)],
+)
+def test_cadence_tiers_boundaries(age_weeks, expected):
+    assert backup_logic._cadence_days_for_age(age_weeks) == expected
+
+
+def test_should_check_tonight_active_channel_always_due():
+    record = {"last_posted": _iso_days_ago(TODAY, 7), "last_checked": _iso_days_ago(TODAY, 1)}
+    assert backup_logic.should_check_tonight({"id": "C1"}, record, TODAY) is True
+
+
+def test_should_check_tonight_dormant_skipped_on_non_due_night():
+    # 20 weeks dormant -> 10-day cadence; find a channel id + today where the
+    # stagger phase does NOT line up, and last_checked is recent enough that the
+    # downtime backstop stays silent.
+    record = {"last_posted": _iso_days_ago(TODAY, 20 * 7), "last_checked": _iso_days_ago(TODAY, 1)}
+    skipped_any = any(
+        backup_logic.should_check_tonight({"id": f"C{i}"}, record, TODAY) is False
+        for i in range(50)
+    )
+    assert skipped_any  # at least some dormant channels are skipped on a given night
+
+
+def test_should_check_tonight_dormant_due_when_last_checked_older_than_cadence():
+    # backstop: never let a dormant channel drift past its cadence, regardless of stagger
+    record = {"last_posted": _iso_days_ago(TODAY, 20 * 7), "last_checked": _iso_days_ago(TODAY, 11)}
+    assert backup_logic.should_check_tonight({"id": "C1"}, record, TODAY) is True
+
+
+def test_should_check_tonight_empty_never_checked_is_due():
+    # empty channel, never checked -> must be picked up
+    assert backup_logic.should_check_tonight({"id": "C1"}, {}, TODAY) is True
+
+
+def test_should_check_tonight_staggers_tier_and_covers_within_cadence():
+    cadence = backup_logic.BACKUP_CADENCE_TIERS[-1][1]  # oldest tier cadence
+    ids = [f"C{i}" for i in range(100)]
+    due_by_day = []
+    seen_due = set()
+    for offset in range(cadence):
+        day = TODAY + timedelta(days=offset)
+        # last_checked one day back each night so the backstop never fires -> pure stagger
+        record = {"last_checked": (day - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")}
+        due_today = {cid for cid in ids if backup_logic.should_check_tonight({"id": cid}, record, day)}
+        due_by_day.append(len(due_today))
+        seen_due |= due_today
+
+    assert max(due_by_day) < len(ids)  # never the whole tier on one night
+    assert seen_due == set(ids)  # every channel checked at least once within its cadence
+
+
+def test_run_logs_per_workspace_progress_counter(tmp_path, monkeypatch, capsys):
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "A1", "name": "a1", "workspace": "f3a"},
+        {"id": "A2", "name": "a2", "workspace": "f3a"},
+        {"id": "B1", "name": "b1", "workspace": "f3b"},
+    ]))
+
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "archive")
+
+    backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache", today=TODAY)
+
+    out = capsys.readouterr().out
+    # f3a has two channels, f3b one - each workspace counts independently
+    assert "backing up a1 (A1) in f3a [1/2 in f3a]" in out
+    assert "backing up a2 (A2) in f3a [2/2 in f3a]" in out
+    assert "backing up b1 (B1) in f3b [1/1 in f3b]" in out
+
+
+def test_run_skips_dormant_channel_not_due_and_records_skip(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([{"id": "C1", "name": "dormant", "workspace": "f3a"}]))
+    backup_logic.catalog_logic.save(
+        cache_dir, "f3a",
+        {
+            "channels": {
+                "C1": {
+                    "member": True, "name": "dormant",
+                    "last_posted": _iso_days_ago(TODAY, 20 * 7),
+                    "last_checked": _iso_days_ago(TODAY, 1),
+                }
+            },
+            "fast_refreshed_at": 0.0, "full_refreshed_at": 0.0,
+        },
+    )
+
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    # force this channel onto a non-due stagger night
+    monkeypatch.setattr(backup_logic, "should_check_tonight", lambda entry, record, today: False)
+
+    attempted = []
+    monkeypatch.setattr(
+        backup_logic, "backup_channel",
+        lambda *a, **kw: attempted.append(a) or "resume",
+    )
+
+    backup_logic.run(channels_file, tmp_path / "archive", cache_dir=cache_dir, today=TODAY)
+
+    assert attempted == []  # no backup, no slackdump, no sqlite touch
+    catalog = backup_logic.catalog_logic.load(cache_dir, "f3a")
+    assert catalog["channels"]["C1"]["last_action"] == "skip"
+    assert catalog["channels"]["C1"]["last_checked"] == TODAY.isoformat()
+
+
+def test_run_records_last_checked_and_last_action_for_checked_channel(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([{"id": "C1", "name": "active", "workspace": "f3a"}]))
+    backup_logic.catalog_logic.save(
+        cache_dir, "f3a",
+        {"channels": {"C1": {"member": True, "name": "active"}}, "fast_refreshed_at": 0.0, "full_refreshed_at": 0.0},
+    )
+
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "resume")
+
+    backup_logic.run(channels_file, tmp_path / "archive", cache_dir=cache_dir, today=TODAY)
+
+    catalog = backup_logic.catalog_logic.load(cache_dir, "f3a")
+    assert catalog["channels"]["C1"]["last_checked"] == TODAY.isoformat()
+    assert catalog["channels"]["C1"]["last_action"] == "resume"
+
+
+def test_run_full_resync_ignores_cadence_and_checks_everything(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([{"id": "C1", "name": "dormant", "workspace": "f3a"}]))
+    backup_logic.catalog_logic.save(
+        cache_dir, "f3a",
+        {
+            "channels": {
+                "C1": {
+                    "member": True, "name": "dormant",
+                    "last_posted": _iso_days_ago(TODAY, 20 * 7),
+                    "last_checked": _iso_days_ago(TODAY, 1),
+                }
+            },
+            "fast_refreshed_at": 0.0, "full_refreshed_at": 0.0,
+        },
+    )
+
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    # even if cadence would skip, -full must run
+    monkeypatch.setattr(backup_logic, "should_check_tonight", lambda entry, record, today: False)
+
+    attempted = []
+    monkeypatch.setattr(
+        backup_logic, "backup_channel",
+        lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append(slug) or "archive",
+    )
+
+    backup_logic.run(channels_file, tmp_path / "archive", full=True, cache_dir=cache_dir, today=TODAY)
+
+    assert attempted == ["dormant"]

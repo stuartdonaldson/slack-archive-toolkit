@@ -29,14 +29,34 @@ mkdir -p "$HOME/slack-exports"
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
 
-#    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
-#    echo "----- backup run exited $? -----"
+    # Keep slackdump credentials in sync with Slack's cookie rotation before the
+    # backup (bd SlackBackup-5df): headless re-capture from the persistent browser
+    # profile so sessions don't silently expire between nightly runs. Non-fatal -
+    # a hard logout still needs an interactive `npm run refresh`.
+    "$REPO_ROOT/scripts/auth-refresh/keepalive.sh" || echo "----- keepalive exited $? (continuing) -----"
+
+    # Announce any still-expired workspaces up front (bd SlackBackup-d70) rather
+    # than discovering them channel-by-channel mid-run. Informational only -
+    # always exits 0, so it never blocks the backup below.
+    "$REPO_ROOT/scripts/preflight-auth.sh" channels.json
+
+    ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
+    echo "----- backup run exited $? -----"
 
     ./slackbackup export digest --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
     echo "----- digest exited $? -----"
 
     ./slackbackup export users --archive-root "$ARCHIVE_ROOT" --channels-file channels.json
     echo "----- users export exited $? -----"
+
+    # Per-recipient report jobs (jobs/*.json, gitignored - see .gitignore's
+    # comment on that pattern): each job file names its own workspace
+    # subset, channels file, and output path. The glob is quoted so the
+    # shell passes it through literally - --jobs does its own comma+glob
+    # expansion (selector_logic.expand_path_selector), same paradigm as
+    # --workspace-glob/--channel selectors elsewhere in this CLI.
+    ./slackbackup export digest --archive-root "$ARCHIVE_ROOT" --jobs "$REPO_ROOT/jobs/*.json"
+    echo "----- job digests exited $? -----"
 
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest finished ====="
 } >> "$LOG_FILE" 2>&1

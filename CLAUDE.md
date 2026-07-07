@@ -21,7 +21,8 @@
 | Quality goals, stakeholders | docs/CONTEXT.md |
 | Glossary | docs/CONTEXT.md |
 | Architecture, modules, data model | docs/DESIGN.md |
-| Deployment, configuration, failure modes | docs/OPERATIONS.md _(not yet created)_ |
+| Deployment, configuration, failure modes | docs/OPERATIONS.md |
+| Authorization / session re-auth workflow | docs/OPERATIONS.md §Authorization |
 | Current state | `bd ready` |
 | Identified work | bd |
 | Technical decisions | docs/adr/ |

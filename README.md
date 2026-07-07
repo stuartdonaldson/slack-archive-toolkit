@@ -65,6 +65,11 @@ workspace import` under the hood, which needs both the token (from the file) and
 cookie (passed fresh — slackdump doesn't persist cookies, since they expire) every time
 you register or re-register.
 
+> **Sessions expire.** When they do, backups fail with `authentication details expired`.
+> The full re-auth workflow — detecting which workspaces are stale and the one-command
+> `scripts/auth-refresh` helper — is documented in
+> [docs/OPERATIONS.md](docs/OPERATIONS.md) §Authorization / Session Lifecycle.
+
 ### 3. Register channels to track
 
 ```bash
@@ -88,13 +93,20 @@ also available: `./slackbackup export monthly --from ... --to ... --workspace ..
 ```bash
 ./slackbackup export digest --archive-root ~/slack-backups
 # -> ~/slack-exports/f3-digest-<today>.json
-# Defaults: last 3 months, every f3* workspace.
-# Override with --workspace-glob, --months, --as-of, --out.
+# Defaults: trailing 180 days, every f3* workspace.
+# Override with --workspace-glob, --days, --as-of, --out.
 ```
 
 One merged JSON document: all in-range messages with thread nesting, per-channel and
 per-workspace activity counts, inferred leadership roles (from display names and profile
 titles), and non-image file/Canvas content.
+
+For repeatable, per-recipient runs, drive the digest from **job files** instead of flags:
+`./slackbackup export digest --jobs 'jobs/*.json'`. Each gitignored `jobs/*.json` fully
+specifies its own archive root, channels file, workspaces, day window, output path
+(`{as_of}`-templated), optional companion user roster, and leadership handler — one digest per
+job. This is what the nightly script runs after the blanket digest. See
+[docs/DESIGN-export.md](docs/DESIGN-export.md) §Report jobs.
 
 ### 6. Generate the user profile report
 
@@ -125,6 +137,14 @@ Feed the digest JSON plus [`docs/fng-getting-started-prompt.md`](docs/fng-gettin
 to an LLM to produce a "Slack: Start Here / FAQ" guide for new members, sourced only from the
 digest's actual channels/roles/events — same pattern as the newsletter above.
 
+### Recovering content from untracked channels (optional)
+
+`./slackbackup channel-digest run <workspace> '<glob>' <out_dir>` archives every channel
+matching an fnmatch glob (e.g. `'shuttered-*'`) and writes a single merge-aware JSON digest of
+surviving messages, files, and orphaned Canvases — for pulling content out of channels that
+aren't in `channels.json` (e.g. Canvases stranded by a region migration). On-demand, not part of
+the nightly run. See [docs/DESIGN-files.md](docs/DESIGN-files.md) §Channel digest.
+
 Run `./slackbackup help` for the full command list.
 
 ---
@@ -135,8 +155,8 @@ Run `./slackbackup help` for the full command list.
 |----------|---------|
 | [CONTEXT.md](docs/CONTEXT.md) | Purpose, capabilities, use cases |
 | [DESIGN.md](docs/DESIGN.md) | Per-channel backup architecture, modules, key decisions |
-| [DESIGN-export.md](docs/DESIGN-export.md) | Export pipeline: monthly per-channel JSON, cross-workspace LLM digest, user-profile roster |
-| [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog (implemented) + canvas/file harvesting (designed, not yet ported to Python) |
+| [DESIGN-export.md](docs/DESIGN-export.md) | Export pipeline: monthly per-channel JSON, cross-workspace LLM digest, user-profile roster, report jobs, pluggable leadership handlers |
+| [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog + untracked-channel digest (implemented) + canvas/file harvesting (designed, not yet ported to Python) |
 | [references/slackdump-cli-notes.md](docs/references/slackdump-cli-notes.md) | slackdump CLI behavior, costs, and gotchas learned the hard way — check before re-deriving |
 | [ADRs](docs/adr/) | Architecture decision records |
 

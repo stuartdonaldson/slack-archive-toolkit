@@ -1,12 +1,14 @@
-"""Tests for the LLM digest export: one merged document spanning the
-trailing N months across every f3* workspace. Separate from
-test_export_logic.py (the per-channel-month exporter) - different schema,
-same underlying fixtures.
+"""Tests for the LLM digest export: one merged document spanning every
+message ever archived (or the trailing N days, via --days) across every
+f3* workspace. Separate from test_export_logic.py (the per-channel-month
+exporter) - different schema, same underlying fixtures.
 """
 import json
 import shutil
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 from slackbackup import catalog_logic, export_logic
 
@@ -41,12 +43,56 @@ def test_select_channels_matches_glob_excludes_others(tmp_path):
     assert {e["workspace"] for e in selected} == {"f3pugetsound", "f3kirkland"}
 
 
-def test_trailing_months_range_within_year():
-    assert export_logic.trailing_months_range(3, "2026-06-23") == ("2026-04-01", "2026-06-23")
+def test_select_channels_accepts_comma_separated_workspace_list(tmp_path):
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "1st-f", "workspace": "f3kirkland"},
+        {"id": "C3", "name": "ai-coding", "workspace": "dungeons-of-finn-hill"},
+    ]))
+
+    selected = export_logic.select_channels(channels_file, "f3pugetsound,f3kirkland")
+    assert {e["workspace"] for e in selected} == {"f3pugetsound", "f3kirkland"}
 
 
-def test_trailing_months_range_crosses_year_boundary():
-    assert export_logic.trailing_months_range(3, "2026-01-15") == ("2025-11-01", "2026-01-15")
+def test_trailing_days_range_within_month():
+    assert export_logic.trailing_days_range(10, "2026-06-23") == ("2026-06-14", "2026-06-23")
+
+
+def test_trailing_days_range_crosses_year_boundary():
+    assert export_logic.trailing_days_range(30, "2026-01-15") == ("2025-12-17", "2026-01-15")
+
+
+def test_trailing_days_range_none_means_unbounded():
+    assert export_logic.trailing_days_range(None, "2026-06-23") == (None, "2026-06-23")
+
+
+def test_load_job_rejects_workspaces_given_as_a_bare_string(tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps({
+        "type": "digest", "archive_root": "/archive", "workspaces": "f3pugetsound", "out": "out-{as_of}.json",
+    }))
+
+    with pytest.raises(ValueError):
+        export_logic.load_job(job_file)
+
+
+def test_load_job_rejects_missing_workspaces(tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps({"type": "digest", "archive_root": "/archive", "out": "out-{as_of}.json"}))
+
+    with pytest.raises(ValueError):
+        export_logic.load_job(job_file)
+
+
+def test_load_job_accepts_workspaces_as_a_list(tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps({
+        "type": "digest", "archive_root": "/archive", "workspaces": ["f3pugetsound"], "out": "out-{as_of}.json",
+    }))
+
+    job = export_logic.load_job(job_file)
+    assert job["workspaces"] == ["f3pugetsound"]
 
 
 def test_digest_message_url():
@@ -98,7 +144,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
     ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -119,7 +165,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
     assert "authors" not in result
 
     # Fixture display names ("Al", "Caz", ...) carry no leadership signal.
-    assert result["leadership"] == {"profile_role_matches": [], "by_region": []}
+    assert result["leadership"] == {"profile_role_matches": [], "by_region": [], "former_by_region": []}
 
 
 def test_build_digest_thread_rollup_fields_on_parent_message(tmp_path):
@@ -134,7 +180,7 @@ def test_build_digest_thread_rollup_fields_on_parent_message(tmp_path):
     ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -160,7 +206,7 @@ def test_build_digest_manifest_describes_counting_rules(tmp_path):
     channels_file.write_text(json.dumps([]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -204,7 +250,7 @@ def test_build_digest_workspace_activity_index_excludes_bot_channel_from_human_v
             _fake_convert(channel_dir, out_dir)
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -258,7 +304,7 @@ def test_build_digest_most_active_human_channel_excludes_bot_posting_as_ordinary
             ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -300,7 +346,7 @@ def test_build_digest_most_active_channel_excludes_bot_only_channel_when_it_woul
             ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_fn,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -460,7 +506,7 @@ def test_build_digest_includes_non_image_files_per_channel(tmp_path):
     ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -488,7 +534,7 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
     catalog_logic.save(cache_dir, "f3pugetsound", catalog)
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=cache_dir,
     )
 
@@ -510,7 +556,7 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
     ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "never-warmed-cache",
     )
 
@@ -548,7 +594,7 @@ def test_build_digest_leadership_includes_workspace_admin_without_title_match(tm
         (out_dir / "users.json").write_text(json.dumps(users))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_admin,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_admin,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -558,111 +604,6 @@ def test_build_digest_leadership_includes_workspace_admin_without_title_match(tm
     assert admin_entry["derived"] is None
     # No derived role/region to group by - doesn't appear in by_region.
     assert result["leadership"]["by_region"] == []
-
-
-def test_derive_leadership_none_for_plain_display_name():
-    assert export_logic.derive_leadership("Al") is None
-    assert export_logic.derive_leadership(None) is None
-    assert export_logic.derive_leadership("") is None
-
-
-def test_derive_leadership_matches_title_and_region():
-    signal = export_logic.derive_leadership("Columbia - Cascades Region Nantan")
-    assert signal["possible_f3_name"] == "Columbia"
-    assert signal["possible_region"] == "F3 Cascades"
-    assert signal["possible_roles"] == [
-        {"position": "Nantan", "basis": "display_name", "confidence": "medium_high", "needs_confirmation": True}
-    ]
-
-
-def test_derive_leadership_no_separator_is_lower_confidence_no_region():
-    signal = export_logic.derive_leadership("Comz Guy")
-    assert signal["possible_f3_name"] == "Comz Guy"
-    assert signal["possible_region"] is None
-    assert signal["possible_roles"][0]["confidence"] == "medium"
-
-
-def test_derive_leadership_compact_hyphen_region_parses_name_correctly():
-    # Reported broken in docs/llm-leadership-improvement.md: no spaces
-    # around the hyphen, so the old separator-only logic fell back to the
-    # whole string as the "name".
-    signal = export_logic.derive_leadership("Montoya-Kirkland Region Nantan")
-    assert signal["possible_f3_name"] == "Montoya"
-    assert signal["possible_region"] == "F3 Kirkland"
-    assert signal["possible_roles"][0]["confidence"] == "medium_high"
-
-
-def test_derive_leadership_paren_region_form():
-    signal = export_logic.derive_leadership("Quesadillah (F3 Ellensburg Nantan)")
-    assert signal["possible_f3_name"] == "Quesadillah"
-    # Ellensburg isn't a tracked f3* region - correctly left unresolved
-    # rather than guessed.
-    assert signal["possible_region"] is None
-    assert signal["possible_roles"][0]["confidence"] == "medium_high"
-
-
-def test_derive_leadership_name_then_role_then_region_order():
-    signal = export_logic.derive_leadership("Tardy - Kirkland 3rd F")
-    assert signal["possible_f3_name"] == "Tardy"
-    assert signal["possible_region"] == "F3 Kirkland"
-    assert {r["position"] for r in signal["possible_roles"]} == {"3rd F"}
-
-
-def test_derive_leadership_weaselshaker_no_space_variant():
-    signal = export_logic.derive_leadership("Voltaire - Weaselshaker Tundra")
-    assert signal["possible_f3_name"] == "Voltaire"
-    assert signal["possible_region"] == "F3 Tundra"
-    assert {r["position"] for r in signal["possible_roles"]} == {"Weasel Shaker"}
-
-
-def test_derive_leadership_multiple_roles_no_redundant_bare_q():
-    signal = export_logic.derive_leadership("Columbia - 1stF Q Cascades")
-    assert signal["possible_f3_name"] == "Columbia"
-    assert signal["possible_region"] == "F3 Cascades"
-    assert {r["position"] for r in signal["possible_roles"]} == {"1st F", "Q"}
-
-
-def test_derive_leadership_specific_q_variant_suppresses_bare_q():
-    signal = export_logic.derive_leadership("Sitwell - Site Q Kirkland")
-    positions = {r["position"] for r in signal["possible_roles"]}
-    assert positions == {"Site Q"}
-    assert "Q" not in positions
-
-
-def test_derive_leadership_title_two_segments_different_regions():
-    # "Redmond Ridge Site Q, Redmond Comz Q" — real title format per user feedback.
-    signal = export_logic.derive_leadership("Combine", title="Redmond Ridge Site Q, Redmond Comz Q")
-    assert signal["possible_f3_name"] == "Combine"
-    roles = signal["possible_roles"]
-    site_q = next(r for r in roles if r["position"] == "Site Q")
-    comz = next(r for r in roles if r["position"] == "Comz")
-    # Site Q is AO-scoped: emits possible_ao for the workout location and
-    # possible_region derived from known region names within the prefix.
-    assert site_q["basis"] == "title"
-    assert site_q["confidence"] == "high"
-    assert site_q["needs_confirmation"] is False
-    assert site_q["possible_ao"] == "Redmond Ridge"
-    assert site_q["possible_region"] == "F3 Redmond"
-    # Comz Q is region-scoped: possible_region only, no possible_ao.
-    assert comz["basis"] == "title"
-    assert comz["possible_region"] == "F3 Redmond"
-    assert "possible_ao" not in comz
-
-
-def test_derive_leadership_title_only_no_display_name_match():
-    # Title alone (plain display name) should still surface roles.
-    signal = export_logic.derive_leadership("Dude", title="Kirkland Nantan")
-    assert signal is not None
-    positions = {r["position"] for r in signal["possible_roles"]}
-    assert "Nantan" in positions
-    title_roles = [r for r in signal["possible_roles"] if r["basis"] == "title"]
-    assert all(r["confidence"] == "high" for r in title_roles)
-    assert all(r["needs_confirmation"] is False for r in title_roles)
-
-
-def test_derive_leadership_none_when_both_sources_empty():
-    assert export_logic.derive_leadership("Dude", title="Community Manager") is None
-    assert export_logic.derive_leadership(None, title=None) is None
 
 
 def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_path):
@@ -686,7 +627,7 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
         (out_dir / "users.json").write_text(json.dumps(users))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_leader,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_leader,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -706,7 +647,11 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
                 "possible_f3_name": "Columbia",
                 "possible_region": "F3 Cascades",
                 "possible_roles": [
-                    {"position": "Nantan", "basis": "display_name", "confidence": "medium_high", "needs_confirmation": True}
+                    {
+                        "position": "Nantan", "basis": "display_name", "confidence": "medium_high",
+                        "needs_confirmation": True, "status": "unclear", "is_current": None,
+                        "modifier_detected": None, "source_text": "Columbia - Cascades Region Nantan",
+                    }
                 ],
             },
         }
@@ -718,6 +663,8 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
                 {
                     "position": "Nantan",
                     "f3_name": "Columbia",
+                    "status": "unclear",
+                    "is_current": None,
                     "confidence": "medium_high",
                     "basis": "display_name",
                     "seen_in_workspaces": ["f3pugetsound"],
@@ -728,6 +675,7 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
             ],
         }
     ]
+    assert result["leadership"]["former_by_region"] == []
 
 
 def test_build_digest_leadership_dedupes_same_person_across_workspaces(tmp_path):
@@ -757,7 +705,7 @@ def test_build_digest_leadership_dedupes_same_person_across_workspaces(tmp_path)
         (out_dir / "users.json").write_text(json.dumps(users))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", convert_with_leader,
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_leader,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -781,7 +729,7 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
     ]))
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", 3, "2026-06-23", _fake_convert,
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
@@ -792,3 +740,114 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
         }
     ]
     assert result["messages"] == []
+
+
+def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_with_former(channel_dir: Path, out_dir: Path) -> None:
+        _fake_convert(channel_dir, out_dir)
+        users = json.loads((out_dir / "users.json").read_text())
+        users.append({
+            "id": "UFORMER", "name": "ex_nantan", "real_name": "Old Leader",
+            "profile": {"display_name": "OldLeader", "title": "Former Cascades Nantan"},
+        })
+        (out_dir / "users.json").write_text(json.dumps(users))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_former,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["leadership"]["by_region"] == []
+    former = result["leadership"]["former_by_region"]
+    assert len(former) == 1
+    role = former[0]["roles"][0]
+    assert role["position"] == "Nantan"
+    assert role["status"] == "former"
+    assert role["is_current"] is False
+
+
+def test_build_digest_emeritus_in_display_name_goes_to_former_by_region(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_with_emeritus(channel_dir: Path, out_dir: Path) -> None:
+        _fake_convert(channel_dir, out_dir)
+        users = json.loads((out_dir / "users.json").read_text())
+        users.append({
+            "id": "UEMERITUS", "name": "padre", "real_name": "Padre",
+            # Sanitized real-world format: modifier after role, trailing noise after " - "
+            "profile": {"display_name": "Padre - Seattle Region Nantan Emeritus - 206.555.1234"},
+        })
+        (out_dir / "users.json").write_text(json.dumps(users))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_emeritus,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["leadership"]["by_region"] == []
+    former = result["leadership"]["former_by_region"]
+    assert len(former) == 1
+    role = former[0]["roles"][0]
+    assert role["status"] == "emeritus"
+    assert role["is_current"] is False
+
+
+def test_build_digest_title_high_role_wins_confidence_and_currency(tmp_path):
+    # A profile carrying both a display-name (medium_high) and an explicit
+    # title (high) role for the same region/position merges into one rollup
+    # group. The group must report the title's "high" confidence (not the
+    # display name's "medium_high") and, since its status resolves to
+    # "current", is_current must be True - not None.
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_with_title(channel_dir: Path, out_dir: Path) -> None:
+        _fake_convert(channel_dir, out_dir)
+        users = json.loads((out_dir / "users.json").read_text())
+        users.append({
+            "id": "ULEADER", "name": "columbia", "real_name": "Real Columbia",
+            "profile": {
+                "display_name": "Columbia - Cascades Region Nantan",
+                "title": "Cascades Nantan",
+            },
+        })
+        (out_dir / "users.json").write_text(json.dumps(users))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_title,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    by_region = result["leadership"]["by_region"]
+    assert len(by_region) == 1
+    role = by_region[0]["roles"][0]
+    assert role["position"] == "Nantan"
+    assert role["confidence"] == "high"
+    assert role["status"] == "current"
+    assert role["is_current"] is True
+    assert result["leadership"]["former_by_region"] == []

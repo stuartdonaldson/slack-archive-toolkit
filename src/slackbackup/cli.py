@@ -14,9 +14,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="slackbackup")
     groups = parser.add_subparsers(dest="group", required=True)
 
-    from . import backup, catalog, channel, export, files, search, workspace
+    from . import backup, catalog, channel, channel_digest, export, files, search, workspace
 
-    for module in (workspace, channel, catalog, backup, export, files, search):
+    for module in (workspace, channel, catalog, backup, export, files, search, channel_digest):
         module.register(groups)
 
     help_parser = groups.add_parser("help", help="list every command with a brief description")

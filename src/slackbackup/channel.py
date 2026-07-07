@@ -14,10 +14,12 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_register = sub.add_parser(
         "register",
         help="look up a channel by name/id and add it to channels.json - both "
-        "arguments accept globs to register many channels/workspaces at once",
+        "arguments accept globs or comma-separated selector lists to register many "
+        "channels/workspaces at once",
         epilog=(
             "Examples:\n"
             "  ./slackbackup channel register f3pugetsound helpdesk\n"
+            "  ./slackbackup channel register 'f3pugetsound,f3kirkland' 'helpdesk,event-*'\n"
             "  ./slackbackup channel register 'f3*' '*'  "
             "# every new public channel, every registered f3* workspace\n"
             "Output: appends {id, name, workspace} per new channel to --channels-file\n"
@@ -25,7 +27,7 @@ def register(groups: argparse._SubParsersAction) -> None:
             "        in either argument) keeps the original single-match behavior -\n"
             "        errors on no match or an ambiguous match instead of registering\n"
             "        nothing. Any glob character ('*', '?', '[') in either argument\n"
-            "        switches to the bulk path, which always checks the full (not\n"
+            "        or a comma-separated list switches to the bulk path, which always checks the full (not\n"
             "        just member) channel catalog and silently registers zero or\n"
             "        more channels - nothing to call ambiguous. The bulk path always\n"
             "        skips private, archived, and \"shuttered*\"-named channels,\n"
@@ -33,9 +35,9 @@ def register(groups: argparse._SubParsersAction) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_register.add_argument("workspace", help="exact workspace name, or a glob like 'f3*'")
+    p_register.add_argument("workspace", help="exact workspace name, a glob like 'f3*', or a comma-separated list")
     p_register.add_argument(
-        "channel", help="channel name (with or without #), raw channel id, or a glob like '*'"
+        "channel", help="channel name (with or without #), raw channel id, a glob like '*', or a comma-separated list"
     )
     p_register.add_argument("--channels-file", default="./channels.json")
     p_register.set_defaults(handler=_register)

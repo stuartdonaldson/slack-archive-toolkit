@@ -134,6 +134,7 @@ def test_list_for_workspace_marks_registered_status(tmp_path, monkeypatch):
 @pytest.mark.parametrize("query,expected", [
     ("general", False), ("f3pugetsound", False), ("C0123", False),
     ("f3*", True), ("*", True), ("event-?", True), ("[ab]ot", True),
+    ("f3pugetsound,f3kirkland", True),
 ])
 def test_is_glob(query, expected):
     assert channel_logic.is_glob(query) is expected
@@ -214,6 +215,41 @@ def test_register_matching_filters_by_channel_glob(tmp_path, monkeypatch):
     result = channel_logic.register_matching("f3pugetsound", "event-*", channels_file, cache_dir=tmp_path / "cache")
 
     assert [e["id"] for e in result["added"]] == ["C1"]
+
+
+def test_register_matching_accepts_comma_separated_workspace_and_channel_lists(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([
+            {"name": "f3pugetsound", "registered": True},
+            {"name": "f3kirkland", "registered": True},
+            {"name": "dungeons-of-finn-hill", "registered": True},
+        ]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "f3pugetsound": {"channels": {
+                "C1": {"member": True, "name": "helpdesk", "description": ""},
+                "C2": {"member": True, "name": "event-spring-fling", "description": ""},
+            }},
+            "f3kirkland": {"channels": {
+                "C3": {"member": True, "name": "helpdesk", "description": ""},
+            }},
+        }[ws],
+    )
+
+    result = channel_logic.register_matching(
+        "f3pugetsound,f3kirkland", "helpdesk,event-*", channels_file, cache_dir=tmp_path / "cache"
+    )
+
+    assert sorted(result["workspaces_checked"]) == ["f3kirkland", "f3pugetsound"]
+    assert {(e["workspace"], e["name"]) for e in result["added"]} == {
+        ("f3pugetsound", "helpdesk"),
+        ("f3pugetsound", "event-spring-fling"),
+        ("f3kirkland", "helpdesk"),
+    }
 
 
 def test_register_matching_reports_unregistered_workspaces_without_erroring(tmp_path, monkeypatch):

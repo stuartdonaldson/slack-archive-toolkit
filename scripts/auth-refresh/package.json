@@ -1,0 +1,17 @@
+{
+  "name": "slackbackup-auth-refresh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One-command Slack session refresh: reads xoxc token + xoxd cookie from a persistent Chromium profile and re-registers expired workspaces with slackdump.",
+  "bin": { "refresh-auth": "./refresh-auth.mjs" },
+  "scripts": {
+    "test": "node --test",
+    "refresh": "node refresh-auth.mjs",
+    "refresh:dry": "node refresh-auth.mjs --dry-run",
+    "keepalive": "node refresh-auth.mjs --keepalive"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.59.1"
+  }
+}

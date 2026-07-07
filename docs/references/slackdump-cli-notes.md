@@ -112,6 +112,12 @@ Conclusions:
 
 ## `list channels`
 
+- **The per-invocation workspace flag is `-workspace <name>`, NOT `-w`.** `list channels`
+  rejects `-w` with `flag provided but not defined: -w` (exit 2) — there is no short
+  alias, and the flag goes *after* the subcommand (`slackdump list channels
+  -member-only -workspace f3cascades`), not before it. On an expired session this same
+  call exits **4** and prints `authentication details expired, relogin is necessary` to
+  stderr — which is exactly how `scripts/preflight-auth.sh` detects stale workspaces.
 - **`-member-only` is cheap.** Returned 52 channels for `f3pugetsound` in a couple of
   seconds, no rate-limit errors.
 - **Without `-member-only` (i.e. "all public channels") is expensive and throttle-

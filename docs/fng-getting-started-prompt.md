@@ -38,6 +38,8 @@ Cover, briefly:
 
 1. Slack setup usually happens after the first workout and once the new guy has an F3 name.
 2. Join the local Slack workspace for the AO or region where he first posted.
+
+   * The f3 puget sound region helpdesk has a document that contains invite links. Refer them there rather than include the link here.
 3. Join the AO channel; ask the PAX who invited him, the Q, or someone from the workout which channel to join.
 4. Set up the Slack profile:
 

@@ -60,3 +60,65 @@ Added Slack profile `title` as a leadership signal: `_clean_user()` now emits `t
 
 ### Key Learnings:
 Profile `title` fields often contain comma-separated multi-role entries (e.g., "Redmond Ridge Site Q, Redmond Comz Q") that should be parsed as independent roles per segment so they group correctly by region in leadership rollups. AO-scoped role detection (Site Q vs regional Comz Q) requires prefix detection — the role name alone doesn't carry the scope; the location segment (e.g., "Redmond Ridge") must map to a known AO to disambiguate.
+
+## 2026-07-03 09:52:40
+
+### Summary:
+Investigated why a Slack Canvas ("REGION INFO", F08235A783C) wasn't appearing in regular backups for f3pugetsound. Traced it to channel `shuttered-region-redmond` (C07CW28MTRP), a channel outside `channels.json`'s tracked set, left behind by an f3pugetsound region migration to its own workspace. Confirmed `slackdump archive` does capture channel-level canvases (FILE.MESSAGE_ID IS NULL) for tracked channels regardless of whether they're linked in a message, but untracked channels get nothing.
+
+Built a new general-purpose CLI command, `slackbackup channel-digest run <workspace> <pattern> <out_dir>` (`src/slackbackup/channel_digest.py` + `channel_digest_logic.py`), that archives every channel matching an fnmatch glob and writes a single JSON digest of surviving messages/files/canvases with authors resolved via the workspace roster. Deliberately a manual, on-demand tool - not wired into the nightly backup cadence.
+
+Iterated the output format from markdown to a schema-versioned JSON document (`slack-channel-digest-v2`) matching the project's existing digest conventions (export_logic's schema_version pattern), since the primary consumer is an LLM, not a human skimming a table. Added `merge_digests()` so re-running the command against the same out_dir merges into the existing digest rather than overwriting it - tracks `first_seen_at`/`last_seen_at` per channel/message/file and `content_last_changed_at` per file, so a future re-run can show what's new or changed since the last pass.
+
+Ran it against f3pugetsound's 70 `shuttered-*` channels: 19 had surviving content (mostly orphaned channel-level canvases; a couple with a few residual messages), 0 errors. Digest written to `~/slack-backups/f3pugetsound-shuttered-digest/f3pugetsound-shuttered-digest.json` (outside the repo, since it contains real names/chat content). Tracked as SlackBackup-ie2 (closed). 236 tests passing.
+
+### Key Learnings:
+Slack's channel-to-workspace migration moves message history but does not reliably carry a channel's standalone/pinned Canvas with it (no message to migrate along, since channel canvases have FILE.MESSAGE_ID IS NULL) - the source "shuttered-*" channel silently keeps orphaned canvases that never make it to the destination workspace. f3pugetsound's channels.json tracks only about half its channels (232 of 464 in the full catalog cache); anything outside that set gets zero backup coverage, tracked-vs-untracked - not message-vs-canvas - is the actual gap.
+
+## 2026-07-06 08:00:31
+
+### Summary:
+Added a self-contained "report job" mechanism on top of `export digest`, driven by operator-owned `jobs/*.json` files (gitignored per `.gitignore`'s existing "Operator's real report/digest job definitions" comment). Each job can now fully specify its own `archive_root`, `channels_file`, `workspaces`, `days`, and `out` (with an `{as_of}` template placeholder), overriding the CLI's `--archive-root`/`--channels-file` fallback flags rather than requiring them. Added `export_logic.load_job()` (validates `type: "digest"`, raises loudly on unsupported types), `export_logic.expand_job_path()` (`~`/`$VAR` expansion for any path read out of a job file), and `export_logic.resolve_job_out()` (applies `{as_of}` templating then `expand_job_path`). Added `selector_logic.expand_path_selector()` as shared comma+glob-to-filesystem-paths logic, mirroring the existing `matches_selector`/`split_selector_list` paradigm already used for workspace/channel selectors - a literal (non-glob) path that matches nothing is passed through as-is so a typo surfaces as a clear "file not found" rather than silently vanishing, while a genuinely-empty wildcard match is dropped. Wired `export digest --jobs '<comma-separated globs>'` into the CLI (quoted so the shell doesn't expand the glob itself) and updated `scripts/nightly-backup-digest.sh` to forward `--jobs "$REPO_ROOT/jobs/*.json"` after the existing blanket digest/users export, with all job-file parsing living in Python rather than bash/jq. Verified end-to-end against the real `jobs/f3-nation.json` (added an `archive_root` field to it) running with zero `--archive-root`/`--channels-file` flags on the command line at all.
+
+### Key Learnings:
+This project's selector paradigm (comma-separated list + glob, `matches_selector`/`split_selector_list` in `selector_logic.py`) generalizes cleanly from "filter a known candidate list" (workspaces/channels) to "expand actual filesystem paths" (job files) - same split-on-comma step, just `glob.glob()` instead of `fnmatch.fnmatch()` per part, with `glob.has_magic()` needed to distinguish a legitimately-empty wildcard match from a typo'd literal path.
+
+## 2026-07-06 13:09:07
+
+### Summary:
+Extended the report-jobs mechanism (from the earlier session on 2026-07-06) so a job can now also deliver a companion user-profiles file, and refactored all F3-specific leadership logic out of `export_logic.py` into an isolated, pluggable handler. Added `src/slackbackup/handlers/` package: `handlers/f3.py` holds every F3-specific regex/title-parsing/leadership-rollup function moved verbatim from `export_logic.py` (title patterns, AO-scoping, tenure-modifier detection, region names, `derive_leadership`, `_build_leadership_by_region`), exposed through a two-function handler protocol (`annotate_profile(display_name, title)` for per-user tagging, `build_leadership(profiles_doc)` for the digest's aggregate rollup); `handlers/__init__.py` is a small registry (`handlers.get(name)`, `handlers.NAMES`) so a future non-F3 region/workspace can register a sibling module without touching the export engine. `export_logic.build_user_profiles(..., handler=None)` now optionally tags each profile with `derived_leadership`, defaulting to no tagging (general-purpose, unchanged default behavior); `export_logic.build_digest(..., handler=<f3 by default>, profiles_doc=None)` delegates the whole `leadership` section to the handler (empty structure when `handler=None`) and accepts a precomputed `profiles_doc` to avoid re-converting every workspace's archive twice. `export.py`'s `export digest` gained `--leadership-handler` (defaults to `f3` for a plain/manual run, preserving the README/newsletter-prompt.md workflow that already depends on `leadership.by_region` being populated by default); jobs get their own `leadership_handler` field (default: none - opt-in, since a job may target a non-F3 workspace like `dungeons-of-finn-hill`) and a new `users_out` field - when present, a companion user-profiles JSON (tagged if a handler applies) is written alongside the digest from one shared `build_user_profiles` call. Updated `jobs/f3-nation.json` and `jobs/f3-pugetsound.json` with `users_out` + `leadership_handler: "f3"`; `jobs/dungeon-fh.json` gets `users_out` only. Moved the ~20 F3 pattern-matching unit tests (`test_derive_leadership_*`) into a new `tests/test_f3_handler.py` importing `handlers.f3` directly; `test_export_digest_logic.py` keeps the general `build_digest`/`build_user_profiles` integration tests untouched, since the default handler preserves prior output exactly (all 240 tests passing, zero test-behavior changes needed for the integration tests). Verified end-to-end against real archived data (f3kirkland, via a scratch job file): the `users_out` file carries per-profile `derived_leadership` tags and the digest's `leadership.by_region` matches prior inline-logic output exactly.
+
+### Key Learnings:
+When extracting embedded domain-specific logic (F3's leadership inference) out of a general-purpose engine into a pluggable handler, defaulting the *library-level* function's handler parameter to the concrete handler (not None) preserves every existing direct-caller test unchanged, while still making the seam real and overridable - the "isolate but don't force a default-off regression" tradeoff only needed to bite at the CLI/job layer, where the two entry points (manual command vs. job file) legitimately want different defaults: manual command defaults to "f3" (matches the historically F3-only documented workflow), job files default to "none" (since a job might target an unrelated workspace, tagging it with F3-specific regex would just produce noise).
+
+## 2026-07-07 11:40:40
+
+### Summary:
+Evaluated and resolved the four Copilot review comments on PR #4 (feat/preflight-auth-check).
+- Dismissed #1 (`scripts/preflight-auth.sh:44` "backwards" stderr redirect) as a false positive — `2>&1 >/dev/null` correctly captures stderr and discards stdout; verified empirically before replying.
+- Fixed #2: added `"high": 3` to `_CONFIDENCE_RANK` in `handlers/f3.py` so title-derived high-confidence roles upgrade a rollup group (and a medium can no longer downgrade a high).
+- Fixed #3: `_groups_to_list` now derives `is_current` from the resolved status (former→False, current→True when status=="current", else None) instead of a fixed per-bucket value.
+- Fixed #4: corrected "Weazel Shaker"/"Commz Q" → "Weasel Shaker"/"Comz Q" in `docs/newsletter-prompt.md` to match canonical `handlers/f3.py` patterns.
+- Added rollup test `test_build_digest_title_high_role_wins_confidence_and_currency` covering #2 and #3. Full suite: 250 passed.
+- Posted threaded replies to all four Copilot comments via the GitHub API.
+
+### Key Learnings:
+- Copilot cited `export_logic.py:656/723`, but that leadership code has been refactored into the still-untracked `src/slackbackup/handlers/f3.py`. The version currently pushed to PR #4 still has this code in `export_logic.py`, so the fixes won't surface on the PR until the untracked `handlers/` package (plus related pending changes) is committed and pushed. Did not commit — the fix depends on untracked code intertwined with a larger uncommitted refactor; left the commit decision to the user.
+- `2>&1 >/dev/null` (order matters) is the correct idiom to capture stderr while discarding stdout inside command substitution; `>/dev/null 2>&1` is the genuinely-backwards form.
+
+## 2026-07-07 14:01:55
+
+### Summary:
+Implemented SlackBackup-2ut (tiered backup cadence) end-to-end and closed the issue.
+- Added `BACKUP_CADENCE_TIERS` (single editable `(min_age_weeks, cadence_days)` constant) and a pure `should_check_tonight(entry, record, today)` filter in `backup_logic.py`: cadence keyed off `last_posted` age (active nightly, 8–12wk every 2d, >12wk/empty every 10d), deterministic stagger via stable `sha1(channel_id)` hash, `last_checked` downtime backstop. Skips are a pure catalog lookup — channel sqlite is never opened.
+- Added `catalog_logic.record_check()` to stamp `last_checked`/`last_action` per channel per run without touching `last_posted`.
+- Wired the filter into `backup_logic.run()` (new `today` param for frozen-date testing; `-full` bypasses cadence); run summary now reports a not-due skip count.
+- Follow-up per user request: per-channel log lines now carry a per-workspace progress counter `[X/Y in <workspace>]` (both the "backing up" and cadence "skipping" lines).
+- Tests: cadence tiers/boundaries, stagger coverage-within-cadence, backstop, run skip/record/full-bypass, progress counter, and `record_check`. 272 tests pass.
+- Docs: updated DESIGN.md (module responsibilities, catalog fields, orchestration) and OPERATIONS.md (new "Tiered cadence" nightly-backup subsection).
+
+### Key Learnings:
+- Python's built-in `hash()` is salted per-process (PYTHONHASHSEED), so it can't drive a stable per-channel due-night — used `int(sha1(channel_id).hexdigest(), 16) % cadence_days` so a channel's staggered night is identical across runs/processes.
+- Steady-state simulation over the issue's real channel distribution confirmed the AC numerically: dormant/empty load ~34 checks/night (target ~35) while all 188 active channels stay nightly, and no single night processes a whole tier.
+- Cadence is keyed strictly off `last_posted` (real message age), not archive-file mtime (which churns nightly from resume/wipe) and not `registered_at` — so empties/never-posted correctly fall through to the oldest tier instead of looking fresh.
+- Not committed: the working tree carries substantial unrelated in-progress work and the branch is `feat/preflight-auth-check` (not this feature); left the landing decision (new branch off main vs. current branch vs. user-staged) to the user.
