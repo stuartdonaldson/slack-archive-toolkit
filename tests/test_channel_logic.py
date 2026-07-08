@@ -116,9 +116,10 @@ def test_list_for_workspace_marks_registered_status(tmp_path, monkeypatch):
         channel_logic.catalog_logic, "refresh_fast",
         lambda ws: {
             "channels": {
-                "C1": {"member": True, "name": "general", "description": ""},
-                "C2": {"member": True, "name": "random", "description": ""},
-                "C3": {"member": False, "name": "not-a-member", "description": ""},
+                "C1": {"member": True, "name": "general", "description": "", "is_private": False},
+                "C2": {"member": True, "name": "random", "description": "", "is_private": False},
+                "C3": {"member": False, "name": "not-a-member", "description": "", "is_private": False},
+                "C4": {"member": True, "name": "leadership-private", "description": "", "is_private": True},
             }
         },
     )
@@ -127,8 +128,11 @@ def test_list_for_workspace_marks_registered_status(tmp_path, monkeypatch):
     by_id = {row["id"]: row for row in rows}
 
     assert by_id["C1"]["registered"] is True
+    assert by_id["C1"]["private"] is False
     assert by_id["C2"]["registered"] is False
+    assert by_id["C2"]["private"] is False
     assert "C3" not in by_id  # non-member channels excluded from the fast-tier view
+    assert by_id["C4"]["private"] is True
 
 
 @pytest.mark.parametrize("query,expected", [
@@ -196,6 +200,8 @@ def test_register_matching_skips_already_registered_channels(tmp_path, monkeypat
     result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
 
     assert [e["id"] for e in result["added"]] == ["C2"]
+    skip_by_id = {e["id"]: e["reason"] for e in result["skipped"]}
+    assert skip_by_id["C1"] == "already-registered"
 
 
 def test_register_matching_filters_by_channel_glob(tmp_path, monkeypatch):
@@ -215,6 +221,28 @@ def test_register_matching_filters_by_channel_glob(tmp_path, monkeypatch):
     result = channel_logic.register_matching("f3pugetsound", "event-*", channels_file, cache_dir=tmp_path / "cache")
 
     assert [e["id"] for e in result["added"]] == ["C1"]
+    assert [e["id"] for e in result["skipped"]] == []  # C2 doesn't match the glob, so it's not reported
+
+
+def test_register_matching_does_not_report_non_matching_channels(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {"channels": {
+            "C1": {"member": True, "name": "helpdesk", "description": "", "is_private": False, "is_archived": False},
+            "C2": {"member": True, "name": "leadership-private", "description": "", "is_private": True, "is_archived": False},
+            "C3": {"member": True, "name": "other-channel", "description": "", "is_private": False, "is_archived": False},
+        }},
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "help*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert [e["id"] for e in result["added"]] == ["C1"]
+    assert result["skipped"] == []  # C2 and C3 don't match "help*", so neither appears in added or skipped
 
 
 def test_register_matching_accepts_comma_separated_workspace_and_channel_lists(tmp_path, monkeypatch):
@@ -304,6 +332,9 @@ def test_register_matching_skips_private_and_archived_channels(tmp_path, monkeyp
     result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
 
     assert [e["id"] for e in result["added"]] == ["C1"]
+    skip_by_id = {e["id"]: e["reason"] for e in result["skipped"]}
+    assert skip_by_id["C2"] == "private"
+    assert skip_by_id["C3"] == "archived"
 
 
 def test_register_matching_skips_shuttered_named_channels_even_when_not_archived(tmp_path, monkeypatch):
@@ -326,6 +357,8 @@ def test_register_matching_skips_shuttered_named_channels_even_when_not_archived
     result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
 
     assert [e["id"] for e in result["added"]] == ["C1"]
+    skip_by_id = {e["id"]: e["reason"] for e in result["skipped"]}
+    assert skip_by_id["C2"] == "shuttered-name"
 
 
 def test_register_matching_stamps_registered_at_in_catalog(tmp_path, monkeypatch):

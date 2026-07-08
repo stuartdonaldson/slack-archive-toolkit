@@ -120,7 +120,13 @@ def register_matching(
     "shuttered*" are also always skipped - this F3 community's own naming
     convention for a closed-out AO, which Slack's is_archived flag does
     not reliably reflect (confirmed: most shuttered-named channels are
-    not actually archived in Slack's own data). Returns {"added": [...],
+    not actually archived in Slack's own data). Every channel matching
+    `channel_glob` (whether or not it ends up added) is reported: skipped
+    channels appear in "skipped" with a single reason - "private",
+    "archived", "shuttered-name", or "already-registered", in that priority
+    order (a channel that's both private and archived reports "private").
+    Channels that don't match `channel_glob` at all are not reported in
+    either list. Returns {"added": [...], "skipped": [...],
     "workspaces_checked": [...], "workspaces_skipped_unregistered": [...]}.
     """
     status = workspace_logic.status()
@@ -131,19 +137,29 @@ def register_matching(
     entries = load(channels_file)
     existing = {(e["id"], e["workspace"]) for e in entries}
     added = []
+    skipped = []
     now = _now_iso()
 
     for workspace in workspaces_checked:
         catalog = catalog_logic.refresh_full(workspace, cache_dir=cache_dir)
         for channel_id, channel in catalog["channels"].items():
-            if channel.get("is_private") or channel.get("is_archived"):
-                continue
-            if channel["name"].lower().startswith("shuttered"):
-                continue
             if not selector_logic.matches_selector(channel_glob, channel["name"]):
                 continue
-            if (channel_id, workspace) in existing:
+
+            reason = None
+            if channel.get("is_private"):
+                reason = "private"
+            elif channel.get("is_archived"):
+                reason = "archived"
+            elif channel["name"].lower().startswith("shuttered"):
+                reason = "shuttered-name"
+            elif (channel_id, workspace) in existing:
+                reason = "already-registered"
+
+            if reason is not None:
+                skipped.append({"id": channel_id, "name": channel["name"], "workspace": workspace, "reason": reason})
                 continue
+
             entries.append({"id": channel_id, "name": channel["name"], "workspace": workspace})
             existing.add((channel_id, workspace))
             added.append({"id": channel_id, "name": channel["name"], "workspace": workspace})
@@ -154,6 +170,7 @@ def register_matching(
 
     return {
         "added": added,
+        "skipped": skipped,
         "workspaces_checked": workspaces_checked,
         "workspaces_skipped_unregistered": workspaces_skipped,
     }
@@ -174,6 +191,7 @@ def list_for_workspace(workspace: str, channels_file: Path) -> list[dict]:
                 "id": channel_id,
                 "name": channel["name"],
                 "registered": channel_id in registered_ids,
+                "private": channel.get("is_private", False),
             }
         )
     return rows

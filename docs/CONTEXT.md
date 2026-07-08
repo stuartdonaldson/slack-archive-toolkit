@@ -167,11 +167,14 @@ Postconditions:
 - `channels.json` contains every newly-discovered, eligible public channel
 - Each newly-added channel has a `registered_at` timestamp in the catalog, used as a recency
   fallback by UC-1 until a real backup finds message data
+- For every channel matching the channel glob, the operator sees a line indicating whether it was
+  added or skipped (with the specific reason: `private`, `archived`, `shuttered-name`, or
+  `already-registered`)
 
 Acceptance Criteria:
 - Private channels, archived channels, and `shuttered*`-named channels are never added,
-  regardless of glob match
-- An already-tracked channel is never added twice
+  regardless of glob match — each skipped channel is reported with its specific reason
+- An already-tracked channel is never added twice (reported as "already-registered" if matching the glob)
 - An unregistered workspace matching the workspace glob is skipped and reported, not an error
 
 ---

@@ -122,3 +122,83 @@ Implemented SlackBackup-2ut (tiered backup cadence) end-to-end and closed the is
 - Steady-state simulation over the issue's real channel distribution confirmed the AC numerically: dormant/empty load ~34 checks/night (target ~35) while all 188 active channels stay nightly, and no single night processes a whole tier.
 - Cadence is keyed strictly off `last_posted` (real message age), not archive-file mtime (which churns nightly from resume/wipe) and not `registered_at` — so empties/never-posted correctly fall through to the oldest tier instead of looking fresh.
 - Not committed: the working tree carries substantial unrelated in-progress work and the branch is `feat/preflight-auth-check` (not this feature); left the landing decision (new branch off main vs. current branch vs. user-staged) to the user.
+
+## 2026-07-07 17:13:57
+
+### Summary:
+Reviewed the last two weeks of work against the docs and reconciled the drift, then landed the whole branch. Found three features shipped on `feat/preflight-auth-check` but undocumented/stale in the docs and fixed all of them in one docs-only commit (`f2d1232`): (1) report jobs (`export digest --jobs`) — new §Report jobs in DESIGN-export.md with the full job-field table, plus a Core-Capabilities bullet, README digest note, and DESIGN.md module-inventory row; (2) `channel-digest run` — new §Channel digest in DESIGN-files.md, Core-Capabilities bullet, README subsection, DESIGN.md module row; (3) the pluggable leadership-handler refactor — new §Pluggable leadership handlers in DESIGN-export.md and corrected the stale attribution that still placed `derive_leadership`/`_build_leadership_by_region` in `export_logic.py` (they moved verbatim to `handlers/f3.py`). Also added `selector_logic.py` and `handlers/` to DESIGN.md's Level-1 module table. Confirmed the already-documented items (auth pre-flight/keep-alive, tiered cadence) needed no change.
+
+Committed only the 5 doc files (left the unrelated untracked files — slackdumpbot/, f3-culture.md, f3-it-infrastructure docs — alone), pushed to update the existing open PR #4, then rewrote PR #4's title and body: the branch had grown far past its "auth pre-flight" title, so the description now covers all four pieces (auth, tiered cadence, export/channel refactor, docs). Merged PR #4 into main with a merge commit (`b596988`, preserving all 7 commits) per user's choice, synced local main, and deleted the merged branch locally + remotely with a prune.
+
+Finally investigated and removed the stray local `master` branch: it was the original pre-public history (no shared ancestor with main — main was re-rooted as a squashed commit before going public). Verified nothing salvageable — obsolete PLAN-bd.md init stub, the purged-PII channels-T*.txt channel-ID dumps, and old shell scripts superseded by the Python rewrite — then force-deleted it (local-only, never on remote). Repo now clean: only main remains, in sync with origin/main.
+
+### Key Learnings:
+- `git merge-base A B` returning empty (unrelated histories) piped to `xargs git log` silently runs against HEAD instead of nothing — misleading. Two branches with no common ancestor is the tell that one was re-rooted (here: main squashed to a fresh initial commit to purge PII before going public), so the pre-squash line survives only as a detached local branch.
+- A long-lived feature branch can silently accumulate scope far past its name/PR-title; before merging, reconcile the PR's title+body to the actual commit set so main's merge history isn't misleading. Doc-vs-code drift check caught three shipped-but-undocumented features on the same branch.
+
+## 2026-07-08 02:58:00
+
+### Summary
+Debugged and fixed `channel register` bulk-path asymmetry: comma-separated or glob-based channel registration was silently skipping archived/private channels with zero feedback to the operator. Implemented per-channel skip reason reporting (`"archived"`, `"private"`, `"shuttered-name"`, `"already-registered"`), added `[private]` indicator to `channel list`, updated docs (UC-2 in CONTEXT.md), and extended test coverage.
+
+### Changes
+- `src/slackbackup/channel_logic.py`: `register_matching()` now returns `"skipped": [{id, name, workspace, reason}]` (glob-matched channels report why they weren't added; non-matching channels silently omitted); `list_for_workspace()` adds `"private"` field to each row
+- `src/slackbackup/channel.py`: `_register()` prints per-channel skip reason; summary line includes skip count; `_list()` appends ` [private]` suffix for private channels; updated CLI help text
+- `docs/CONTEXT.md`: UC-2 wording updated to reflect skip reasons are now reported, not silent
+- `tests/test_channel_logic.py`: 6 test functions extended/added to verify skip reasons and private flag (9 new assertions); all 273 tests passing
+
+### Root Cause (Investigation)
+Both `social` and `new-channel` on f3northsea are flagged `is_archived: true` in Slack's metadata. Bulk/comma path filters out archived/private/shuttered/already-registered channels by design (per docstring), but only accumulated `"added"`, losing visibility into *why* a glob-matched channel didn't get registered. Single-name/ID path does no such filtering — hence ID-based registration succeeded while name-based failed.
+
+### Verification
+- `pytest tests/test_channel_logic.py -v`: 35/35 pass
+- `pytest tests/`: 273/273 pass
+- Manual: `./slackbackup channel register f3northsea 'social,new-channel'` now prints `skipped social (C09TFHFHPQR) in f3northsea — archived` and `skipped new-channel (C09SM7AJ89M) in f3northsea — archived`, plus summary `0 new channel(s), 2 skipped, across 1 workspace(s)` instead of bare `0 new channel(s)`
+- Manual: `./slackbackup channel list f3northsea` shows ` [private]` suffix for private member-only channels (verified with synthetic test)
+
+### Design Notes
+- Skip reasons have priority order (private > archived > shuttered-name > already-registered) so a channel reports exactly one reason
+- Non-glob-matching channels never appear in `skipped` (glob can span hundreds; only report actual matches)
+- Catalog already carries `is_private` field via `_channel_fields()`; no schema change needed
+
+
+## 2026-07-08 15:04:17
+
+### Summary:
+Investigation + design session (no code changes this session). Reviewed nightly.log
+state and worked through the tiered-cadence bootstrap and digest-consolidation designs.
+
+- **nightly.log review:** Confirmed the 2026-07-08 run is the first executing under the
+  tiered-cadence code (it has the new `[X/Y in workspace]` progress markers; the
+  2026-07-07 summary line lacks the `not-due skip(s)` field, so it ran an older build).
+  Zero not-due skips this run is *correct* — `last_checked` was unpopulated everywhere,
+  and `should_check_tonight` treats `last_checked=None` as unconditionally due (retention
+  backstop). Staggering activates on the next run once `last_checked` is seeded. Verified
+  against the catalog cache (149/464 f3pugetsound stamped mid-run).
+- **Ordering confirmed:** `run()` sorts by `effective_recency` desc (most-active-first,
+  real `last_posted` else `registered_at`), then `_interleave_by_workspace` round-robins
+  across workspaces to spread per-workspace rate-limit load.
+
+### Design Decisions:
+- **Cadence bootstrap:** Keep two fields with two jobs — `last_posted` drives the tier
+  (data recency), `last_checked` gates due-ness (run recency). Do NOT collapse to
+  `last_data`: a stale channel's last-post date never moves, so gating on it would either
+  re-pull nightly or risk retention. Correct seed = `last_posted`←MAX(ts),
+  `last_checked`←today (only where an archive exists; leave None for never-archived so
+  they get a real first pull). Seeding `last_checked` from an *old* date (posting/oldest)
+  trips the backstop and forces a full sweep — the trap to avoid. Empty channels: None →
+  already maps to oldest (>12wk) tier, no synthetic date needed. Durable fix: add
+  `last_checked` seeding to `sync_catalog_from_local` so cold starts skip the 128-min sweep.
+- **Digest concurrency:** `export digest` is read-only against archives (converts into a
+  `tempfile.TemporaryDirectory`), safe to run alongside a live backup. `channel-digest`
+  runs its own `slackdump archive` and DOES contend — manual/rescue tool only.
+- **channel-digest vs export digest:** Agreed they are effectively mergeable —
+  `channel-digest` ≈ `export digest` with archive-first + catalog-glob selection + scratch
+  raw-dir + no-cadence-write + channel schema. Four flags to fold, with one hard
+  constraint: on-demand/rescue pulls must NOT leak into nightly cadence bookkeeping
+  (`channel-digest` bypasses `backup_one` today, so it never stamps last_posted/last_checked).
+
+### Key Learnings:
+- The `~13s/channel` cost is slackdump's own per-channel API/rate-limit work, not a sleep
+  we control — the only lever on nightly runtime is staggering (pull fewer channels), not
+  faster individual pulls.

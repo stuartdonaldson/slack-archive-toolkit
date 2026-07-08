@@ -28,10 +28,10 @@ def register(groups: argparse._SubParsersAction) -> None:
             "        errors on no match or an ambiguous match instead of registering\n"
             "        nothing. Any glob character ('*', '?', '[') in either argument\n"
             "        or a comma-separated list switches to the bulk path, which always checks the full (not\n"
-            "        just member) channel catalog and silently registers zero or\n"
-            "        more channels - nothing to call ambiguous. The bulk path always\n"
-            "        skips private, archived, and \"shuttered*\"-named channels,\n"
-            "        regardless of the glob."
+            "        just member) channel catalog. The bulk path always skips\n"
+            "        private, archived, and \"shuttered*\"-named channels, regardless\n"
+            "        of the glob, and reports each skipped channel with its reason\n"
+            "        (private / archived / shuttered-name / already-registered)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -96,8 +96,15 @@ def _register(args: argparse.Namespace) -> int:
     for entry in result["added"]:
         print(f"channel register: added {entry['name']} ({entry['id']}) in {entry['workspace']} to {args.channels_file}")
 
+    for entry in result["skipped"]:
+        print(
+            f"channel register: skipped {entry['name']} ({entry['id']}) in "
+            f"{entry['workspace']} — {entry['reason']}"
+        )
+
     print(
-        f"channel register: {len(result['added'])} new channel(s) across "
+        f"channel register: {len(result['added'])} new channel(s), "
+        f"{len(result['skipped'])} skipped, across "
         f"{len(result['workspaces_checked'])} workspace(s)"
     )
     return 0
@@ -108,7 +115,8 @@ def _list(args: argparse.Namespace) -> int:
     print(f"Channels in {args.workspace}:")
     for row in rows:
         status = "registered" if row["registered"] else "not registered"
-        print(f"  {row['name']} ({row['id']}) — {status}")
+        suffix = " [private]" if row["private"] else ""
+        print(f"  {row['name']} ({row['id']}) — {status}{suffix}")
     return 0
 
 
