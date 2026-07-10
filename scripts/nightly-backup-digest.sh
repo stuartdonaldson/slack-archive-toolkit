@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Nightly trigger: backup every tracked channel, then regenerate the f3*
 # digest. Invoked by a Windows Scheduled Task running
-# `wsl.exe -d Ubuntu -- /mnt/c/dev/SlackBackup/scripts/nightly-backup-digest.sh`
+# `wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`
 # at 2am - see README.md "Getting Started" for the manual equivalent.
 #
 # Deliberately does not `set -e`: a partial backup failure (e.g. an
 # expired workspace session, or a channel with an empty archive - see
 # SlackBackup-8ew) must not prevent the digest step from running against
 # whatever data IS available.
-REPO_ROOT="/mnt/c/dev/SlackBackup"
+REPO_ROOT="/home/stuar/proj/SlackArchiver"
 ARCHIVE_ROOT="$HOME/slack-backups"
 LOG_FILE="$HOME/slack-backups/nightly.log"
 

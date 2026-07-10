@@ -125,7 +125,7 @@ window (nightly is comfortably inside the observed ~2–3 week expiry).
 ## Nightly Backup
 
 `scripts/nightly-backup-digest.sh` is invoked by a Windows Scheduled Task
-(`wsl.exe -d Ubuntu -- .../scripts/nightly-backup-digest.sh`) at 2am. It runs the
+(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am. It runs the
 headless auth keep-alive (§4), then the auth pre-flight (§2), then `backup run`, then the
 digest / users / job-digest exports, appending everything to `~/slack-backups/nightly.log`.
 It deliberately does **not** `set -e`: a single workspace or channel failure — or the

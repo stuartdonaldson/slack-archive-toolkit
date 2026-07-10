@@ -202,3 +202,10 @@ state and worked through the tiered-cadence bootstrap and digest-consolidation d
 - The `~13s/channel` cost is slackdump's own per-channel API/rate-limit work, not a sleep
   we control — the only lever on nightly runtime is staggering (pull fewer channels), not
   faster individual pulls.
+
+## 2026-07-09 12:39:45
+
+### Summary:
+Renamed and relocated repository from /mnt/c/dev/SlackBackup to /home/stuar/proj/SlackArchiver (folder renamed SlackBackup -> SlackArchiver). Merged scattered Claude Code history dirs into the new location and
+rewrote the matching ~/.claude.json project references. Performed by the
+move-to-proj tool, not an interactive session.
