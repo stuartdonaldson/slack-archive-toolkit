@@ -26,7 +26,7 @@ def _base_args(**overrides) -> argparse.Namespace:
         jobs=None,
         archive_root=None,
         channels_file="./channels.json",
-        workspace_glob="f3*",
+        workspace_glob="f3*",  # args.workspace_glob is the dest for the --workspace CLI flag
         days=180,
         as_of="2026-07-01",
         out=None,
@@ -139,3 +139,16 @@ def test_digest_direct_path_reports_unknown_handler_cleanly(tmp_path, capsys):
     assert exit_code == 2
     captured = capsys.readouterr()
     assert "bogus" in captured.err
+
+
+# --- Change 2: --workspace has no default; required unless --jobs is given ---
+
+
+def test_digest_direct_path_requires_workspace_when_no_jobs(tmp_path, capsys):
+    args = _base_args(archive_root=str(tmp_path), workspace_glob=None)
+
+    exit_code = export._digest(args)
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "--workspace is required unless --jobs is given" in captured.err

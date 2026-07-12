@@ -209,7 +209,7 @@ force regeneration of a sealed month for any other reason, delete its target fil
 | # | Seal predicate for month M | Coupling / cost | Weakness |
 |---|----------------------------|-----------------|----------|
 | 1 | **Message high-water mark** — the archive holds a message in some month later than M. | None — uses only the converted day files. | A channel that has gone **quiet** never gets a later message, so its last active month is rewritten on every run forever and never stabilises. Harmless but wasteful, and that file is perpetually "provisional". |
-| 2 | **Backup-completion stamp** *(recommended)* — a durable UTC timestamp the backup job writes after a successful `archive`/`resume`; M is sealed iff `last_backup > end_of_month(M)`. | One line in `backup_logic.py` to write a `<channel-dir>/.last_backup` sidecar. Git-durable (content, not mtime); no slackdump-internal coupling. | Requires the backup side to cooperate; archives written before the stamp existed have none. |
+| 2 | **Backup-completion stamp** *(implemented)* — a durable UTC timestamp the backup job writes after a successful `archive`/`resume`; M is sealed iff `last_backup > end_of_month(M)`. | `backup_logic._write_last_backup()` writes a `<channel-dir>/.last_backup` sidecar after each successful archive/resume. Git-durable (content, not mtime); no slackdump-internal coupling. | Archives written before the stamp existed have none (exporter falls back to (1) for those). |
 | 3 | **slackdump internal fetch timestamp** — the chunk-recording time slackdump stamps inside `slackdump.sqlite`. | Couples to slackdump's internal schema — the exact coupling Strategy B exists to avoid. | Rejected for the same reason Strategy A was. |
 
 **Decision:** use **(2) when the stamp is present, falling back to (1) when it is absent.** This
@@ -264,7 +264,7 @@ small per-channel-month files, this is one document, one read.
 
 ```
 ./slackbackup export digest --archive-root <path> --channels-file ./channels.json \
-    [--workspace-glob f3*] [--days N] [--as-of YYYY-MM-DD] --out <file.json>
+    --workspace f3* [--days N] [--as-of YYYY-MM-DD] --out <file.json>
 ```
 
 `--days` defaults to 180 (the trailing 180 days ending at `--as-of`). Pass `--days N` to scope it
@@ -473,7 +473,7 @@ unsupported type) can specify:
 | `type` | Must be `"digest"` | — (required) |
 | `archive_root` | Archive root to read | `--archive-root` |
 | `channels_file` | `channels.json` to select from | `--channels-file` |
-| `workspaces` | Explicit workspace list (used as the selector) | `--workspace-glob` |
+| `workspaces` | Explicit workspace list (used as the selector) | `--workspace` |
 | `channels` | Channel selector within those workspaces | `*` |
 | `days` | Trailing-day window (`null` = no lower bound / all history) | `--days` |
 | `out` | Output path; supports an `{as_of}` template placeholder | — (required) |
@@ -493,8 +493,7 @@ Python, not bash/jq. The nightly script (`scripts/nightly-backup-digest.sh`) for
 
 | Gap | Assessment | Recommendation |
 |-----|------------|----------------|
-| Knowing a month is **complete** | **Resolved by design** — a month is sealed (skip-protected) only when proven complete by the seal predicate, otherwise always rewritten (see Crosscutting §Sealing signal). Preferred predicate is a backup-completion stamp; fallback is the message high-water mark. | Add a `<channel-dir>/.last_backup` UTC stamp write to `backup_logic.py` (filed as follow-up; note this is unrelated to the catalog's own `registered_at`/`last_posted` bookkeeping, which orders backup runs, not export sealing). Until then the high-water-mark fallback applies, which rewrites a quiet channel's last active month every run. |
-| Backup side does not yet write the seal stamp | The recommended predicate (2) depends on `backup_logic.py` writing `.last_backup` after a successful run; it currently does not. | File an implementation issue against `backup_logic.py`; exporter must tolerate the stamp's absence and fall back to the high-water mark. |
+| Knowing a month is **complete** | **Resolved** — a month is sealed (skip-protected) only when proven complete by the seal predicate, otherwise always rewritten (see Crosscutting §Sealing signal). Preferred predicate is a backup-completion stamp; fallback is the message high-water mark. | `backup_logic._write_last_backup()` writes the `<channel-dir>/.last_backup` UTC stamp after each successful archive/resume (this is unrelated to the catalog's own `registered_at`/`last_posted` bookkeeping, which orders backup runs, not export sealing). Pre-stamp archives fall back to the high-water mark. |
 | Skip rule ignores **range width** | A month file first written under a narrow `--from/--to` will be skipped under a later wider range, so it never gains the additional threads. | Document that idempotency keys on filename only; widening a range requires deleting affected month files. Acceptable for the intended "export once, immutable monthly snapshots" model. |
 | Per-run `convert` cost | Each invocation converts the whole archive to temp before any per-month skip, so skipped months still pay the conversion. | Acceptable at current archive sizes. If archives grow large, revisit Strategy A (direct SQLite range query) to avoid full conversion. |
 | No channel-purpose classification in the digest | `docs/llm-digest2-idea.md` proposed a `channel_category` field (ao/announcement/iso/classifieds/etc.) inferred from channel name/description. | Deferred — channel-naming conventions aren't consistent across all `f3*` workspaces, so accuracy would vary; if added, follow the existing `derive_leadership`-style pattern (heuristic value plus a `_basis` field), never an authoritative claim. |

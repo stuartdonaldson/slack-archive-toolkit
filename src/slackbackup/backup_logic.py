@@ -126,6 +126,17 @@ def _max_message_ts(db_path: Path) -> str | None:
     return datetime.fromtimestamp(float(row[0]), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _write_last_backup(target_dir: Path) -> None:
+    """Record the last successful backup of `target_dir` as a git-durable UTC
+    stamp in `<target_dir>/.last_backup` (file content, not mtime - mtime does
+    not survive a clone/checkout). The monthly exporter reads this to seal
+    quiet/empty recent months as complete instead of falling back to the
+    message high-water mark, which otherwise rewrites a quiet channel's last
+    active month on every run (SlackBackup-026)."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / ".last_backup").write_text(_ts() + "\n")
+
+
 def backup_channel(
     channel_id: str,
     channel_slug: str,
@@ -147,6 +158,7 @@ def backup_channel(
             "(incremental archive untouched)"
         )
         slackdump.archive(channel_id, full_dir)
+        _write_last_backup(full_dir)
         return "archive"
 
     channel_directory = channel_dir(archive_root, workspace, channel_slug)
@@ -156,6 +168,7 @@ def backup_channel(
         _log(f"backup: no existing archive — running full archive into {channel_directory}")
         slackdump.archive(channel_id, channel_directory)
         catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+        _write_last_backup(channel_directory)
         return "archive"
 
     try:
@@ -180,6 +193,7 @@ def backup_channel(
         shutil.rmtree(channel_directory)
         slackdump.archive(channel_id, channel_directory)
         catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+        _write_last_backup(channel_directory)
         return "archive"
 
     _log(f"backup: existing archive found at {db_path} — resuming")
@@ -187,6 +201,7 @@ def backup_channel(
     # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles.
     slackdump.resume(channel_directory)
     catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+    _write_last_backup(channel_directory)
     return "resume"
 
 

@@ -57,11 +57,11 @@ def register(groups: argparse._SubParsersAction) -> None:
 
     p_digest = sub.add_parser(
         "digest",
-        help="merge messages across workspaces matching --workspace-glob into one JSON document",
+        help="merge messages across workspaces matching --workspace into one JSON document",
         epilog=(
-            "Example:\n  ./slackbackup export digest --archive-root ~/slack-backups\n"
-            "  ./slackbackup export digest --archive-root ~/slack-backups --workspace-glob 'f3*,dungeons-*'\n"
-            "  ./slackbackup export digest --archive-root ~/slack-backups --days 30\n"
+            "Example:\n  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*'\n"
+            "  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*,dungeons-*'\n"
+            "  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*' --days 30\n"
             "  ./slackbackup export digest --jobs 'jobs/*.json'\n"
             "Output: --out, defaulting to ~/slack-exports/f3-digest-<as-of>.json.\n"
             "With --jobs, each matched job's own archive-root/channels-file/workspaces/days/out/\n"
@@ -76,7 +76,11 @@ def register(groups: argparse._SubParsersAction) -> None:
         help="required unless every --job entry defines its own archive_root",
     )
     p_digest.add_argument("--channels-file", default="./channels.json")
-    p_digest.add_argument("--workspace-glob", default="f3*", help="workspace glob or comma-separated selector list")
+    p_digest.add_argument(
+        "--workspace", dest="workspace_glob", default=None,
+        help="workspace glob or comma-separated selector list; required unless every "
+        "--job entry defines its own workspaces",
+    )
     p_digest.add_argument(
         "--days", type=int, default=180,
         help="only include the trailing N days ending at --as-of; defaults to 180 days",
@@ -91,7 +95,7 @@ def register(groups: argparse._SubParsersAction) -> None:
         help="comma-separated glob(s) matching jobs/*.json report definitions "
         "(quote to stop the shell from expanding the glob itself), e.g. 'jobs/*.json' "
         "or 'jobs/f3-*.json,jobs/other.json'; one digest per matched job, "
-        "overriding --channels-file/--workspace-glob/--days/--out for that job",
+        "overriding --channels-file/--workspace/--days/--out for that job",
     )
     p_digest.add_argument(
         "--leadership-handler", default=None,
@@ -105,17 +109,20 @@ def register(groups: argparse._SubParsersAction) -> None:
 
     p_users = sub.add_parser(
         "users",
-        help="export every known user profile, grouped per workspace matching --workspace-glob",
+        help="export every known user profile, grouped per workspace matching --workspace",
         epilog=(
-            "Example:\n  ./slackbackup export users --archive-root ~/slack-backups\n"
-            "  ./slackbackup export users --archive-root ~/slack-backups --workspace-glob 'f3*,dungeons-*'\n"
+            "Example:\n  ./slackbackup export users --archive-root ~/slack-backups --workspace 'f3*'\n"
+            "  ./slackbackup export users --archive-root ~/slack-backups --workspace 'f3*,dungeons-*'\n"
             "Output: --out, defaulting to ~/slack-exports/f3-user-profiles-<today>.json."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_users.add_argument("--archive-root", required=True)
     p_users.add_argument("--channels-file", default="./channels.json")
-    p_users.add_argument("--workspace-glob", default="f3*", help="workspace glob or comma-separated selector list")
+    p_users.add_argument(
+        "--workspace", dest="workspace_glob", required=True,
+        help="workspace glob or comma-separated selector list",
+    )
     p_users.add_argument(
         "--out", default=None,
         help="defaults to ~/slack-exports/f3-user-profiles-<today>.json",
@@ -236,6 +243,10 @@ def _digest(args: argparse.Namespace) -> int:
 
     if not args.archive_root:
         print("export digest: --archive-root is required unless --jobs is given", file=sys.stderr)
+        return 2
+
+    if not args.workspace_glob:
+        print("export digest: --workspace is required unless --jobs is given", file=sys.stderr)
         return 2
 
     try:

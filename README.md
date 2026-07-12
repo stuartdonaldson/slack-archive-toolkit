@@ -66,9 +66,10 @@ cookie (passed fresh — slackdump doesn't persist cookies, since they expire) e
 you register or re-register.
 
 > **Sessions expire.** When they do, backups fail with `authentication details expired`.
-> The full re-auth workflow — detecting which workspaces are stale and the one-command
-> `scripts/auth-refresh` helper — is documented in
-> [docs/OPERATIONS.md](docs/OPERATIONS.md) §Authorization / Session Lifecycle.
+> The full re-auth workflow — detecting which workspaces are stale, the one-command
+> `scripts/auth-refresh` helper for interactive re-login, and `scripts/auth-refresh/keepalive.sh`
+> for headless nightly session refresh (already wired into `scripts/nightly-backup-digest.sh`) —
+> is documented in [docs/OPERATIONS.md](docs/OPERATIONS.md) §Authorization / Session Lifecycle.
 
 ### 3. Register channels to track
 
@@ -91,10 +92,10 @@ also available: `./slackbackup export monthly --from ... --to ... --workspace ..
 ### 5. Generate the digest
 
 ```bash
-./slackbackup export digest --archive-root ~/slack-backups
+./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*'
 # -> ~/slack-exports/f3-digest-<today>.json
-# Defaults: trailing 180 days, every f3* workspace.
-# Override with --workspace-glob, --days, --as-of, --out.
+# Defaults: trailing 180 days. --workspace is required unless --jobs is given.
+# Override with --days, --as-of, --out.
 ```
 
 One merged JSON document: all in-range messages with thread nesting, per-channel and
@@ -111,10 +112,10 @@ job. This is what the nightly script runs after the blanket digest. See
 ### 6. Generate the user profile report
 
 ```bash
-./slackbackup export users --archive-root ~/slack-backups
+./slackbackup export users --archive-root ~/slack-backups --workspace 'f3*'
 # -> ~/slack-exports/f3-user-profiles-<today>.json
-# Defaults: every f3* workspace.
-# Override with --workspace-glob, --out.
+# --workspace is required.
+# Override with --out.
 ```
 
 The full per-workspace user roster — display names, profile titles, Slack account roles
@@ -136,6 +137,19 @@ user profiles' per-workspace `profiles` list as-is, so don't reshape the JSON fi
 Feed the digest JSON plus [`docs/fng-getting-started-prompt.md`](docs/fng-getting-started-prompt.md)
 to an LLM to produce a "Slack: Start Here / FAQ" guide for new members, sourced only from the
 digest's actual channels/roles/events — same pattern as the newsletter above.
+
+### Browse the archive locally (optional)
+
+To read a backed-up channel interactively, point slackdump's built-in viewer at that
+channel's archive directory (`<archive-root>/<workspace>/<channel>`):
+
+```bash
+slackdump view ~/slack-backups/f3puget/general
+```
+
+This starts a local, read-only web viewer — threads in a side panel, downloaded images and
+files inline, no Slack token or network needed (it reads only the local `slackdump.sqlite`).
+Add `DEBUG=1` before the command if a message fails to render. Nothing is modified.
 
 ### Recovering content from untracked channels (optional)
 

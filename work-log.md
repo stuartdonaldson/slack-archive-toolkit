@@ -209,3 +209,38 @@ state and worked through the tiered-cadence bootstrap and digest-consolidation d
 Renamed and relocated repository from /mnt/c/dev/SlackBackup to /home/stuar/proj/SlackArchiver (folder renamed SlackBackup -> SlackArchiver). Merged scattered Claude Code history dirs into the new location and
 rewrote the matching ~/.claude.json project references. Performed by the
 move-to-proj tool, not an interactive session.
+
+## 2026-07-11 06:08:56
+_session 61e1e06e-492e-4ed4-bed2-5e9dd8861fd5 · v3 · 07-11_
+
+### Objective 1: Explain where the nightly script's `~/slack-exports/f3-digest` file comes from
+Rationale: User noticed `scripts/nightly-backup-digest.sh` produced an `f3-digest` file in addition to a digest per `jobs/*.json` and couldn't find `f3-digest` specified in any job file — needed to know if it was redundant config drift or intentional.
+Outcome [internal]: Traced to `export digest`'s non-`--jobs` code path (`src/slackbackup/export.py`): `--workspace-glob` defaulted to `"f3*"` and `--out` defaulted to the literal `~/slack-exports/f3-digest-<as-of>.json`, both hardcoded, not derived from `channels.json`. This was a separate catch-all digest across every `f3*` workspace, distinct from the per-recipient job digests.
+
+### Objective 2: Rename `--workspace-glob` to `--workspace` on `export digest`/`export users`, remove its `"f3*"` default
+Rationale: "adding -glob is excess specification, it should just be a --workspace parameter, and there should be no default you should have to specify the workspace." The investigation in Objective 1 surfaced this hardcoded default as the root design smell.
+Outcome [user-facing]: `export digest` and `export users` now take `--workspace` (still glob/comma-selector syntax); `export users` requires it, `export digest` requires it unless `--jobs` is given — matching the existing `--archive-root` required-unless-jobs pattern. Updated help/epilog text, README.md, docs/CONTEXT.md, docs/DESIGN-export.md.
+Outcome [developer-facing]: Added a regression test (`test_digest_direct_path_requires_workspace_when_no_jobs`) via red→green TDD; kept the argparse `dest="workspace_glob"` so internal call sites and existing tests needed no further churn. All 274 tests pass. Tracked and closed as bd `SlackBackup-8k5`.
+Outcome [user-facing]: Updated `scripts/nightly-backup-digest.sh` to pass `--workspace 'f3*'` explicitly on its digest/users calls so the flag change didn't break the nightly run (the user subsequently removed that catch-all digest/users step from the nightly script themselves, separately from this session's work).
+
+### Objective 3: Clarify `keepalive.sh` prerequisites and reference it explicitly from README  [accreted]
+Transition: New question raised once the nightly-script rename work was done, about a different script (`scripts/auth-refresh/keepalive.sh`) referenced in that same file.
+Rationale: User wanted the headless session-refresh helper's prerequisites documented and confirmed visible from the top-level README, not just docs/OPERATIONS.md.
+Outcome [internal]: Enumerated keepalive's prerequisites (Node.js on PATH or via nvm fallback, one-time `npm install` for `@playwright/test`, pre-existing Chromium cache, `SLACKDUMP_AUTH_PROFILE`/`SLACKDUMP_TOKENS`/`SLACKDUMP_BIN` env vars, and a prior interactive `npm run refresh` login since `--keepalive` can only extend an existing session, never establish one).
+Outcome [user-facing]: README.md's §Authorization callout now explicitly names `scripts/auth-refresh/keepalive.sh` and notes it's already wired into the nightly script, alongside the existing pointer to docs/OPERATIONS.md for full detail.
+
+## 2026-07-11 21:49:57
+_session bb14c476 · v3 · 07-11_
+
+### Objective 1: Reconcile the bd board with the actual code — close stale, implemented, and non-actionable issues
+Rationale: The user suspected the tracker had drifted from reality — "look at 'bdls --ready' it looks like many of these have already been implemented" and, later, "i still see several issues claimed an in progress, what about those?" Goal was to verify each open/in-progress issue against committed code and close what no longer represents real work, so nothing hangs around indefinitely: "i don't want things hanging around indefinitely."
+Outcome [internal]: Closed 7 issues after per-issue code verification. Ready queue: 026 and 4my done (see Obj 2), 8ew rejected as external (Slack returns 0 messages for the admin-restricted all-pax channel — a permissions issue, not tooling; the resume-from-empty consequence already had a shipped workaround). In-progress queue: fac, jqb, t8i, d70 were all stale — implemented and committed (c5e8f5f, 0bfe94d, the Python channel-register rewrite, e47b74e/PR#4 respectively) but never marked closed. bd board now clear except dependency-blocked issues.
+
+### Objective 2: Complete the two ready-queue issues that turned out to be real unfinished work
+Rationale: Reconciliation surfaced two issues that weren't actually done, and the user directed completing them rather than deferring: "if there is value we should just go ahead and do it." 026: the exporter read a <channel-dir>/.last_backup seal stamp that nothing ever wrote, so it always fell back to the message high-water mark and rewrote a quiet channel's last active month on every run. 4my: README was otherwise fork-ready but lacked the one documented deliverable, slackdump-view browse commands.
+Outcome [user-facing]: README gained a "Browse the archive locally" section documenting `slackdump view <archive-root>/<workspace>/<channel>` (read-only local viewer, no token).
+Outcome [developer-facing]: Added backup_logic._write_last_backup() — a git-durable UTC stamp (content, not mtime) written after every successful archive/resume path (full, first-archive, wipe+re-archive, resume); helper mkdirs defensively so the test fakes that don't create dirs still exercise it. Two tests added; full suite 276 passing.
+Outcome [internal]: Updated docs/DESIGN-export.md §Sealing signal and the gaps table to mark the seal stamp implemented (both had tracked it as an unimplemented follow-up).
+
+### Key Learnings:
+bd's auto-export tries to `git add .beads/issues.jsonl` on every close, which is gitignored here — emits a harmless "paths are ignored" warning each time; the close is still recorded in the bd DB.

@@ -15,6 +15,17 @@ This supersedes an earlier GitHub-Actions/NDJSON/private-archive-repo design (se
 which was abandoned before being built out — everything in this document describes the actual
 shipped local-CLI architecture.
 
+**Vision: a workspace-agnostic engine, not an F3 tool.** This project was built against F3's own
+Slack workspaces and still ships an F3-specific leadership-role vocabulary (Nantan, Q, AOQ, Comz Q,
+etc.), but that vocabulary is deliberately *not* load-bearing in the core engine — backup, catalog,
+export, search, and channel/workspace registration have no knowledge of F3 or any other community.
+The only F3-specific logic lives behind the pluggable leadership-handler seam (`handlers/f3.py`,
+selected via `--leadership-handler` or a job's `leadership_handler` field — see `docs/DESIGN-export.md`
+§Pluggable leadership handlers); a fork targeting a different community should be able to add a
+sibling handler module without touching `export_logic.py` or any other engine code. Where this
+isn't true yet — anywhere F3 naming/assumptions have leaked into the general engine — is a bug
+against this vision, not an accepted shortcut.
+
 ### Quality Goals
 
 | Priority | Quality Goal | Scenario |
@@ -22,13 +33,14 @@ shipped local-CLI architecture.
 | 1 | Reliability | A backup run completes or fails with a clear, timestamped log entry per channel and a run summary; no silent data loss |
 | 2 | Operability | An operator can register a workspace, register channels (individually or by bulk glob), and have a working backup running in well under 30 minutes |
 | 3 | Low coupling to slackdump internals | This app reads `slackdump`'s documented, stable boundaries (`convert -f export`, `list channels` JSON) wherever possible, falling back to the internal sqlite schema only where slackdump exposes no other path (e.g. channel-level Canvas files) |
+| 4 | Community-agnostic engine | Every community-specific behavior (currently: F3's leadership-role vocabulary) is isolated behind a pluggable seam (`handlers/`), never inline in `export_logic.py` or any other engine module — a fork for a different community registers a sibling handler instead of forking the engine |
 
 ### Stakeholders
 
 | Stakeholder | Expectation |
 |-------------|-------------|
 | Operator (currently: the author, running this against several F3 workspaces) | Run the CLI locally on a schedule or by hand; get a durable archive plus a digest suitable for feeding an LLM newsletter-generation prompt |
-| Forker | Minimal required changes to adapt `channels.json` and the tokens file to a different workspace |
+| Forker | Minimal required changes to adapt `channels.json` and the tokens file to a different workspace; adapting leadership/role inference to a different community means adding a new `handlers/` module, never editing the engine |
 
 ---
 
@@ -187,7 +199,7 @@ Preconditions:
 - At least one channel per relevant workspace has already been backed up (UC-1)
 
 Primary Flow:
-1. Operator runs `./slackbackup export digest --archive-root <path> [--workspace-glob f3*]
+1. Operator runs `./slackbackup export digest --archive-root <path> --workspace f3*
    [--days N]`
 2. The tool selects channels matching the workspace glob from `channels.json`, computes the
    date range (the trailing 180 days by default, or the trailing N days if `--days` was given), and
@@ -228,6 +240,8 @@ Acceptance Criteria:
   Slack user id means different people in different workspaces)
 - Building a custom Slack API client — every Slack-facing capability is implemented by calling
   `slackdump`, never by reimplementing what it already does
+- Community-specific logic (naming conventions, role vocabularies, tagging rules) living in the
+  engine — that belongs in a `handlers/` module; see Purpose §Vision
 
 ---
 

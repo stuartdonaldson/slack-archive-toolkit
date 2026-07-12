@@ -35,6 +35,35 @@ def test_backup_channel_archives_when_no_existing_db(tmp_path, monkeypatch):
     assert kind == "archive"
 
 
+def test_backup_channel_writes_last_backup_stamp_on_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(backup_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(backup_logic.slackdump, "archive", lambda cid, out: None)
+    monkeypatch.setattr(backup_logic.slackdump, "resume", lambda d: None)
+
+    archive_root = tmp_path / "archive"
+    backup_logic.backup_channel("C1", "general", "f3test", archive_root, cache_dir=tmp_path / "cache")
+
+    stamp = (archive_root / "f3test" / "general" / ".last_backup").read_text().strip()
+    # Must match the exact format the exporter parses (see export_logic).
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp)
+
+
+def test_backup_channel_writes_last_backup_stamp_on_resume(tmp_path, monkeypatch):
+    archive_root = tmp_path / "archive"
+    channel_directory = archive_root / "f3test" / "general"
+    channel_directory.mkdir(parents=True)
+    _make_db(channel_directory / "slackdump.sqlite", message_count=5)
+
+    monkeypatch.setattr(backup_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(backup_logic.slackdump, "archive", lambda cid, out: None)
+    monkeypatch.setattr(backup_logic.slackdump, "resume", lambda d: None)
+
+    backup_logic.backup_channel("C1", "general", "f3test", archive_root, cache_dir=tmp_path / "cache")
+
+    stamp = (channel_directory / ".last_backup").read_text().strip()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp)
+
+
 def test_backup_channel_resumes_when_db_already_exists(tmp_path, monkeypatch):
     archive_root = tmp_path / "archive"
     channel_directory = archive_root / "f3test" / "general"
