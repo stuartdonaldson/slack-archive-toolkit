@@ -173,6 +173,110 @@ def test_select_messages_in_range_excludes_thread_when_parent_and_replies_all_be
     assert messages == []
 
 
+def test_select_messages_in_range_carries_reactions_when_present():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "parent",
+            "reactions": [{"name": "+1", "count": 2, "users": ["U0A", "U0B"]}],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert messages[0]["reactions"] == [{"name": "+1", "count": 2, "users": ["U0A", "U0B"]}]
+
+
+def test_select_messages_in_range_omits_reactions_key_when_absent():
+    users_map = {"U0A": "Al"}
+    all_messages = [{"ts": "1000.000100", "user": "U0A", "text": "parent"}]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert "reactions" not in messages[0]
+
+
+def test_select_messages_in_range_carries_edited_as_utc():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "parent",
+            "edited": {"user": "U0A", "ts": "1000.000200"},
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert messages[0]["edited"] == {"user": "U0A", "at_utc": export_logic._format_utc(1000.0002)}
+
+
+def test_select_messages_in_range_carries_subtype_verbatim():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {"ts": "1000.000100", "user": "U0A", "text": "joined", "subtype": "channel_join"},
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert messages[0]["subtype"] == "channel_join"
+
+
+def test_select_messages_in_range_unfurl_from_permalink_parses_target_channel_and_ts():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "look at this",
+            "attachments": [
+                {
+                    "is_msg_unfurl": True,
+                    "from_url": "https://f3pugetsound.slack.com/archives/C123/p1778086219226429",
+                    "author_name": "Caz",
+                    "text": "the earlier quoted message",
+                },
+            ],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    unfurl = messages[0]["unfurls"][0]
+    assert unfurl["url"] == "https://f3pugetsound.slack.com/archives/C123/p1778086219226429"
+    assert unfurl["author_name"] == "Caz"
+    assert unfurl["quoted_text"] == "the earlier quoted message"
+    assert unfurl["target_channel_id"] == "C123"
+    assert unfurl["target_ts"] == "1778086219.226429"
+
+
+def test_select_messages_in_range_other_attachment_emits_url_and_title():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "check this out",
+            "attachments": [
+                {"from_url": "https://example.com/page", "title": "Example Page"},
+            ],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert messages[0]["unfurls"] == [{"url": "https://example.com/page", "title": "Example Page"}]
+
+
+def test_select_messages_in_range_attachment_without_url_or_title_link_is_skipped():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "no link here",
+            "attachments": [{"fallback": "some fallback text with no url"}],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert "unfurls" not in messages[0]
+
+
 def _fake_convert(channel_dir: Path, out_dir: Path) -> None:
     """Stands in for slackdump.convert_export: copies the pre-converted
     fixture day-files/users.json for whichever channel `channel_dir`'s name

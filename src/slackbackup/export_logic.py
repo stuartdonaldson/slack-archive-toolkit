@@ -64,7 +64,40 @@ def _is_parent(msg: dict) -> bool:
     return thread_ts is None or thread_ts == msg.get("ts")
 
 
-def _clean(msg: dict, users_map: dict[str, str]) -> dict:
+_ARCHIVE_URL_RE = re.compile(r"/archives/([^/]+)/p(\d+)")
+
+
+def _parse_archive_url(url: str) -> tuple[str, str] | None:
+    match = _ARCHIVE_URL_RE.search(url)
+    if not match:
+        return None
+    channel_id, digits = match.group(1), match.group(2)
+    return channel_id, f"{digits[:-6]}.{digits[-6:]}"
+
+
+def _unfurls_from_attachments(attachments: list[dict]) -> list[dict]:
+    unfurls = []
+    for att in attachments:
+        from_url = att.get("from_url")
+        is_msg_unfurl = att.get("is_msg_unfurl") or (from_url and "slack.com/archives/" in from_url)
+        if is_msg_unfurl:
+            entry = {
+                "url": from_url,
+                "author_name": att.get("author_name"),
+                "quoted_text": att.get("text"),
+            }
+            target = _parse_archive_url(from_url) if from_url else None
+            if target:
+                entry["target_channel_id"], entry["target_ts"] = target
+            unfurls.append(entry)
+            continue
+        title_link = att.get("title_link")
+        if from_url or title_link:
+            unfurls.append({"url": from_url or title_link, "title": att.get("title")})
+    return unfurls
+
+
+def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False) -> dict:
     uid = msg.get("user") or msg.get("bot_id")
     resolved = users_map.get(uid) if uid is not None else None
     display_name = resolved or msg.get("username") or uid
@@ -75,6 +108,24 @@ def _clean(msg: dict, users_map: dict[str, str]) -> dict:
             {"name": f.get("name"), "filetype": f.get("filetype"), "permalink": f.get("permalink")}
             for f in files
         ]
+    if evidence:
+        reactions = msg.get("reactions")
+        if reactions:
+            base["reactions"] = [
+                {"name": r.get("name"), "count": r.get("count"), "users": r.get("users")}
+                for r in reactions
+            ]
+        edited = msg.get("edited")
+        if edited:
+            base["edited"] = {"user": edited.get("user"), "at_utc": _format_utc(float(edited["ts"]))}
+        subtype = msg.get("subtype")
+        if subtype:
+            base["subtype"] = subtype
+        attachments = msg.get("attachments")
+        if attachments:
+            unfurls = _unfurls_from_attachments(attachments)
+            if unfurls:
+                base["unfurls"] = unfurls
     return base
 
 
@@ -481,7 +532,7 @@ def select_messages_in_range(
         by_thread.setdefault(msg["thread_ts"], []).append(msg)
     for thread_ts, replies in by_thread.items():
         by_thread[thread_ts] = [
-            _clean(m, users_map) for m in sorted(replies, key=lambda m: float(m["ts"]))
+            _clean(m, users_map, evidence=True) for m in sorted(replies, key=lambda m: float(m["ts"]))
         ]
 
     messages = []
@@ -496,7 +547,7 @@ def select_messages_in_range(
         )
         if not parent_in_range and not reply_in_range:
             continue
-        cleaned = _clean(msg, users_map)
+        cleaned = _clean(msg, users_map, evidence=True)
         if replies:
             cleaned["replies"] = replies
         if not parent_in_range:
