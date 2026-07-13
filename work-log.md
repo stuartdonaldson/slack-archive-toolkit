@@ -244,3 +244,24 @@ Outcome [internal]: Updated docs/DESIGN-export.md §Sealing signal and the gaps 
 
 ### Key Learnings:
 bd's auto-export tries to `git add .beads/issues.jsonl` on every close, which is gitignored here — emits a harmless "paths are ignored" warning each time; the close is still recorded in the bd DB.
+
+## 2026-07-13 14:25:09
+_session d4f24abb · v3 · 07-13_
+
+### Objective 1: v2 design review and improvements for LLM use of digest output
+Rationale: The digest must "preserve and organize evidence rather than make unreliable semantic inferences" — Slack users continue discussions through new top-level messages, so the extractor's job is to keep enough chronological and source context for a downstream LLM to infer those links, never to guess them itself. Recommendations were required to be grounded in the whole repo, not isolated field changes.
+Outcome [internal]: Design recommendation delivered, grounded by sampling real archives: reactions on ~20% of messages, edited on ~7%, and Slack message unfurls (quoted url/author/text of an earlier message — the only explicit cross-message reference evidence Slack records) all silently dropped by _clean(); plus a correctness gap — a thread whose parent predates the export window is entirely absent even when its replies are recent.
+Outcome [developer-facing]: 8 execution-ready beads filed (SlackBackup-7jn/efk/s1n/4ao/lwx/ugs/tdq + pex backlog) with file/line specs, acceptance criteria, dependency wiring, and model routing cues ([haiku-ok] title tags; model:haiku label on s1n) sized so Sonnet/Haiku could execute them standalone.
+
+### Objective 2: bd-run-beads — reusable runner executing beads in clean sessions with the appropriate model, including work-log capture  [accreted]
+Transition: with the beads filed, the question became cost-effective execution: "i'd like a general purpose script that can be reused, and uses cues such as the model in the title or model in the label ... give it the bead to implement and it would sort through the dependencies to get the right order."
+Rationale: Deterministic orchestration shouldn't cost model tokens (a Haiku /loop orchestrator was rejected); one fresh small-context session per bead is cheaper than one long session, and sequential execution is required anyway since a dependency tree touches the same files. Hard external gates (tests pass, bead actually closed) make cheap models safe. After the first real run: "we should also make sure the output and progress is logged with sufficient info to support debugging and troubleshooting." For capture: "i don't want to re-implement that skill to do this, i want to reuse it" — so the worker session invokes /work-log itself (single-objective session = the skill's no-confirmation case, and its mechanical session-id capture points at the transcript that did the work).
+Rejected: initial bash implementation — ported to Python after "is bash the right tool to use for this or would python be better?"; the bash version already delegated every JSON read to embedded python3 heredocs. The black-box test suite (fake bd/claude via BD_BIN/CLAUDE_BIN) validated the port unchanged.
+Outcome [user-facing]: scripts/bd-run-beads.py — resolves transitive blocks-dependencies deps-first (deduped, cycle-detected), routes models label > title-tag > --default-model, dry-run plan, restartable (closed beads skip), per-run debug logs under .bd-run-beads/ (run.log, per-bead stream-json transcripts, stderr, test-gate output, live tool-call/cost progress), --work-log auto|on|off with a warn-only capture check.
+Outcome [developer-facing]: scripts/test_bd_run_beads.sh, 30 fixture-driven assertions; beads SlackBackup-j7b/dbp/tct closed across three commits.
+Outcome [user-facing]: The digest-v2 tree ran end-to-end through the tool: 7/7 beads completed in separate worker sessions (commits 8891e36..d30421b, schema now slack-llm-digest-v2 + ADR 0001), pushed.
+Open: the 7 worker sessions predate the work-log integration, so they are unlogged (backfill candidate via extract_context.py digest); /code-review over the accumulated digest-v2 diff (29cf818..d30421b) still pending; SlackBackup-hjo (stale .venv shims from the repo move) open.
+
+### Key Learnings:
+claude CLI: --allowedTools is variadic and swallows a trailing positional prompt — deliver headless prompts via stdin; -p with --output-format stream-json requires --verbose.
+After a repo move, venv shims keep absolute shebangs to the old path: executable-but-dead. Probe test commands (pytest --collect-only, exit 0 or 5) instead of trusting -x.
