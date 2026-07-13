@@ -108,7 +108,7 @@ def test_files_reduced_to_name_filetype_permalink(tmp_path):
 
     parent_a = _by_ts(april["messages"], A_TS)
     assert len(parent_a["files"]) == 1
-    assert set(parent_a["files"][0].keys()) == {"name", "filetype", "permalink"}
+    assert set(parent_a["files"][0].keys()) == {"id", "name", "filetype", "permalink"}
     assert parent_a["files"][0]["name"] == "printer-error.jpg"
 
 

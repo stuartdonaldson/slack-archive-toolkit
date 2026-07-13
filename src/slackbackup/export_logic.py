@@ -105,7 +105,7 @@ def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False) -> dict
     files = msg.get("files")
     if files:
         base["files"] = [
-            {"name": f.get("name"), "filetype": f.get("filetype"), "permalink": f.get("permalink")}
+            {"id": f.get("id"), "name": f.get("name"), "filetype": f.get("filetype"), "permalink": f.get("permalink")}
             for f in files
         ]
     if evidence:
@@ -375,6 +375,10 @@ def trailing_days_range(days: int | None, as_of: str) -> tuple[str | None, str]:
     return from_date.isoformat(), as_of
 
 
+def digest_channel_url(workspace: str, channel_id: str) -> str:
+    return f"https://{workspace}.slack.com/archives/{channel_id}"
+
+
 def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
     return f"https://{workspace}.slack.com/archives/{channel_id}/p{ts.replace('.', '')}"
 
@@ -477,12 +481,12 @@ def _clean_file(data: dict) -> dict:
 def _load_channel_files(channel_dir: Path) -> list[dict]:
     """Reads channel_dir's slackdump.sqlite FILE table directly - not via
     convert_fn's message-anchored export, which never surfaces these at
-    all for an unattached channel Canvas (FILE.MESSAGE_ID is "EMPTY FOR
-    CHANNEL CANVAS FILES" per the table's own comment - a Canvas isn't a
-    reply to anything). Read-only, local-only, no API call. Non-image
-    only (mimetype not image/*), matching docs/DESIGN-files.md's existing
-    non-image filtering convention. Deduped by file id - the same row can
-    repeat across resume cycles, like MESSAGE.
+    all for an unattached channel Canvas (FILE.MESSAGE_ID is NULL for
+    channel Canvas files - a Canvas isn't a reply to anything). Read-only,
+    local-only, no API call. Non-image only (mimetype not image/*), matching
+    docs/DESIGN-files.md's existing non-image filtering convention. Deduped
+    by file id - the same row can repeat across resume cycles, like MESSAGE.
+    When merging duplicate rows, prefer one with non-null MESSAGE_ID.
     """
     db_path = channel_dir / "slackdump.sqlite"
     if not db_path.exists():
@@ -491,7 +495,7 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
     try:
         conn = sqlite3.connect(db_path)
         try:
-            rows = conn.execute("SELECT DATA FROM FILE").fetchall()
+            rows = conn.execute("SELECT DATA, MESSAGE_ID FROM FILE").fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -499,16 +503,21 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
         # table to read, same as "no files" rather than a hard failure.
         return []
 
-    by_id: dict[str, dict] = {}
-    for (raw,) in rows:
+    by_id: dict[str, tuple[dict, str | None]] = {}
+    for raw, message_id in rows:
         data = json.loads(raw)
         if (data.get("mimetype") or "").startswith("image/"):
             continue
-        by_id[data["id"]] = data
+        # When deduping by id, prefer rows with non-null MESSAGE_ID over null.
+        file_id = data["id"]
+        if file_id not in by_id or by_id[file_id][1] is None:
+            by_id[file_id] = (data, message_id)
 
     files = []
-    for data in by_id.values():
+    for data, message_id in by_id.values():
         cleaned = _clean_file(data)
+        if message_id is not None:
+            cleaned["message_ts"] = message_id
         local_path = channel_dir / "__uploads" / cleaned["id"] / (cleaned["name"] or "")
         exists = local_path.exists()
         cleaned["local_path"] = str(local_path.relative_to(channel_dir.parent.parent)) if exists else None
@@ -808,7 +817,8 @@ def build_digest(
             channels_meta.append(
                 {
                     "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                    "status": "missing_archive", "files": [], **channel_info,
+                    "status": "missing_archive", "channel_url": digest_channel_url(workspace, channel_id),
+                    "files": [], **channel_info,
                 }
             )
             continue
@@ -830,7 +840,8 @@ def build_digest(
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                "status": "ok", "files": _load_channel_files(channel_dir), **channel_info,
+                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
+                "files": _load_channel_files(channel_dir), **channel_info,
                 **activity_fields,
             }
         )

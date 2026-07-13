@@ -17,9 +17,10 @@ FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-a
 
 def _make_file_db(path: Path, files: list[dict]) -> None:
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT)")
+    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT, MESSAGE_ID TEXT)")
     for f in files:
-        conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (f["id"], json.dumps(f)))
+        message_id = f.get("message_id")
+        conn.execute("INSERT INTO FILE (ID, DATA, MESSAGE_ID) VALUES (?, ?, ?)", (f["id"], json.dumps(f), message_id))
     conn.commit()
     conn.close()
 
@@ -98,6 +99,11 @@ def test_load_job_accepts_workspaces_as_a_list(tmp_path):
 def test_digest_message_url():
     url = export_logic.digest_message_url("f3pugetsound", "C123", "1718990400.123456")
     assert url == "https://f3pugetsound.slack.com/archives/C123/p1718990400123456"
+
+
+def test_digest_channel_url():
+    url = export_logic.digest_channel_url("f3pugetsound", "C123")
+    assert url == "https://f3pugetsound.slack.com/archives/C123"
 
 
 def test_select_messages_in_range_nests_threads_without_month_bucketing():
@@ -652,9 +658,9 @@ def test_build_digest_includes_non_image_files_per_channel(tmp_path):
 
     db_path = channel_dir / "slackdump.sqlite"
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT)")
-    conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (CANVAS_FILE["id"], json.dumps(CANVAS_FILE)))
-    conn.execute("INSERT INTO FILE (ID, DATA) VALUES (?, ?)", (IMAGE_FILE["id"], json.dumps(IMAGE_FILE)))
+    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT, MESSAGE_ID TEXT)")
+    conn.execute("INSERT INTO FILE (ID, DATA, MESSAGE_ID) VALUES (?, ?, ?)", (CANVAS_FILE["id"], json.dumps(CANVAS_FILE), None))
+    conn.execute("INSERT INTO FILE (ID, DATA, MESSAGE_ID) VALUES (?, ?, ?)", (IMAGE_FILE["id"], json.dumps(IMAGE_FILE), None))
     conn.commit()
     conn.close()
 
@@ -720,7 +726,8 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
 
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
     assert meta == {
-        "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok", "files": [],
+        "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok",
+        "channel_url": "https://f3pugetsound.slack.com/archives/C1", "files": [],
         "description": None, "creator": None, "created_at": None,
         "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
         "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
@@ -894,6 +901,7 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
     assert result["channels"] == [
         {
             "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
+            "channel_url": "https://f3pugetsound.slack.com/archives/C1",
             "files": [], "description": None, "creator": None, "created_at": None,
         }
     ]
@@ -932,6 +940,101 @@ def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
     assert role["position"] == "Nantan"
     assert role["status"] == "former"
     assert role["is_current"] is False
+
+
+def test_load_channel_files_message_attached_file_carries_message_ts(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+
+    file_with_message = CANVAS_FILE.copy()
+    file_with_message["id"] = "F_WITH_MESSAGE"
+    _make_file_db(channel_dir / "slackdump.sqlite", [file_with_message])
+
+    # Manually add MESSAGE_ID to the database since _make_file_db uses the message_id key
+    # We need to update the database directly
+    db_path = channel_dir / "slackdump.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE FILE SET MESSAGE_ID = ? WHERE ID = ?", ("1234567890.000001", "F_WITH_MESSAGE"))
+    conn.commit()
+    conn.close()
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert len(files) == 1
+    assert files[0]["message_ts"] == "1234567890.000001"
+
+
+def test_load_channel_files_channel_canvas_omits_message_ts(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert len(files) == 1
+    assert "message_ts" not in files[0]
+
+
+def test_load_channel_files_dedupes_prefers_message_attached_over_channel_canvas(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+
+    # Create two rows for the same file: one with MESSAGE_ID, one without
+    db_path = channel_dir / "slackdump.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE FILE (ID TEXT, DATA TEXT, MESSAGE_ID TEXT)")
+    # First row: channel canvas (MESSAGE_ID is null)
+    conn.execute("INSERT INTO FILE (ID, DATA, MESSAGE_ID) VALUES (?, ?, ?)",
+                 (CANVAS_FILE["id"], json.dumps(CANVAS_FILE), None))
+    # Second row: same file attached to a message
+    conn.execute("INSERT INTO FILE (ID, DATA, MESSAGE_ID) VALUES (?, ?, ?)",
+                 (CANVAS_FILE["id"], json.dumps(CANVAS_FILE), "1234567890.000001"))
+    conn.commit()
+    conn.close()
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert len(files) == 1
+    assert files[0]["message_ts"] == "1234567890.000001"
+
+
+def test_build_digest_channel_url_present_on_ok_channels(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta["channel_url"] == "https://f3pugetsound.slack.com/archives/C1"
+    assert meta["status"] == "ok"
+
+
+def test_build_digest_channel_url_present_on_missing_archive_channels(tmp_path):
+    archive_root = tmp_path / "archive"
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta["channel_url"] == "https://f3pugetsound.slack.com/archives/C1"
+    assert meta["status"] == "missing_archive"
 
 
 def test_build_digest_emeritus_in_display_name_goes_to_former_by_region(tmp_path):
