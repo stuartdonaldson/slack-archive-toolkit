@@ -1112,3 +1112,31 @@ def test_build_digest_title_high_role_wins_confidence_and_currency(tmp_path):
     assert role["status"] == "current"
     assert role["is_current"] is True
     assert result["leadership"]["former_by_region"] == []
+
+
+def test_enrich_for_digest_reply_has_thread_ts_parent_does_not():
+    """Replies carry thread_ts equal to parent ts; roots have no thread_ts."""
+    parent = {"ts": "1000.000100", "user": "U0A", "text": "parent message"}
+    reply = {"ts": "1100.000100", "user": "U0B", "text": "reply"}
+    parent["replies"] = [reply]
+
+    export_logic._enrich_for_digest(parent, "f3pugetsound", "helpdesk", "C1")
+
+    assert "thread_ts" not in parent
+    assert parent["posted_at_local"] == export_logic._format_local_pacific(1000.0001)
+    assert reply["thread_ts"] == "1000.000100"
+    assert reply["posted_at_local"] == export_logic._format_local_pacific(1100.0001)
+
+
+def test_enrich_for_digest_posted_at_local_has_dst_offset():
+    """January timestamp shows -08:00 offset; July shows -07:00."""
+    # 2026-01-15 00:00:00 UTC = epoch 1736899200
+    jan_ts = 1736899200.000100
+    # 2026-07-15 00:00:00 UTC = epoch 1752604800
+    jul_ts = 1752604800.000100
+
+    jan_local = export_logic._format_local_pacific(jan_ts)
+    jul_local = export_logic._format_local_pacific(jul_ts)
+
+    assert "-08:00" in jan_local
+    assert "-07:00" in jul_local

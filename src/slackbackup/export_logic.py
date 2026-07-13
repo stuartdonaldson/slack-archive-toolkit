@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, AbstractSet
+from zoneinfo import ZoneInfo
 
 from . import catalog_logic, selector_logic
 from .handlers import f3 as _default_handler
@@ -575,12 +576,20 @@ def _format_utc(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str) -> None:
+def _format_local_pacific(epoch: float) -> str:
+    tz = ZoneInfo("America/Los_Angeles")
+    return datetime.fromtimestamp(epoch, tz=tz).isoformat()
+
+
+def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str, parent_ts: str | None = None) -> None:
     msg["workspace"] = workspace
     msg["channel"] = channel
     msg["channel_id"] = channel_id
     msg["message_url"] = digest_message_url(workspace, channel_id, msg["ts"])
     msg["posted_at_utc"] = _format_utc(float(msg["ts"]))
+    msg["posted_at_local"] = _format_local_pacific(float(msg["ts"]))
+    if parent_ts is not None:
+        msg["thread_ts"] = parent_ts
     replies = msg.get("replies")
     if replies:
         # Thread rollups so a consumer can answer "how active was this
@@ -591,7 +600,7 @@ def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str)
         msg["thread_participant_count"] = len(participants - {None})
         msg["thread_last_reply_utc"] = _format_utc(max(float(r["ts"]) for r in replies))
         for reply in replies:
-            _enrich_for_digest(reply, workspace, channel, channel_id)
+            _enrich_for_digest(reply, workspace, channel, channel_id, parent_ts=msg["ts"])
 
 
 def _assign_digest_seq(cleaned: list[dict]) -> None:
