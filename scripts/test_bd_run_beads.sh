@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for scripts/bd-run-beads.sh (bd SlackBackup-j7b).
+# Tests for scripts/bd-run-beads.py (bd SlackBackup-j7b).
 # Fixture-driven: no live bd database, no real claude sessions. A fake `bd`
 # serves issue JSON from per-test fixture dirs; a fake `claude` logs its
 # invocations and flips the bead's status file to closed (or doesn't, for
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNNER="$SCRIPT_DIR/bd-run-beads.sh"
+RUNNER="$SCRIPT_DIR/bd-run-beads.py"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -197,6 +197,23 @@ rc=$?
 set -e
 assert_eq "gate: failing tests -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
 assert_contains "gate: reports test failure" "test" "$OUT"
+
+# --- case 8: auto-detect must not pick a broken .venv pytest shim -------------
+# Simulates a repo whose .venv predates a directory move: the shim exists and
+# is executable, but its shebang interpreter is gone. Detection must probe and
+# fall through to a working candidate (or disable) instead of trusting -x.
+
+PROJ="$WORKDIR/proj"; mkdir -p "$PROJ/.venv/bin" "$PROJ/src"
+printf '#!/nonexistent/python\n' > "$PROJ/.venv/bin/pytest"
+chmod +x "$PROJ/.venv/bin/pytest"
+touch "$PROJ/pyproject.toml"
+
+FIX7="$WORKDIR/fix7"; mkdir -p "$FIX7"
+mk_bead "$FIX7" tb-r "root fix" open "" ""
+
+OUT="$(cd "$PROJ" && FIXDIR="$FIX7" "$RUNNER" --dry-run tb-r 2>&1)"
+gate_line="$(grep 'test gate:' <<<"$OUT")"
+assert_eq "detect: broken .venv shim rejected" "" "$(grep -o '.venv/bin/pytest' <<<"$gate_line" || true)"
 
 # ------------------------------------------------------------------------------
 
