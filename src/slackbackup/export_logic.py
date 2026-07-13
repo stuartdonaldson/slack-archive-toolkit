@@ -76,6 +76,44 @@ def _parse_archive_url(url: str) -> tuple[str, str] | None:
     return channel_id, f"{digits[:-6]}.{digits[-6:]}"
 
 
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
+_LINK_TOKEN_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]*))?>")
+
+
+def _extract_mentions(text: str | None) -> list[str]:
+    """<@U...> user ids in order of first appearance, deduped."""
+    if not text:
+        return []
+    seen: list[str] = []
+    for match in _MENTION_RE.finditer(text):
+        uid = match.group(1)
+        if uid not in seen:
+            seen.append(uid)
+    return seen
+
+
+def _extract_links(text: str | None) -> list[dict]:
+    """Slack angle-bracket link tokens <url> / <url|label> (url must start
+    with http, so <#C...>/<@U...>/<!here> tokens are never matched here)."""
+    if not text:
+        return []
+    links = []
+    for match in _LINK_TOKEN_RE.finditer(text):
+        url, label = match.group(1), match.group(2)
+        entry = {"url": url, "label": label or None}
+        if "slack.com/archives/" in url:
+            entry["type"] = "slack_message"
+            target = _parse_archive_url(url)
+            if target:
+                entry["target_channel_id"], entry["target_ts"] = target
+        elif "slack.com/docs/" in url or "slack.com/files/" in url:
+            entry["type"] = "slack_file"
+        else:
+            entry["type"] = "external"
+        links.append(entry)
+    return links
+
+
 def _unfurls_from_attachments(attachments: list[dict]) -> list[dict]:
     unfurls = []
     for att in attachments:
@@ -127,6 +165,13 @@ def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False) -> dict
             unfurls = _unfurls_from_attachments(attachments)
             if unfurls:
                 base["unfurls"] = unfurls
+        text = msg.get("text")
+        mentions = _extract_mentions(text)
+        if mentions:
+            base["mentions"] = mentions
+        links = _extract_links(text)
+        if links:
+            base["links"] = links
     return base
 
 
@@ -697,6 +742,60 @@ def _channel_activity(messages: list[dict], bot_ids: AbstractSet[str] = frozense
     }
 
 
+def _collect_referenced_ids(cleaned_messages: list[dict], creator: str | None, files: list[dict]) -> set[str]:
+    """Every user id actually referenced in one channel's digest slice:
+    message/reply authors, mentions, reactions users, the channel creator,
+    and file creators - the bounded set user_index is built from, not the
+    full workspace roster."""
+    ids: set[str] = set()
+    if creator:
+        ids.add(creator)
+    for f in files:
+        if f.get("creator"):
+            ids.add(f["creator"])
+
+    def _walk(msg: dict) -> None:
+        uid = msg.get("user")
+        if uid:
+            ids.add(uid)
+        for mention in msg.get("mentions", ()):
+            ids.add(mention)
+        for reaction in msg.get("reactions", ()):
+            for ruser in reaction.get("users") or ():
+                ids.add(ruser)
+        for reply in msg.get("replies", ()):
+            _walk(reply)
+
+    for msg in cleaned_messages:
+        _walk(msg)
+    return ids
+
+
+def _build_user_index(profiles_doc: dict, referenced_ids_by_workspace: dict[str, set[str]]) -> dict:
+    """Per-workspace {user_id: {display_name, is_bot}}, scoped to ids
+    actually referenced somewhere in that workspace's digest slice -
+    intentionally not a cross-workspace merged identity table (see
+    build_digest's docstring) and not the full roster."""
+    profiles_by_workspace = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+    index: dict[str, dict] = {}
+    for workspace, ids in referenced_ids_by_workspace.items():
+        profiles = profiles_by_workspace.get(workspace, {})
+        entries = {}
+        for uid in sorted(ids):
+            profile = profiles.get(uid)
+            if profile is None:
+                continue
+            display_name = profile["display_name"] or profile["real_name"] or profile["name"] or profile["id"]
+            entries[uid] = {"display_name": display_name, "is_bot": "bot" in profile["slack_roles"]}
+        if entries:
+            index[workspace] = entries
+    return index
+
+
 def _build_workspace_activity_index(channels_meta: list[dict], activity_by_channel: dict[tuple, dict]) -> list[dict]:
     """One record per workspace, aggregated from each "ok" channel's
     _channel_activity() output - keyed by (workspace, channel_id) so a
@@ -770,10 +869,14 @@ def build_digest(
     "missing_archive" and skipped - one un-archived channel must not abort
     a digest spanning many workspaces.
 
-    Deliberately has no top-level merged "users"/"authors" table: the same
-    Slack user id (or display name) in two different workspaces is not the
-    same identity, so author info stays embedded per-message, scoped to
-    that message's own workspace, exactly as `_clean()` already resolves it.
+    Has a top-level `user_index` section, but it is per-workspace (keyed by
+    workspace name, never merged): the same Slack user id in two different
+    workspaces is not the same identity, so an id is looked up only within
+    its own workspace's profiles and never crosses workspace boundaries. It
+    is also bounded to ids actually referenced somewhere in that workspace's
+    digest slice (authors, mentions, reactions, channel creators, file
+    creators) - not the full roster. Author info itself still stays
+    embedded per-message, exactly as `_clean()` already resolves it.
 
     Each "ok" channel's entry also carries its non-image files/Canvases
     (see _load_channel_files) - read directly from the channel's own
@@ -812,6 +915,7 @@ def build_digest(
     channels_meta: list[dict] = []
     messages: list[dict] = []
     activity_by_channel: dict[tuple, dict] = {}
+    referenced_ids_by_workspace: dict[str, set[str]] = {}
 
     catalog_cache: dict[str, dict] = {}
 
@@ -846,11 +950,15 @@ def build_digest(
             _enrich_for_digest(msg, workspace, channel, channel_id)
         _assign_digest_seq(cleaned)
         messages.extend(cleaned)
+        files = _load_channel_files(channel_dir)
+        referenced_ids_by_workspace.setdefault(workspace, set()).update(
+            _collect_referenced_ids(cleaned, channel_info.get("creator"), files)
+        )
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
                 "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
-                "files": _load_channel_files(channel_dir), **channel_info,
+                "files": files, **channel_info,
                 **activity_fields,
             }
         )
@@ -897,6 +1005,25 @@ def build_digest(
                     "after that root in the true timeline despite being nested under its own thread. "
                     "No gaps; a record outside export_scope is simply not present, so not numbered."
                 ),
+                "mentions": (
+                    "user ids parsed from <@U...> tokens in a message's text, in order of first "
+                    "appearance, deduped; the key is omitted when the text has no mentions. text "
+                    "itself is never modified - always the raw, unresolved Slack token."
+                ),
+                "links": (
+                    "Slack angle-bracket link tokens (<url> / <url|label>) parsed from a message's "
+                    "text, omitted when none are present; label is null for a bare url. type is "
+                    "slack_message (with target_channel_id/target_ts) for a slack.com/archives/... "
+                    "message link, slack_file for a slack.com/docs/ or slack.com/files/ link, else "
+                    "external."
+                ),
+                "user_index": (
+                    "top-level {workspace: {user_id: {display_name, is_bot}}}, scoped to ids actually "
+                    "referenced somewhere in that workspace's slice of this digest (message/reply "
+                    "authors, mentions, reactions users, channel creators, file creators) - not the "
+                    "full roster, and never merged across workspaces (a shared user id in two "
+                    "workspaces gets two separate entries, one per workspace)."
+                ),
             },
             "known_limitations": [
                 "Private or inaccessible channels may be absent",
@@ -907,6 +1034,7 @@ def build_digest(
         "channels": channels_meta,
         "workspace_activity_index": _build_workspace_activity_index(channels_meta, activity_by_channel),
         "messages": messages,
+        "user_index": _build_user_index(profiles_doc, referenced_ids_by_workspace),
         "leadership": leadership,
     }
 

@@ -1128,6 +1128,138 @@ def test_enrich_for_digest_reply_has_thread_ts_parent_does_not():
     assert reply["posted_at_local"] == export_logic._format_local_pacific(1100.0001)
 
 
+def test_extract_mentions_order_and_dedupe():
+    text = "hey <@U0B> and <@U0A>, also <@U0B> again"
+    assert export_logic._extract_mentions(text) == ["U0B", "U0A"]
+
+
+def test_extract_mentions_empty_when_no_tokens():
+    assert export_logic._extract_mentions("no mentions here, just <#C123> and <!here>") == []
+
+
+def test_extract_links_bare_url_has_null_label():
+    links = export_logic._extract_links("check <https://example.com/page>")
+    assert links == [{"url": "https://example.com/page", "label": None, "type": "external"}]
+
+
+def test_extract_links_labeled_url():
+    links = export_logic._extract_links("see <https://example.com/page|the docs>")
+    assert links[0]["label"] == "the docs"
+    assert links[0]["type"] == "external"
+
+
+def test_extract_links_slack_message_link_yields_target_channel_and_ts():
+    text = "look at <https://f3pugetsound.slack.com/archives/C123/p1778086219226429|this>"
+    links = export_logic._extract_links(text)
+    assert links[0]["type"] == "slack_message"
+    assert links[0]["target_channel_id"] == "C123"
+    assert links[0]["target_ts"] == "1778086219.226429"
+
+
+def test_extract_links_slack_file_link():
+    text = "doc <https://f3pugetsound.slack.com/files/U0A/F123/canvas>"
+    links = export_logic._extract_links(text)
+    assert links[0]["type"] == "slack_file"
+
+
+def test_select_messages_in_range_carries_mentions_and_links():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A",
+            "text": "hey <@U0B> check <https://example.com/page>",
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert messages[0]["mentions"] == ["U0B"]
+    assert messages[0]["links"] == [{"url": "https://example.com/page", "label": None, "type": "external"}]
+    # text is untouched - raw tokens survive verbatim.
+    assert messages[0]["text"] == "hey <@U0B> check <https://example.com/page>"
+
+
+def test_select_messages_in_range_omits_mentions_and_links_keys_when_absent():
+    users_map = {"U0A": "Al"}
+    all_messages = [{"ts": "1000.000100", "user": "U0A", "text": "plain text"}]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert "mentions" not in messages[0]
+    assert "links" not in messages[0]
+
+
+def test_build_digest_user_index_includes_mentioned_never_posting_user_excludes_unreferenced(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    def convert_fn(channel_dir: Path, out_dir: Path) -> None:
+        out = out_dir / "helpdesk"
+        out.mkdir(parents=True)
+        (out_dir / "users.json").write_text(json.dumps([
+            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
+            {"id": "U0MENTIONED", "name": "mo", "real_name": "Mo Mentioned",
+             "profile": {"display_name": "Mo"}},
+            {"id": "U0UNUSED", "name": "un", "real_name": "Un Referenced",
+             "profile": {"display_name": "Un"}},
+        ]))
+        (out / "2026-06-01.json").write_text(json.dumps([
+            {"type": "message", "user": "U0A", "ts": "1780300800.000100", "text": "hey <@U0MENTIONED>"},
+        ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    ws_index = result["user_index"]["f3pugetsound"]
+    assert ws_index["U0A"] == {"display_name": "Al", "is_bot": False}
+    assert ws_index["U0MENTIONED"] == {"display_name": "Mo", "is_bot": False}
+    assert "U0UNUSED" not in ws_index
+
+
+def test_build_digest_user_index_scoped_per_workspace_for_shared_user_id(tmp_path):
+    archive_root = tmp_path / "archive"
+    for ws in ("f3pugetsound", "f3kirkland"):
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
+    ]))
+
+    def convert_fn(channel_dir: Path, out_dir: Path) -> None:
+        workspace = channel_dir.parent.name
+        out = out_dir / "helpdesk"
+        out.mkdir(parents=True)
+        display_name = "Puget Al" if workspace == "f3pugetsound" else "Kirkland Al"
+        (out_dir / "users.json").write_text(json.dumps([
+            {"id": "U0SAME", "name": "same", "real_name": "Same Real Name",
+             "profile": {"display_name": display_name}},
+        ]))
+        (out / "2026-06-01.json").write_text(json.dumps([
+            {"type": "message", "user": "U0SAME", "ts": "1780300800.000100", "text": "hi"},
+        ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["user_index"]["f3pugetsound"]["U0SAME"]["display_name"] == "Puget Al"
+    assert result["user_index"]["f3kirkland"]["U0SAME"]["display_name"] == "Kirkland Al"
+
+
 def test_enrich_for_digest_posted_at_local_has_dst_offset():
     """January timestamp shows -08:00 offset; July shows -07:00."""
     # 2026-01-15 00:00:00 UTC = epoch 1736899200
