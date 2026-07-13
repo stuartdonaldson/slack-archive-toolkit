@@ -344,9 +344,12 @@ export engine. Handler selection:
 
 ### Output shape
 
+`schema_version: "slack-llm-digest-v2"`. v2 evolves v1 **additively** — every v1 field/shape
+still holds; v2 only adds fields (see the ADR below for the design decision behind this).
+
 ```jsonc
 {
-  "schema_version": "slack-llm-digest-v1",
+  "schema_version": "slack-llm-digest-v2",
   "generated_at": "2026-06-23T18:00:00Z",
   "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
@@ -355,7 +358,12 @@ export engine. Handler selection:
       "root_message_count": "top-level messages only",
       "reply_count": "nested replies under root messages",
       "total_message_count": "root_message_count plus reply_count",
-      "activity_status": "active when total_message_count > 0 in export_scope, else inactive"
+      "activity_status": "active when total_message_count > 0 in export_scope, else inactive",
+      "in_scope": "false only on a parent that predates export_scope but whose thread was pulled in by an in-range reply (see §Cross-period thread inclusion below); absent/omitted means in scope. Never emitted as true.",
+      "seq": "per-channel (not global) monotonic integer, 1..N, over every emitted record (root + nested replies) ascending by true post ts; lets a consumer flatten thread nesting back into true chronological order.",
+      "mentions": "<@U...> user ids parsed from a message's text, first-appearance order, deduped; omitted when none.",
+      "links": "Slack angle-bracket link tokens (<url>/<url|label>) parsed from a message's text, omitted when none; type is slack_message/slack_file/external.",
+      "user_index": "top-level {workspace: {user_id: {display_name, is_bot}}}, scoped to ids referenced in that workspace's digest slice, never merged across workspaces."
     },
     "known_limitations": [
       "Private or inaccessible channels may be absent",
@@ -365,13 +373,18 @@ export engine. Handler selection:
   },
   "channels": [
     { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
-      "status": "ok", "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
-      "files": [ { "id": "F...", "name": "Upcoming_Q_Schedule", "mimetype": "application/vnd.slack-docs",
-                   "content": "Q | Date | AO\n...", "permalink": "https://..." } ],
+      "status": "ok", "channel_url": "https://f3pugetsound.slack.com/archives/C...",
+      "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
+      "files": [ { "id": "F...", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q Schedule",
+                   "filetype": "canvas", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
+                   "creator": "U...", "created_at": "2026-01-05T00:00:00Z", "size": 4096,
+                   "permalink": "https://...", "message_ts": "1718...", "local_path": "f3pugetsound/ao-active-book-club/__uploads/F.../Upcoming_Q_Schedule",
+                   "content": "Q | Date | AO\n..." } ],
       "root_message_count": 12, "reply_count": 28, "total_message_count": 40, "participant_count": 8,
       "first_message_utc": "2026-04-01T12:00:00Z", "last_message_utc": "2026-06-20T08:00:00Z",
       "activity_status": "active", "activity_status_basis": "has messages during export_scope" },
-    { "workspace": "f3kirkland", "channel": "general", "status": "missing_archive" }
+    { "workspace": "f3kirkland", "channel": "general", "status": "missing_archive",
+      "channel_url": "https://f3kirkland.slack.com/archives/C...", "files": [] }
   ],
   "workspace_activity_index": [
     { "workspace": "f3pugetsound", "channel_count": 232, "active_channel_count": 67, "inactive_channel_count": 165,
@@ -382,12 +395,36 @@ export engine. Handler selection:
       "inactive_definition": "zero root messages and zero nested replies during export_scope" }
   ],
   "messages": [
-    { "ts": "1718...", "user": "U123", "display_name": "Jane Doe", "text": "...",
+    { "ts": "1718...", "user": "U123", "display_name": "Jane Doe", "text": "...text <@U456> check <https://example.com|this>",
+      "files": [ { "id": "F...", "name": "photo.jpg", "filetype": "jpg", "permalink": "https://..." } ],
+      "reactions": [ { "name": "+1", "count": 2, "users": ["U456", "U789"] } ],
+      "edited": { "user": "U123", "at_utc": "2026-06-21T08:05:00Z" },
+      "subtype": "channel_join",
+      "unfurls": [ { "url": "https://...", "author_name": "...", "quoted_text": "...", "target_channel_id": "C...", "target_ts": "1718..." } ],
+      "mentions": [ "U456" ],
+      "links": [ { "url": "https://example.com", "label": "this", "type": "external" } ],
       "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
-      "message_url": "https://f3pugetsound.slack.com/archives/C.../p1718...", "posted_at_utc": "2026-06-21T08:00:00Z",
+      "message_url": "https://f3pugetsound.slack.com/archives/C.../p1718...",
+      "posted_at_utc": "2026-06-21T08:00:00Z", "posted_at_local": "2026-06-21T01:00:00-07:00",
+      "seq": 42,
       "reply_count": 2, "thread_participant_count": 2, "thread_last_reply_utc": "2026-06-21T09:00:00Z",
-      "replies": [ "..." ] }
+      "replies": [
+        { "ts": "1718...", "user": "U456", "display_name": "John Smith", "text": "reply text",
+          "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
+          "message_url": "https://f3pugetsound.slack.com/archives/C.../p1718...",
+          "posted_at_utc": "2026-06-21T09:00:00Z", "posted_at_local": "2026-06-21T02:00:00-07:00",
+          "thread_ts": "1718...", "seq": 43 }
+      ] },
+    { "ts": "1717...", "user": "U999", "display_name": "Old Poster", "text": "old thread parent, only here because a reply landed in scope",
+      "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
+      "message_url": "https://f3pugetsound.slack.com/archives/C.../p1717...",
+      "posted_at_utc": "2026-03-15T08:00:00Z", "posted_at_local": "2026-03-15T01:00:00-07:00",
+      "in_scope": false, "seq": 1,
+      "reply_count": 1, "replies": [ "..." ] }
   ],
+  "user_index": {
+    "f3pugetsound": { "U123": { "display_name": "Jane Doe", "is_bot": false } }
+  },
   "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] }
 }
 ```
@@ -396,7 +433,35 @@ export engine. Handler selection:
 timeline, not grouped by workspace. `reply_count`/`thread_participant_count`/`thread_last_reply_utc`
 appear only on a root message that has replies — they're rollups over the existing `replies[]`,
 not a separate thread structure, so thread context stays in one place rather than duplicated
-across a parallel index.
+across a parallel index. `reactions`/`edited`/`subtype`/`unfurls`/`mentions`/`links` are digest-only
+evidence fields (only ever attached by `select_messages_in_range`'s `evidence=True` cleaning path,
+never by `export_month`'s plain per-channel-month export) and are each omitted when absent rather
+than emitted as `null`/`[]`. `posted_at_local` is Pacific local time (`America/Los_Angeles`,
+DST-aware, ISO 8601 with UTC offset) alongside `posted_at_utc` — added so a consumer never has to
+convert timezones itself. `seq` is a per-channel (not global) monotonic counter over every emitted
+record — root and nested reply alike — assigned in true post-time order; sorting a channel's
+records by `seq` reproduces chronological order even though replies stay nested under their
+parent. `thread_ts` appears only on a reply (equal to its parent's `ts`), never on a root message.
+
+#### Cross-period thread inclusion
+
+A thread whose parent predates `export_scope` but which received a reply *inside* the scope is
+included in full — parent plus every reply — rather than starting the thread mid-conversation
+with a headless reply. The parent record in this case carries `in_scope: false` and is excluded
+from `root_message_count`, `participant_count`, and `first_message_utc`/`last_message_utc`, while
+its in-range replies still count normally as replies. `in_scope` is otherwise absent (never
+emitted as `true`) — its presence is itself the false-only signal.
+
+#### Message anchors and channel/file linking
+
+Every message and reply carries `message_url` (`https://<workspace>.slack.com/archives/<channel_id>/p<ts-no-dot>`)
+and every channel entry carries `channel_url` (`https://<workspace>.slack.com/archives/<channel_id>`),
+so a consumer can cite a specific post or channel without reconstructing Slack's URL scheme itself.
+A file's `id` plus, when the file is a reply/message attachment, its `message_ts` (the id of the
+message it was attached to) let a consumer anchor a channel-level file back to the conversation
+that posted it, the same way `message_url` anchors a message. `mentions`/`links`/`unfurls` on a
+message, together with `user_index` and each channel's `files[]`, are enough to resolve most
+cross-references (a person, another message, or a file) without a second pass over the archive.
 
 `most_active_human_channel` (in `workspace_activity_index`, below) excludes a channel whose
 total is driven by bot authors from winning the "most active" comparison purely on log/bot
@@ -498,6 +563,7 @@ Python, not bash/jq. The nightly script (`scripts/nightly-backup-digest.sh`) for
 | Per-run `convert` cost | Each invocation converts the whole archive to temp before any per-month skip, so skipped months still pay the conversion. | Acceptable at current archive sizes. If archives grow large, revisit Strategy A (direct SQLite range query) to avoid full conversion. |
 | No channel-purpose classification in the digest | `docs/llm-digest2-idea.md` proposed a `channel_category` field (ao/announcement/iso/classifieds/etc.) inferred from channel name/description. | Deferred — channel-naming conventions aren't consistent across all `f3*` workspaces, so accuracy would vary; if added, follow the existing `derive_leadership`-style pattern (heuristic value plus a `_basis` field), never an authoritative claim. |
 | Single-document digest size | `docs/llm-digest2-idea.md` proposed ZIP/per-workspace-file packaging once the merged digest gets large. A real digest (2026-06-25, 7 workspaces, 381 channels) is ~11.4 MB. | Deferred — no evidence yet that 11.4 MB is actually unworkable for the newsletter-prompt use case; revisit only if that changes, since splitting `messages` would reverse the original "one valid JSON object" decision (`docs/llm-export-suggestion.md`). |
+| v1 digest dropped raw Slack evidence (reactions, edits, subtypes, unfurls) and left timezone conversion, message/channel citation, and cross-workspace identity resolution to the LLM | `schema_version: "slack-llm-digest-v1"` carried only `ts`/`user`/`display_name`/`text`/`files` per message plus a UTC-only `posted_at_utc` — no reaction/edit/subtype/unfurl evidence, no `thread_ts` on a reply, no `channel_url`/message anchors, no `mentions`/`links` extraction, and no bounded per-workspace user index. | **Resolved** by `slack-llm-digest-v2` (see `docs/adr/0001-digest-v2-additive-evidence.md`) — additive fields only, all semantic inference still left to the downstream LLM. See §Output shape above for the full v2 field list. |
 
 ---
 

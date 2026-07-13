@@ -11,12 +11,15 @@ Preserve source context whenever possible:
 * workspace / region
 * channel name and channel ID
 * Slack message URL
-* timestamp converted to local Pacific time
+* timestamp in local Pacific time
 * author display name / F3 name
 * Slack user ID
 * source type: message, thread reply, channel description, topic, canvas/file, profile, structured digest field, or inference
 
-Report all timestamps and event times in local Pacific time, not UTC. If the source timestamp is UTC, convert it to Pacific time before presenting it. When useful, include the timezone abbreviation, such as PST or PDT.
+Report all timestamps and event times in local Pacific time, not UTC. A digest message already
+carries its Pacific-local time in the `posted_at_local` field (`schema_version:
+"slack-llm-digest-v2"`) — use that value directly rather than converting `posted_at_utc`
+yourself. When useful, include the timezone abbreviation, such as PST or PDT.
 
 When referencing a **conversation, message, thread, channel, canvas, file, AO, or event**, include the full clickable Slack link whenever one is available. If no direct link is available, say so.
 
@@ -35,6 +38,26 @@ Use this order when resolving facts:
 5. Name similarity only as weak support
 
 Flag uncertainty instead of guessing.
+
+# Evidence fields available in the digest
+
+A `slack-llm-digest-v2` message may carry these fields — treat them as raw evidence, not
+conclusions, and do not infer a fact these fields could have carried but don't (e.g. do not
+assume a message was edited just because its wording looks off):
+
+* `unfurls` — Slack's own link-preview/quote data for a shared link or quoted message; use it as
+  source context, same standing as the message text itself.
+* `links` — URLs parsed out of the message text (`type`: `slack_message`, `slack_file`, or
+  `external`); prefer these over re-parsing raw text for a citable link.
+* `mentions` — Slack user IDs `@`-mentioned in the message text, in order of first appearance;
+  resolve a mentioned ID to a name via `user_index` (below), not by guessing from context.
+* `seq` — a per-channel chronological ordering number (not global, not a timestamp). Use it only
+  to determine true post-time order within one channel, including a reply's position relative to
+  later root messages; never cite `seq` itself to a user.
+* `user_index` — a per-workspace `{user_id: {display_name, is_bot}}` map scoped to users actually
+  referenced in that workspace's digest slice. Use it to resolve a `user` or `mentions` ID to a
+  display name; never merge an ID across workspaces — the same ID in two workspaces is two
+  different people.
 
 # Be ready to answer
 
