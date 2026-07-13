@@ -91,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 prompt="$(cat)"
+[[ -n "${PROMPT_DUMP:-}" ]] && printf '%s' "$prompt" > "$PROMPT_DUMP"
 id="$(grep -oE 'tb-[a-z0-9]+' <<<"$prompt" | head -1)"
 [[ -n "$id" ]] || { echo "fake claude: no bead id on stdin" >&2; exit 1; }
 echo "RUN $id $model" >> "$CLAUDE_LOG"
@@ -167,7 +168,7 @@ mk_bead "$FIX4" tb-r "root fix"                  open "" ""
 mk_bead "$FIX4" tb-a "[haiku-ok] mechanical bit" open "" "tb-r"
 
 export CLAUDE_LOG="$WORKDIR/claude.log"; : > "$CLAUDE_LOG"
-FIXDIR="$FIX4" "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs5" tb-a
+FIXDIR="$FIX4" "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs5" --work-log off tb-a
 assert_eq "exec: sessions run dependency-first with cue models" \
     "RUN tb-r sonnet
 RUN tb-a haiku" "$(cat "$CLAUDE_LOG")"
@@ -210,6 +211,39 @@ rc=$?
 set -e
 assert_eq "gate: failing tests -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
 assert_contains "gate: reports test failure" "test" "$OUT"
+
+# --- case 9/10: work-log step reuses the skill; on/off; warn-only gate --------
+# With --work-log on, the session prompt gains an "invoke the work-log skill"
+# step placed BEFORE the commit step (so the entry lands in the bead's own
+# commit), and a session that doesn't grow work-log.md draws a run.log
+# warning but never fails the run. With off, neither appears.
+
+FIX8="$WORKDIR/fix8"; mkdir -p "$FIX8"
+mk_bead "$FIX8" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$WORKDIR" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt9.txt" \
+    "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs9" --work-log on tb-r 2>&1)"
+PROMPT="$(cat "$WORKDIR/prompt9.txt")"
+assert_contains "work-log on: prompt invokes the skill" "work-log skill (/work-log)" "$PROMPT"
+wl_line="$(line_no "work-log skill" "$PROMPT")"
+commit_line="$(line_no "Commit the changes" "$PROMPT")"
+assert_eq "work-log on: skill step precedes commit step" "yes" \
+    "$( (( wl_line < commit_line )) && echo yes || echo no )"
+run9=("$WORKDIR/logs9"/*)
+assert_contains "work-log on: unchanged work-log.md draws warning" \
+    "no work-log entry detected" "$(cat "${run9[0]}/run.log")"
+assert_eq "work-log on: warning does not fail the run" "closed" "$(cat "$FIX8/tb-r.status")"
+
+echo closed > "$FIX8/tb-r.status.reset" && echo open > "$FIX8/tb-r.status"
+: > "$CLAUDE_LOG"
+OUT="$(cd "$WORKDIR" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt10.txt" \
+    "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs10" --work-log off tb-r 2>&1)"
+assert_eq "work-log off: prompt has no skill step" "" \
+    "$(grep -o 'work-log' "$WORKDIR/prompt10.txt" || true)"
+run10=("$WORKDIR/logs10"/*)
+assert_eq "work-log off: no warning logged" "" \
+    "$(grep -o 'no work-log entry detected' "${run10[0]}/run.log" || true)"
 
 # --- case 8: auto-detect must not pick a broken .venv pytest shim -------------
 # Simulates a repo whose .venv predates a directory move: the shim exists and

@@ -27,6 +27,13 @@ plus, per bead, the full claude stream-json transcript
 test-gate output (<bead>.tests.log). Compact per-event progress (assistant
 text, tool calls, result/cost) is echoed to the console as the session runs.
 
+Work-log capture (--work-log auto|on|off, default auto = on when a
+work-log skill dir exists user- or project-level): each session is asked to
+invoke the existing work-log skill itself — reused, never reimplemented
+here — before committing, so the entry lands inside the bead's own commit
+and its provenance session-id is the session that did the work. The runner
+only warns (never fails) when work-log.md didn't grow during a bead.
+
 The prompt is delivered on the session's stdin, never as a positional
 argument — claude's --allowedTools is variadic and eats a trailing
 positional prompt ("Input must be provided either through stdin...").
@@ -171,20 +178,33 @@ def detect_test_cmd() -> str:
     return ""
 
 
-def session_prompt(issue_id: str, test_cmd: str) -> str:
-    lines = [
-        f"Work exactly one bd issue to completion: {issue_id}.",
-        f"1. Run 'bd show {issue_id}' and follow its description and acceptance criteria literally.",
-        f"2. Claim it: bd update {issue_id} --claim",
-        "3. Implement only this issue. Do not start, modify, or close any other bead.",
+def session_prompt(issue_id: str, test_cmd: str, work_log: bool) -> str:
+    steps = [
+        f"Run 'bd show {issue_id}' and follow its description and acceptance criteria literally.",
+        f"Claim it: bd update {issue_id} --claim",
+        "Implement only this issue. Do not start, modify, or close any other bead.",
     ]
     if test_cmd:
-        lines.append(f"4. Run the test suite until it passes: {test_cmd}")
-    lines.append(
-        f"5. Commit the changes with '{issue_id}' in the commit message. Do not push."
+        steps.append(f"Run the test suite until it passes: {test_cmd}")
+    if work_log:
+        # Reuse the work-log skill, don't reproduce its format here: the
+        # worker is a single-objective session (the skill's no-confirmation
+        # case), and the skill's mechanical session-id capture points at
+        # this very session - the one that did the work - which is what
+        # the capture audit pairs entries against.
+        steps.append(
+            "Log the work: invoke the work-log skill (/work-log) to append "
+            "this session's entry to work-log.md. This is a single-objective "
+            "session, so no confirmation gate applies; mark anything you had "
+            "to infer as inferred."
+        )
+    steps.append(
+        f"Commit the changes{' - including work-log.md -' if work_log else ''} "
+        f"with '{issue_id}' in the commit message. Do not push."
     )
-    lines.append(f"6. Close it: bd close {issue_id}")
-    return "\n".join(lines)
+    steps.append(f"Close it: bd close {issue_id}")
+    numbered = "\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1))
+    return f"Work exactly one bd issue to completion: {issue_id}.\n{numbered}"
 
 
 def _squeeze(text: str, limit: int) -> str:
@@ -272,7 +292,16 @@ def main() -> None:
                         help="passed to claude as --allowedTools")
     parser.add_argument("--log-dir", default=".bd-run-beads",
                         help="root for per-run log dirs (default: .bd-run-beads)")
+    parser.add_argument("--work-log", choices=["auto", "on", "off"], default="auto",
+                        help="have each session append a work-log.md entry via the "
+                             "work-log skill (auto: on when the skill is installed)")
     args = parser.parse_args()
+
+    if args.work_log == "auto":
+        work_log = (Path.home() / ".claude/skills/work-log").is_dir() \
+            or Path(".claude/skills/work-log").is_dir()
+    else:
+        work_log = args.work_log == "on"
 
     test_cmd = args.test_cmd if args.test_cmd is not None else detect_test_cmd()
 
@@ -315,6 +344,8 @@ def main() -> None:
         model = plan_model[issue_id]
         started = time.monotonic()
         runlog.log(f"== {issue_id} ({model}) start head={git_head()}")
+        work_log_path = Path("work-log.md")
+        work_log_size = work_log_path.stat().st_size if work_log_path.exists() else 0
 
         stream_path = run_dir / f"{issue_id}.stream.jsonl"
         stderr_path = run_dir / f"{issue_id}.stderr.log"
@@ -324,8 +355,8 @@ def main() -> None:
             cmd += ["--allowedTools", args.allowed_tools]
         cmd += shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
-        rc = run_session(cmd, session_prompt(issue_id, test_cmd), stream_path,
-                         stderr_path, runlog)
+        rc = run_session(cmd, session_prompt(issue_id, test_cmd, work_log),
+                         stream_path, stderr_path, runlog)
         if rc != 0:
             die(f"{issue_id}: claude session exited {rc} "
                 f"(transcript: {stream_path}, stderr: {stderr_path})")
@@ -346,6 +377,13 @@ def main() -> None:
         if issues.show(issue_id, fresh=True).get("status") != "closed":
             die(f"{issue_id}: session ended without closing the bead "
                 f"(transcript: {stream_path})")
+        if work_log:
+            # warn-only: a missing log entry is a capture gap, not a reason
+            # to strand the rest of the dependency tree
+            new_size = work_log_path.stat().st_size if work_log_path.exists() else 0
+            if new_size <= work_log_size:
+                runlog.log(f"   warning: {issue_id}: no work-log entry detected "
+                           f"(work-log.md unchanged)")
         runlog.log(
             f"== {issue_id} done in {time.monotonic() - started:.0f}s head={git_head()}"
         )
