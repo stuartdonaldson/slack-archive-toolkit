@@ -534,6 +534,22 @@ def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str)
             _enrich_for_digest(reply, workspace, channel, channel_id)
 
 
+def _assign_digest_seq(cleaned: list[dict]) -> None:
+    """Assigns a per-channel monotonic `seq` (1..N) to every record - each
+    root plus every nested reply - in true post-time order, so a downstream
+    LLM can flatten a channel's thread nesting back into the chronological
+    order it actually happened in (a reply posted after a later root sorts
+    after that root). Mutates the dicts in place; nesting itself is
+    untouched. Ties broken by the ts string itself since float(ts) can't
+    distinguish Slack ts values that differ only past float precision."""
+    flat = list(cleaned)
+    for msg in cleaned:
+        flat.extend(msg.get("replies", ()))
+    flat.sort(key=lambda m: (float(m["ts"]), m["ts"]))
+    for seq, msg in enumerate(flat, start=1):
+        msg["seq"] = seq
+
+
 _BOT_ID_PREFIX = "B"
 
 
@@ -758,6 +774,7 @@ def build_digest(
         activity_fields = {k: v for k, v in activity.items() if not k.startswith("_")}
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
+        _assign_digest_seq(cleaned)
         messages.extend(cleaned)
         channels_meta.append(
             {
@@ -800,6 +817,14 @@ def build_digest(
                     "first_message_utc/last_message_utc, while its in-range replies are still counted "
                     "as replies. Records without this key are implicitly in scope; the key is never "
                     "emitted as true."
+                ),
+                "seq": (
+                    "per-channel (not global) monotonic integer, 1..N, assigned by sorting that "
+                    "channel's emitted records - every root plus every nested reply - ascending by "
+                    "true post time (float(ts)); sorting a channel's records by seq is equivalent to "
+                    "sorting the flattened set by ts. Lets a reply posted after a later root be placed "
+                    "after that root in the true timeline despite being nested under its own thread. "
+                    "No gaps; a record outside export_scope is simply not present, so not numbered."
                 ),
             },
             "known_limitations": [
