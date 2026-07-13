@@ -77,20 +77,24 @@ chmod +x "$FAKEBIN/bd"
 
 cat > "$FAKEBIN/claude" <<'FAKE'
 #!/usr/bin/env bash
-# fake claude: log "RUN <bead-id> <model>", then close the bead unless NO_CLOSE.
+# fake claude: prompt arrives on STDIN (the runner must never pass it as a
+# positional arg — variadic --allowedTools would eat it). Logs
+# "RUN <bead-id> <model>", emits one stream-json result line, then closes
+# the bead unless NO_CLOSE.
 set -euo pipefail
 model=""
-prompt=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) model="$2"; shift 2 ;;
-        --permission-mode|--allowedTools) shift 2 ;;
-        -p) shift ;;
-        *) prompt="$1"; shift ;;
+        --permission-mode|--allowedTools|--output-format) shift 2 ;;
+        *) shift ;;
     esac
 done
+prompt="$(cat)"
 id="$(grep -oE 'tb-[a-z0-9]+' <<<"$prompt" | head -1)"
+[[ -n "$id" ]] || { echo "fake claude: no bead id on stdin" >&2; exit 1; }
 echo "RUN $id $model" >> "$CLAUDE_LOG"
+echo '{"type":"result","subtype":"success","num_turns":1}'
 if [[ -z "${NO_CLOSE:-}" ]]; then
     echo closed > "$FIXDIR/$id.status"
 fi
@@ -163,12 +167,21 @@ mk_bead "$FIX4" tb-r "root fix"                  open "" ""
 mk_bead "$FIX4" tb-a "[haiku-ok] mechanical bit" open "" "tb-r"
 
 export CLAUDE_LOG="$WORKDIR/claude.log"; : > "$CLAUDE_LOG"
-FIXDIR="$FIX4" "$RUNNER" --test-cmd true tb-a
+FIXDIR="$FIX4" "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs5" tb-a
 assert_eq "exec: sessions run dependency-first with cue models" \
     "RUN tb-r sonnet
 RUN tb-a haiku" "$(cat "$CLAUDE_LOG")"
 assert_eq "exec: beads closed by session" "closed closed" \
     "$(cat "$FIX4/tb-r.status" "$FIX4/tb-a.status" | tr '\n' ' ' | sed 's/ $//')"
+
+run_dirs=("$WORKDIR/logs5"/*)
+assert_eq "logs: exactly one run dir" "1" "${#run_dirs[@]}"
+assert_eq "logs: run.log written" "yes" \
+    "$( [[ -s "${run_dirs[0]}/run.log" ]] && echo yes || echo no )"
+assert_eq "logs: per-bead transcripts written" "yes" \
+    "$( [[ -f "${run_dirs[0]}/tb-r.stream.jsonl" && -f "${run_dirs[0]}/tb-a.stream.jsonl" ]] && echo yes || echo no )"
+assert_contains "logs: run.log records completion" "beads completed" \
+    "$(cat "${run_dirs[0]}/run.log")"
 
 # --- case 6: session that fails to close its bead stops the run ---------------
 
@@ -178,7 +191,7 @@ mk_bead "$FIX5" tb-a "never reached"   open "" "tb-r"
 
 : > "$CLAUDE_LOG"
 set +e
-OUT="$(FIXDIR="$FIX5" NO_CLOSE=1 "$RUNNER" --test-cmd true tb-a 2>&1)"
+OUT="$(FIXDIR="$FIX5" NO_CLOSE=1 "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs6" tb-a 2>&1)"
 rc=$?
 set -e
 assert_eq "gate: unclosed bead -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
@@ -192,7 +205,7 @@ mk_bead "$FIX6" tb-r "root fix" open "" ""
 
 : > "$CLAUDE_LOG"
 set +e
-OUT="$(FIXDIR="$FIX6" "$RUNNER" --test-cmd false tb-r 2>&1)"
+OUT="$(FIXDIR="$FIX6" "$RUNNER" --test-cmd false --log-dir "$WORKDIR/logs7" tb-r 2>&1)"
 rc=$?
 set -e
 assert_eq "gate: failing tests -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"

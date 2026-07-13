@@ -42,3 +42,6 @@ scripts/auth-refresh/channels-T*.txt
 # jobs/example-*.json is the one exception, kept tracked as a template.
 jobs/*.json
 !jobs/example-*.json
+
+# bd-run-beads per-run debug logs (scripts/bd-run-beads.py --log-dir default)
+.bd-run-beads/
