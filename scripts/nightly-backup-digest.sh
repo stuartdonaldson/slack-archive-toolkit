@@ -25,6 +25,17 @@ export PYTHONUNBUFFERED=1
 
 mkdir -p "$ARCHIVE_ROOT"
 mkdir -p "$HOME/slack-exports"
+
+# Prompt/context templates for the LLM newsletter workflow (F3 culture notes,
+# ingestion/newsletter/FNG prompts) are canonical in docs/ and git-tracked
+# there; refresh the ~/slack-exports working copies from them each run so
+# manual edits to the operator's copies don't silently diverge from git.
+cp "$REPO_ROOT/docs/f3-culture.md" \
+   "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
+   "$REPO_ROOT/docs/newsletter-prompt.md" \
+   "$REPO_ROOT/docs/slack-ingestion.md" \
+   "$HOME/slack-exports/"
+
 {
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
     cd "$REPO_ROOT" || exit 1
