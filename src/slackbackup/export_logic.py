@@ -489,12 +489,23 @@ def select_messages_in_range(
         if not _is_parent(msg):
             continue
         parent_ts = float(msg["ts"])
-        if not (from_epoch <= parent_ts <= to_epoch):
+        parent_in_range = from_epoch <= parent_ts <= to_epoch
+        replies = by_thread.get(msg["ts"])
+        reply_in_range = replies is not None and any(
+            from_epoch <= float(r["ts"]) <= to_epoch for r in replies
+        )
+        if not parent_in_range and not reply_in_range:
             continue
         cleaned = _clean(msg, users_map)
-        replies = by_thread.get(msg["ts"])
         if replies:
             cleaned["replies"] = replies
+        if not parent_in_range:
+            # Parent predates the export window but a reply revived the
+            # thread inside it (see docs/DESIGN-export.md Idempotency for
+            # the analogous late-reply case in export_month) - keep the
+            # thread but flag the parent so _channel_activity can exclude
+            # it from root counts while its in-range replies still count.
+            cleaned["in_scope"] = False
         messages.append(cleaned)
     messages.sort(key=lambda m: float(m["ts"]))
     return messages
@@ -549,16 +560,23 @@ def _channel_activity(messages: list[dict], bot_ids: AbstractSet[str] = frozense
     human_participants: set[str] = set()
     timestamps: list[float] = []
     human_total = 0
+    root_count = 0
     for msg in messages:
-        timestamps.append(float(msg["ts"]))
-        uid = msg.get("user")
-        if uid is not None:
-            participants.add(uid)
-            if not _is_bot_author(uid, bot_ids):
-                human_participants.add(uid)
+        # A parent flagged in_scope:false (see select_messages_in_range)
+        # predates the export window - it's only present so its in-range
+        # replies have somewhere to nest, and must not itself count as a
+        # root message, participant, or first/last timestamp.
+        if msg.get("in_scope") is not False:
+            root_count += 1
+            timestamps.append(float(msg["ts"]))
+            uid = msg.get("user")
+            if uid is not None:
+                participants.add(uid)
+                if not _is_bot_author(uid, bot_ids):
+                    human_participants.add(uid)
+                    human_total += 1
+            elif not _is_bot_author(uid, bot_ids):
                 human_total += 1
-        elif not _is_bot_author(uid, bot_ids):
-            human_total += 1
         for reply in msg.get("replies", ()):
             timestamps.append(float(reply["ts"]))
             ruid = reply.get("user")
@@ -570,7 +588,6 @@ def _channel_activity(messages: list[dict], bot_ids: AbstractSet[str] = frozense
             elif not _is_bot_author(ruid, bot_ids):
                 human_total += 1
 
-    root_count = len(messages)
     reply_count = len(timestamps) - root_count
     total = root_count + reply_count
     fields = (
@@ -766,7 +783,7 @@ def build_digest(
     )
 
     return {
-        "schema_version": "slack-llm-digest-v1",
+        "schema_version": "slack-llm-digest-v2",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": {"from": date_from, "to": date_to, "days": days, "workspace_glob": workspace_glob},
         "manifest": {
@@ -776,6 +793,14 @@ def build_digest(
                 "reply_count": "nested replies under root messages",
                 "total_message_count": "root_message_count plus reply_count",
                 "activity_status": "active when total_message_count > 0 in export_scope, else inactive",
+                "in_scope": (
+                    "a thread whose parent predates export_scope but received a reply inside it "
+                    "is still included in full (parent plus all replies); its parent record carries "
+                    "in_scope: false and is excluded from root_message_count, participant_count, and "
+                    "first_message_utc/last_message_utc, while its in-range replies are still counted "
+                    "as replies. Records without this key are implicitly in scope; the key is never "
+                    "emitted as true."
+                ),
             },
             "known_limitations": [
                 "Private or inaccessible channels may be absent",

@@ -119,6 +119,60 @@ def test_select_messages_in_range_nests_threads_without_month_bucketing():
     assert not any(m["ts"] == A1_TS for m in messages)
 
 
+def test_select_messages_in_range_includes_thread_with_parent_before_window_and_reply_inside():
+    users_map = {"U0A": "Al", "U0B": "Caz"}
+    all_messages = [
+        {"ts": "1000.000100", "thread_ts": "1000.000100", "user": "U0A", "text": "old parent"},
+        {"ts": "2000.000100", "thread_ts": "1000.000100", "user": "U0B", "text": "revived reply"},
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 1900.0, 2100.0)
+
+    assert len(messages) == 1
+    parent = messages[0]
+    assert parent["ts"] == "1000.000100"
+    assert parent["in_scope"] is False
+    assert [r["ts"] for r in parent["replies"]] == ["2000.000100"]
+
+    activity = export_logic._channel_activity(messages)
+    assert activity["root_message_count"] == 0
+    assert activity["reply_count"] == 1
+    assert activity["total_message_count"] == 1
+    assert activity["participant_count"] == 1  # only the replying author, U0B
+    assert activity["first_message_utc"] == activity["last_message_utc"]
+
+
+def test_select_messages_in_range_no_in_scope_key_when_parent_and_replies_inside_window():
+    users_map = {"U0A": "Al", "U0B": "Caz"}
+    all_messages = [
+        {"ts": "1000.000100", "thread_ts": "1000.000100", "user": "U0A", "text": "parent"},
+        {"ts": "1100.000100", "thread_ts": "1000.000100", "user": "U0B", "text": "reply"},
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert len(messages) == 1
+    assert "in_scope" not in messages[0]
+    assert "in_scope" not in messages[0]["replies"][0]
+
+    activity = export_logic._channel_activity(messages)
+    assert activity["root_message_count"] == 1
+    assert activity["reply_count"] == 1
+    assert activity["participant_count"] == 2
+
+
+def test_select_messages_in_range_excludes_thread_when_parent_and_replies_all_before_window():
+    users_map = {"U0A": "Al", "U0B": "Caz"}
+    all_messages = [
+        {"ts": "1000.000100", "thread_ts": "1000.000100", "user": "U0A", "text": "parent"},
+        {"ts": "1100.000100", "thread_ts": "1000.000100", "user": "U0B", "text": "reply"},
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 5000.0, 6000.0)
+
+    assert messages == []
+
+
 def _fake_convert(channel_dir: Path, out_dir: Path) -> None:
     """Stands in for slackdump.convert_export: copies the pre-converted
     fixture day-files/users.json for whichever channel `channel_dir`'s name
@@ -148,7 +202,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v1"
+    assert result["schema_version"] == "slack-llm-digest-v2"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
