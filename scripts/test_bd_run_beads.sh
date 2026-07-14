@@ -92,9 +92,12 @@ cat > "$FAKEBIN/claude" <<'FAKE'
 #!/usr/bin/env bash
 # fake claude: prompt arrives on STDIN (the runner must never pass it as a
 # positional arg — variadic --allowedTools would eat it). Logs
-# "RUN <bead-id> <model>", emits one stream-json result line, then simulates
-# work by dropping a marker file work-<id>.txt in cwd, unless NO_CHANGES=1.
-# It never touches bd or git — the runner owns commit/close now.
+# "RUN <bead-id> <model>", optionally emits a denied-tool-call sequence
+# (DENY_ONCE=1) and/or a BLOCKED final result (BLOCKED=1), then a
+# stream-json result line (with a fixed session_id, for --resume
+# assertions), then simulates work by dropping a marker file
+# work-<id>.txt in cwd, unless NO_CHANGES=1. It never touches bd or git —
+# the runner owns commit/close now.
 set -euo pipefail
 model=""
 allowed_tools=""
@@ -112,7 +115,30 @@ prompt="$(cat)"
 id="$(grep -oE 'tb-[a-z0-9]+' <<<"$prompt" | head -1)"
 [[ -n "$id" ]] || { echo "fake claude: no bead id on stdin" >&2; exit 1; }
 echo "RUN $id $model" >> "$CLAUDE_LOG"
-echo '{"type":"result","subtype":"success","num_turns":1}'
+
+if [[ -n "${DENY_ONCE:-}" ]]; then
+    python3 - <<'PY'
+import json
+print(json.dumps({"type": "assistant", "message": {"content": [
+    {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+     "input": {"command": "git commit -m wip"}}
+]}}))
+print(json.dumps({"type": "user", "message": {"content": [
+    {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": True,
+     "content": "This command requires approval"}
+]}}))
+PY
+fi
+
+BLOCKED="${BLOCKED:-}" python3 - <<'PY'
+import json, os
+text = "ok"
+if os.environ.get("BLOCKED"):
+    text = "nothing more to do\nBLOCKED: needs a human decision"
+print(json.dumps({"type": "result", "subtype": "success", "num_turns": 1,
+                   "result": text, "session_id": "fake-sess-1"}))
+PY
+
 if [[ -z "${NO_CHANGES:-}" ]]; then
     : > "work-$id.txt"
 fi
@@ -392,6 +418,55 @@ mk_bead "$FIX12" tb-r "root fix" open "" ""
 
 OUT="$(cd "$PROJ2" && FIXDIR="$FIX12" "$RUNNER" --dry-run tb-r 2>&1)"
 assert_contains "npm detect: npm test picked as gate" "test gate: npm test" "$OUT"
+
+# --- case 15: permission denial is logged live even in an otherwise-successful
+# session (a denied command doesn't have to be fatal by itself) -------------
+
+REPO13="$WORKDIR/repo13"; mk_repo "$REPO13"
+FIX13="$WORKDIR/fix13"; mkdir -p "$FIX13"
+mk_bead "$FIX13" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$REPO13" && FIXDIR="$FIX13" DENY_ONCE=1 "$RUNNER" --test-cmd true --log-dir .bd-run-beads tb-r 2>&1)"
+run13=("$REPO13/.bd-run-beads"/*)
+assert_contains "denial: logged live in run.log with the command brief" \
+    "permission denied: git commit -m wip" "$(cat "${run13[0]}/run.log")"
+assert_eq "denial: session otherwise succeeds and bead closes" "closed" \
+    "$(cat "$FIX13/tb-r.status")"
+
+# --- case 16: BLOCKED final message fails the bead before any commit ---------
+
+REPO14="$WORKDIR/repo14"; mk_repo "$REPO14"
+FIX14="$WORKDIR/fix14"; mkdir -p "$FIX14"
+mk_bead "$FIX14" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+set +e
+OUT="$(cd "$REPO14" && FIXDIR="$FIX14" BLOCKED=1 "$RUNNER" --test-cmd true --log-dir .bd-run-beads tb-r 2>&1)"
+rc=$?
+set -e
+assert_eq "BLOCKED: non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
+assert_contains "BLOCKED: reason echoed verbatim" "needs a human decision" "$OUT"
+assert_eq "BLOCKED: no commit created" "1" "$(git -C "$REPO14" log --oneline | wc -l | tr -d ' ')"
+assert_eq "BLOCKED: bead left open" "open" "$(cat "$FIX14/tb-r.status")"
+assert_contains "BLOCKED: recovery block has resume hint" "claude --resume fake-sess-1" "$OUT"
+assert_contains "BLOCKED: recovery block has rerun hint" "resumes at tb-r" "$OUT"
+
+# --- case 17: every bead-failure path prints the recovery block -------------
+# (no-op guard and test-gate failure both already exercised above; check the
+# recovery block's shape on the test-gate-failure case from case 7's repo.)
+
+: > "$CLAUDE_LOG"
+set +e
+OUT="$(cd "$REPO7" && FIXDIR="$FIX6" "$RUNNER" --test-cmd false --log-dir .bd-run-beads --allow-dirty tb-r 2>&1)"
+rc=$?
+set -e
+assert_contains "recovery: names the bead and its status" "bead tb-r: status=open" "$OUT"
+assert_contains "recovery: reports change count" "changed files (staged+unstaged):" "$OUT"
+assert_contains "recovery: reports no denials when none occurred" "permission denials: none" "$OUT"
+assert_contains "recovery: resume hint present" "claude --resume fake-sess-1" "$OUT"
+assert_contains "recovery: rerun-resumes hint present" \
+    "rerunning this bd-run-beads command skips closed beads" "$OUT"
 
 # ------------------------------------------------------------------------------
 

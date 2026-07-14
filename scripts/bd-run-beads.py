@@ -247,6 +247,12 @@ def session_prompt(issue_id: str, test_cmd: str, work_log: bool) -> str:
         f"Run 'bd show {issue_id}' and follow its description and acceptance criteria literally.",
         f"Claim it: bd update {issue_id} --claim",
         "Implement only this issue. Do not start, modify, or close any other bead.",
+        "If a command is denied for permissions (a tool error mentions "
+        "\"requires approval\") or you are blocked for any other reason, do "
+        "not retry it and do not wait: record a handoff by running "
+        f'bd update {issue_id} --notes="HANDOFF: <what is done> / <what '
+        'remains> / <what a human must decide>", then end your final '
+        'message with a line starting exactly "BLOCKED: <one-line reason>".',
     ]
     if test_cmd:
         steps.append(f"Run the test suite until it passes: {test_cmd}")
@@ -288,13 +294,46 @@ def _tool_brief(tool_input: dict) -> str:
     return ""
 
 
-def summarize_event(line: str) -> str | None:
-    """One compact console line per interesting stream-json event; None for
-    noise (and for non-JSON lines, which still land in the raw transcript)."""
+def parse_event(line: str) -> dict | None:
     try:
-        event = json.loads(line)
+        return json.loads(line)
     except ValueError:
         return None
+
+
+def _tool_result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+_DENIAL_MARKERS = ("requires approval", "command_substitution", "expansion")
+
+
+def _is_permission_denial(text: str) -> bool:
+    return any(marker in text for marker in _DENIAL_MARKERS)
+
+
+def _blocked_reason(text: str) -> str | None:
+    """-> the reason on a line starting exactly 'BLOCKED:' in the session's
+    final result text, or None. Session prompt mandates this line as the
+    unattended handoff signal (see session_prompt)."""
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("BLOCKED:"):
+            return stripped[len("BLOCKED:"):].strip()
+    return None
+
+
+def summarize_event(event: dict) -> str | None:
+    """One compact console line per interesting stream-json event; None for
+    noise (and for non-JSON lines, which still land in the raw transcript)."""
     etype = event.get("type")
     if etype == "assistant":
         parts = []
@@ -316,7 +355,15 @@ def summarize_event(line: str) -> str | None:
 
 def run_session(
     cmd: list[str], prompt: str, stream_path: Path, stderr_path: Path, runlog: RunLog
-) -> int:
+) -> tuple[int, str | None, str, list[str]]:
+    """Runs one claude session, streaming stream-json to stream_path.
+    Returns (exit_code, session_id, final_result_text, permission_denials):
+    denials are logged live as they're seen, and all four values feed the
+    BLOCKED gate and the failure recovery block in main()."""
+    tool_briefs: dict[str, str] = {}
+    denials: list[str] = []
+    session_id: str | None = None
+    result_text = ""
     with open(stream_path, "w") as stream, open(stderr_path, "w") as errf:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf, text=True
@@ -327,10 +374,32 @@ def run_session(
         for line in proc.stdout:
             stream.write(line)
             stream.flush()
-            progress = summarize_event(line)
+            event = parse_event(line)
+            if event is None:
+                continue
+            progress = summarize_event(event)
             if progress:
                 runlog.log(f"   {progress}")
-        return proc.wait()
+            if session_id is None and event.get("session_id"):
+                session_id = event["session_id"]
+            etype = event.get("type")
+            if etype == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if block.get("type") == "tool_use" and block.get("id"):
+                        tool_briefs[block["id"]] = _tool_brief(block.get("input") or {})
+            elif etype == "user":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if block.get("type") != "tool_result" or not block.get("is_error"):
+                        continue
+                    text = _tool_result_text(block.get("content"))
+                    if _is_permission_denial(text):
+                        brief = tool_briefs.get(block.get("tool_use_id"), "")
+                        denials.append(brief)
+                        runlog.log(f"permission denied: {brief}")
+            elif etype == "result":
+                result_text = event.get("result") or ""
+        rc = proc.wait()
+    return rc, session_id, result_text, denials
 
 
 def git_head() -> str:
@@ -378,6 +447,35 @@ def git_commit(message: str) -> None:
     proc = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
     if proc.returncode != 0:
         die(f"git commit failed: {proc.stderr.strip()}")
+
+
+def print_recovery_block(
+    runlog: RunLog,
+    issues: IssueCache,
+    issue_id: str,
+    log_exclude: list[str],
+    denials: list[str],
+    session_id: str | None,
+) -> None:
+    """Printed on every bead-failure path (session rc, test gate, BLOCKED,
+    no-op, close verification): status, so a human resuming knows what
+    already happened; denials, so they know what to approve; --resume, so
+    they can take the same session over interactively."""
+    status = issues.show(issue_id, fresh=True).get("status", "unknown")
+    changes = [l for l in git_status_porcelain(log_exclude).splitlines() if l.strip()]
+    runlog.log("RECOVERY:")
+    runlog.log(f"  bead {issue_id}: status={status}")
+    runlog.log(f"  changed files (staged+unstaged): {len(changes)}")
+    if denials:
+        for brief in denials:
+            runlog.log(f"  permission denied: {brief}")
+    else:
+        runlog.log("  permission denials: none")
+    runlog.log(f"  resume: claude --resume {session_id or '<unknown>'}")
+    runlog.log(
+        "  rerun: rerunning this bd-run-beads command skips closed beads "
+        f"and resumes at {issue_id}"
+    )
 
 
 def bd_close(issue_id: str) -> None:
@@ -492,9 +590,23 @@ def main() -> None:
             cmd += ["--allowedTools", allowed_tools]
         cmd += shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
-        rc = run_session(cmd, session_prompt(issue_id, test_cmd, work_log),
-                         stream_path, stderr_path, runlog)
+        rc, session_id, result_text, denials = run_session(
+            cmd, session_prompt(issue_id, test_cmd, work_log),
+            stream_path, stderr_path, runlog,
+        )
+
+        def recover() -> None:
+            print_recovery_block(runlog, issues, issue_id, log_exclude, denials, session_id)
+
+        # BLOCKED beats every other outcome, including a clean exit: the
+        # session is handing off deliberately, so fail before touching git.
+        blocked_reason = _blocked_reason(result_text)
+        if blocked_reason is not None:
+            recover()
+            die(f"{issue_id}: BLOCKED: {blocked_reason} (transcript: {stream_path})")
+
         if rc != 0:
+            recover()
             die(f"{issue_id}: claude session exited {rc} "
                 f"(transcript: {stream_path}, stderr: {stderr_path})")
 
@@ -509,6 +621,7 @@ def main() -> None:
             if gate_rc != 0:
                 for tail_line in tests_path.read_text().splitlines()[-15:]:
                     runlog.log(f"   {tail_line}", console=False)
+                recover()
                 die(f"{issue_id}: test gate failed after session "
                     f"({test_cmd}); output: {tests_path}")
         if work_log:
@@ -526,6 +639,7 @@ def main() -> None:
         if bead_closed and not tree_changed:
             runlog.log(f"== {issue_id}: already closed, tree unchanged; nothing to commit")
         elif not bead_closed and not tree_changed:
+            recover()
             die(f"{issue_id}: session produced no changes and did not close "
                 f"the bead (transcript: {stream_path})")
         else:
@@ -534,6 +648,7 @@ def main() -> None:
             git_commit(f"{title} ({issue_id})")
             bd_close(issue_id)
             if issues.show(issue_id, fresh=True).get("status") != "closed":
+                recover()
                 die(f"{issue_id}: bd close did not result in closed status")
 
         runlog.log(
