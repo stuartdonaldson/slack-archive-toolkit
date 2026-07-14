@@ -97,13 +97,16 @@ cat > "$FAKEBIN/claude" <<'FAKE'
 # It never touches bd or git — the runner owns commit/close now.
 set -euo pipefail
 model=""
+allowed_tools=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) model="$2"; shift 2 ;;
-        --permission-mode|--allowedTools|--output-format) shift 2 ;;
+        --allowedTools) allowed_tools="$2"; shift 2 ;;
+        --permission-mode|--output-format) shift 2 ;;
         *) shift ;;
     esac
 done
+[[ -n "${ARGS_DUMP:-}" ]] && printf '%s' "$allowed_tools" > "$ARGS_DUMP"
 prompt="$(cat)"
 [[ -n "${PROMPT_DUMP:-}" ]] && printf '%s' "$prompt" > "$PROMPT_DUMP"
 id="$(grep -oE 'tb-[a-z0-9]+' <<<"$prompt" | head -1)"
@@ -345,6 +348,50 @@ mk_bead "$FIX7" tb-r "root fix" open "" ""
 OUT="$(cd "$PROJ" && FIXDIR="$FIX7" "$RUNNER" --dry-run tb-r 2>&1)"
 gate_line="$(grep 'test gate:' <<<"$OUT")"
 assert_eq "detect: broken .venv shim rejected" "" "$(grep -o '.venv/bin/pytest' <<<"$gate_line" || true)"
+
+# --- case 12: default --allowedTools covers the mandated commands -------------
+
+REPO11="$WORKDIR/repo11"; mk_repo "$REPO11"
+FIX10="$WORKDIR/fix10"; mkdir -p "$FIX10"
+mk_bead "$FIX10" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$REPO11" && FIXDIR="$FIX10" ARGS_DUMP="$WORKDIR/args12.txt" \
+    "$RUNNER" --test-cmd true --log-dir .bd-run-beads --work-log off tb-r 2>&1)"
+DUMP="$(cat "$WORKDIR/args12.txt")"
+assert_contains "default allowlist: bd" "Bash(bd:*)" "$DUMP"
+assert_contains "default allowlist: git add" "Bash(git add:*)" "$DUMP"
+assert_contains "default allowlist: git status" "Bash(git status:*)" "$DUMP"
+assert_contains "default allowlist: git diff" "Bash(git diff:*)" "$DUMP"
+assert_contains "default allowlist: git log" "Bash(git log:*)" "$DUMP"
+assert_contains "default allowlist: git rev-parse" "Bash(git rev-parse:*)" "$DUMP"
+assert_contains "default allowlist: test-cmd entry" "Bash(true:*)" "$DUMP"
+
+# --- case 13: explicit --allowed-tools is passed through verbatim -------------
+
+REPO12="$WORKDIR/repo12"; mk_repo "$REPO12"
+FIX11="$WORKDIR/fix11"; mkdir -p "$FIX11"
+mk_bead "$FIX11" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$REPO12" && FIXDIR="$FIX11" ARGS_DUMP="$WORKDIR/args13.txt" \
+    "$RUNNER" --test-cmd true --log-dir .bd-run-beads --work-log off \
+    --allowed-tools "Bash(echo:*)" tb-r 2>&1)"
+assert_eq "explicit allowlist: passed through verbatim" "Bash(echo:*)" \
+    "$(cat "$WORKDIR/args13.txt")"
+
+# --- case 14: npm test auto-detected without executing it ---------------------
+
+PROJ2="$WORKDIR/proj2"; mkdir -p "$PROJ2"
+cat > "$PROJ2/package.json" <<'JSON'
+{"scripts":{"test":"true"}}
+JSON
+
+FIX12="$WORKDIR/fix12"; mkdir -p "$FIX12"
+mk_bead "$FIX12" tb-r "root fix" open "" ""
+
+OUT="$(cd "$PROJ2" && FIXDIR="$FIX12" "$RUNNER" --dry-run tb-r 2>&1)"
+assert_contains "npm detect: npm test picked as gate" "test gate: npm test" "$OUT"
 
 # ------------------------------------------------------------------------------
 

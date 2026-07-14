@@ -59,6 +59,18 @@ The prompt is delivered on the session's stdin, never as a positional
 argument — claude's --allowedTools is variadic and eats a trailing
 positional prompt ("Input must be provided either through stdin...").
 
+Allowed tools: when --allowed-tools is not given, the runner computes an
+allowlist covering exactly what the session prompt mandates -
+Bash(bd:*), Bash(git add:*), Bash(git status:*), Bash(git diff:*),
+Bash(git log:*), Bash(git rev-parse:*) - plus Bash(<test_cmd>:*) when a
+test gate is active. Passing --allowed-tools explicitly (including "" for
+none) overrides this and is used verbatim.
+
+Test-command detection tries, in order: npm test (when package.json
+declares scripts.test and npm is on PATH - existence plus PATH lookup is
+the probe, `npm test` itself is never executed during detection), then
+the pytest candidates as before.
+
 Env: BD_BIN / CLAUDE_BIN override the binaries (used by the test suite);
 CLAUDE_EXTRA_ARGS is shlex-split into extra claude flags.
 """
@@ -69,6 +81,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -180,23 +193,53 @@ def probe_test_cmd(cmd: str) -> bool:
     return rc in (0, 5)
 
 
+def probe_npm(cmd: str) -> bool:
+    """package.json declaring scripts.test plus npm on PATH is the probe;
+    `npm test` itself is never executed here (that would run the suite)."""
+    if not os.path.exists("package.json"):
+        return False
+    try:
+        with open("package.json") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not (isinstance(data.get("scripts"), dict) and "test" in data["scripts"]):
+        return False
+    return shutil.which("npm") is not None
+
+
 def detect_test_cmd() -> str:
-    candidates = []
+    candidates = [("npm test", probe_npm)]
     if os.access(".venv/bin/pytest", os.X_OK):
-        candidates.append(".venv/bin/pytest -q")
+        candidates.append((".venv/bin/pytest -q", probe_test_cmd))
     if os.path.exists("pyproject.toml"):
         if os.path.isdir("src"):
-            candidates.append("PYTHONPATH=src python3 -m pytest -q")
-        candidates.append("python3 -m pytest -q")
-    candidates.append("pytest -q")
-    for cand in candidates:
-        if probe_test_cmd(cand):
+            candidates.append(("PYTHONPATH=src python3 -m pytest -q", probe_test_cmd))
+        candidates.append(("python3 -m pytest -q", probe_test_cmd))
+    candidates.append(("pytest -q", probe_test_cmd))
+    for cand, probe in candidates:
+        if probe(cand):
             return cand
     print(
         "bd-run-beads: no working test command detected; test gate disabled",
         file=sys.stderr,
     )
     return ""
+
+
+def default_allowed_tools(test_cmd: str) -> str:
+    """Allowlist covering exactly what the session prompt mandates."""
+    tools = [
+        "Bash(bd:*)",
+        "Bash(git add:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git log:*)",
+        "Bash(git rev-parse:*)",
+    ]
+    if test_cmd:
+        tools.append(f"Bash({test_cmd}:*)")
+    return ",".join(tools)
 
 
 def session_prompt(issue_id: str, test_cmd: str, work_log: bool) -> str:
@@ -360,8 +403,11 @@ def main() -> None:
                         help='post-session test gate; "" disables. Default: auto-detect')
     parser.add_argument("--permission-mode", default="acceptEdits",
                         help="passed to claude (default: acceptEdits)")
-    parser.add_argument("--allowed-tools", default="",
-                        help="passed to claude as --allowedTools")
+    parser.add_argument("--allowed-tools", default=None,
+                        help="passed to claude as --allowedTools verbatim "
+                             '("" for none). Default: an allowlist covering '
+                             "the mandated commands (bd, git add/status/diff/"
+                             "log/rev-parse, and the test command)")
     parser.add_argument("--log-dir", default=".bd-run-beads",
                         help="root for per-run log dirs (default: .bd-run-beads)")
     parser.add_argument("--work-log", choices=["auto", "on", "off"], default="auto",
@@ -380,6 +426,10 @@ def main() -> None:
         work_log = args.work_log == "on"
 
     test_cmd = args.test_cmd if args.test_cmd is not None else detect_test_cmd()
+    allowed_tools = (
+        args.allowed_tools if args.allowed_tools is not None
+        else default_allowed_tools(test_cmd)
+    )
 
     issues = IssueCache()
     order, closed_skipped = resolve(args.targets, issues)
@@ -438,8 +488,8 @@ def main() -> None:
         stderr_path = run_dir / f"{issue_id}.stderr.log"
         cmd = [CLAUDE, "-p", "--verbose", "--output-format", "stream-json",
                "--model", model, "--permission-mode", args.permission_mode]
-        if args.allowed_tools:
-            cmd += ["--allowedTools", args.allowed_tools]
+        if allowed_tools:
+            cmd += ["--allowedTools", allowed_tools]
         cmd += shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
         rc = run_session(cmd, session_prompt(issue_id, test_cmd, work_log),
