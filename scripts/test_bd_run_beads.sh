@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Tests for scripts/bd-run-beads.py (bd SlackBackup-j7b).
+# Tests for scripts/bd-run-beads.py (bd SlackBackup-j7b, -daq).
 # Fixture-driven: no live bd database, no real claude sessions. A fake `bd`
-# serves issue JSON from per-test fixture dirs; a fake `claude` logs its
-# invocations and flips the bead's status file to closed (or doesn't, for
-# the gate-failure case). Bead ids use a tb- prefix so prompt parsing in
-# the fake is unambiguous.
+# serves issue JSON from per-test fixture dirs and records `close` calls; a
+# fake `claude` logs its invocations and simulates work by dropping a marker
+# file in cwd (unless NO_CHANGES=1). The runner itself now owns git
+# commit/bd close, so execution cases run inside a real temp git repo.
+# Bead ids use a tb- prefix so prompt parsing in the fake is unambiguous.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,10 +47,12 @@ mkdir -p "$FAKEBIN"
 
 cat > "$FAKEBIN/bd" <<'FAKE'
 #!/usr/bin/env bash
-# fake bd: only `bd show <id> --json`, served from $FIXDIR/<id>.{title,status,labels,deps}
+# fake bd: `show <id> --json` served from $FIXDIR/<id>.{title,status,labels,deps};
+# `close <id>` writes closed to the status fixture; `update` is tolerated (no-op).
 set -euo pipefail
-[[ "$1" == "show" ]] || { echo "fake bd: unsupported: $*" >&2; exit 1; }
-python3 - "$2" <<'PY'
+case "$1" in
+    show)
+        python3 - "$2" <<'PY'
 import json, os, sys
 fix = os.environ["FIXDIR"]
 iid = sys.argv[1]
@@ -72,6 +75,16 @@ print(json.dumps([{
     "dependencies": deps,
 }]))
 PY
+        ;;
+    close)
+        echo closed > "$FIXDIR/$2.status"
+        ;;
+    update)
+        : # tolerated no-op (e.g. --claim)
+        ;;
+    *)
+        echo "fake bd: unsupported: $*" >&2; exit 1 ;;
+esac
 FAKE
 chmod +x "$FAKEBIN/bd"
 
@@ -79,8 +92,9 @@ cat > "$FAKEBIN/claude" <<'FAKE'
 #!/usr/bin/env bash
 # fake claude: prompt arrives on STDIN (the runner must never pass it as a
 # positional arg — variadic --allowedTools would eat it). Logs
-# "RUN <bead-id> <model>", emits one stream-json result line, then closes
-# the bead unless NO_CLOSE.
+# "RUN <bead-id> <model>", emits one stream-json result line, then simulates
+# work by dropping a marker file work-<id>.txt in cwd, unless NO_CHANGES=1.
+# It never touches bd or git — the runner owns commit/close now.
 set -euo pipefail
 model=""
 while [[ $# -gt 0 ]]; do
@@ -96,8 +110,8 @@ id="$(grep -oE 'tb-[a-z0-9]+' <<<"$prompt" | head -1)"
 [[ -n "$id" ]] || { echo "fake claude: no bead id on stdin" >&2; exit 1; }
 echo "RUN $id $model" >> "$CLAUDE_LOG"
 echo '{"type":"result","subtype":"success","num_turns":1}'
-if [[ -z "${NO_CLOSE:-}" ]]; then
-    echo closed > "$FIXDIR/$id.status"
+if [[ -z "${NO_CHANGES:-}" ]]; then
+    : > "work-$id.txt"
 fi
 FAKE
 chmod +x "$FAKEBIN/claude"
@@ -112,6 +126,19 @@ mk_bead() {
     echo "$status" > "$dir/$id.status"
     echo "$labels" > "$dir/$id.labels"
     echo "$*"      > "$dir/$id.deps"
+}
+
+# repo helper: mk_repo <dir> — a git repo with one commit, ready for the
+# runner's dirty-tree guard and its own commits.
+mk_repo() {
+    local dir="$1"
+    mkdir -p "$dir"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email test@example.com
+    git -C "$dir" config user.name "Test"
+    echo "seed" > "$dir/README"
+    git -C "$dir" add README
+    git -C "$dir" commit -q -m "initial"
 }
 
 line_no() { grep -n -- "$1" <<<"$2" | head -1 | cut -d: -f1; }
@@ -161,21 +188,26 @@ set -e
 assert_eq "cycle: non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
 assert_contains "cycle: message names the cycle" "cycle" "$OUT"
 
-# --- case 5: execution order, models, and closing gate ------------------------
+# --- case 5: execution order, models, and runner-side commit/close -----------
 
+REPO5="$WORKDIR/repo5"; mk_repo "$REPO5"
 FIX4="$WORKDIR/fix4"; mkdir -p "$FIX4"
 mk_bead "$FIX4" tb-r "root fix"                  open "" ""
 mk_bead "$FIX4" tb-a "[haiku-ok] mechanical bit" open "" "tb-r"
 
 export CLAUDE_LOG="$WORKDIR/claude.log"; : > "$CLAUDE_LOG"
-FIXDIR="$FIX4" "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs5" --work-log off tb-a
+(cd "$REPO5" && FIXDIR="$FIX4" "$RUNNER" --test-cmd true --log-dir .bd-run-beads --work-log off tb-a)
 assert_eq "exec: sessions run dependency-first with cue models" \
     "RUN tb-r sonnet
 RUN tb-a haiku" "$(cat "$CLAUDE_LOG")"
-assert_eq "exec: beads closed by session" "closed closed" \
+assert_eq "exec: beads closed via runner-invoked bd close" "closed closed" \
     "$(cat "$FIX4/tb-r.status" "$FIX4/tb-a.status" | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "exec: a commit exists per bead, each naming the bead id" "2" \
+    "$(git -C "$REPO5" log --oneline | grep -cE '\(tb-(r|a)\)')"
+assert_eq "exec: working tree clean after run (log dir excluded)" "" \
+    "$(git -C "$REPO5" status --porcelain -- . ':(exclude).bd-run-beads')"
 
-run_dirs=("$WORKDIR/logs5"/*)
+run_dirs=("$REPO5/.bd-run-beads"/*)
 assert_eq "logs: exactly one run dir" "1" "${#run_dirs[@]}"
 assert_eq "logs: run.log written" "yes" \
     "$( [[ -s "${run_dirs[0]}/run.log" ]] && echo yes || echo no )"
@@ -184,71 +216,123 @@ assert_eq "logs: per-bead transcripts written" "yes" \
 assert_contains "logs: run.log records completion" "beads completed" \
     "$(cat "${run_dirs[0]}/run.log")"
 
-# --- case 6: session that fails to close its bead stops the run ---------------
+# --- case 6: no-op guard — a session that changes nothing and doesn't close
+# its bead fails the run, naming the bead; a dependent bead is never reached.
 
+REPO6="$WORKDIR/repo6"; mk_repo "$REPO6"
 FIX5="$WORKDIR/fix5"; mkdir -p "$FIX5"
-mk_bead "$FIX5" tb-r "root fix"        open "" ""
-mk_bead "$FIX5" tb-a "never reached"   open "" "tb-r"
+mk_bead "$FIX5" tb-r "root fix"      open "" ""
+mk_bead "$FIX5" tb-a "never reached" open "" "tb-r"
 
 : > "$CLAUDE_LOG"
 set +e
-OUT="$(FIXDIR="$FIX5" NO_CLOSE=1 "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs6" tb-a 2>&1)"
+OUT="$(cd "$REPO6" && FIXDIR="$FIX5" NO_CHANGES=1 "$RUNNER" --test-cmd true --log-dir .bd-run-beads tb-a 2>&1)"
 rc=$?
 set -e
-assert_eq "gate: unclosed bead -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
-assert_contains "gate: names the offending bead" "tb-r" "$OUT"
-assert_eq "gate: run stopped before second bead" "RUN tb-r sonnet" "$(cat "$CLAUDE_LOG")"
+assert_eq "no-op guard: unchanged & unclosed bead -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
+assert_contains "no-op guard: names the offending bead" "tb-r" "$OUT"
+assert_eq "no-op guard: run stopped before second bead" "RUN tb-r sonnet" "$(cat "$CLAUDE_LOG")"
+assert_eq "no-op guard: no commit created" "1" "$(git -C "$REPO6" log --oneline | wc -l | tr -d ' ')"
+assert_eq "no-op guard: bead left open" "open" "$(cat "$FIX5/tb-r.status")"
 
 # --- case 7: failing test command stops the run -------------------------------
 
+REPO7="$WORKDIR/repo7"; mk_repo "$REPO7"
 FIX6="$WORKDIR/fix6"; mkdir -p "$FIX6"
 mk_bead "$FIX6" tb-r "root fix" open "" ""
 
 : > "$CLAUDE_LOG"
 set +e
-OUT="$(FIXDIR="$FIX6" "$RUNNER" --test-cmd false --log-dir "$WORKDIR/logs7" tb-r 2>&1)"
+OUT="$(cd "$REPO7" && FIXDIR="$FIX6" "$RUNNER" --test-cmd false --log-dir .bd-run-beads tb-r 2>&1)"
 rc=$?
 set -e
 assert_eq "gate: failing tests -> non-zero exit" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
 assert_contains "gate: reports test failure" "test" "$OUT"
+assert_eq "gate: no commit created on test failure" "1" "$(git -C "$REPO7" log --oneline | wc -l | tr -d ' ')"
+
+# --- case 8: dirty-tree guard --------------------------------------------------
+# A pre-existing change outside --log-dir blocks the run unless --allow-dirty
+# is passed; log-dir contents never count as dirty.
+
+REPO8="$WORKDIR/repo8"; mk_repo "$REPO8"
+echo "stray change" >> "$REPO8/README"
+FIX9="$WORKDIR/fix9"; mkdir -p "$FIX9"
+mk_bead "$FIX9" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+set +e
+OUT="$(cd "$REPO8" && FIXDIR="$FIX9" "$RUNNER" --test-cmd true --log-dir .bd-run-beads tb-r 2>&1)"
+rc=$?
+set -e
+assert_eq "dirty guard: refuses to start" "yes" "$( (( rc != 0 )) && echo yes || echo no )"
+assert_contains "dirty guard: mentions --allow-dirty" "--allow-dirty" "$OUT"
+assert_eq "dirty guard: no session run" "" "$(cat "$CLAUDE_LOG")"
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$REPO8" && FIXDIR="$FIX9" "$RUNNER" --test-cmd true --log-dir .bd-run-beads --allow-dirty tb-r 2>&1)"
+assert_contains "dirty guard: --allow-dirty proceeds" "RUN tb-r sonnet" "$(cat "$CLAUDE_LOG")"
+assert_contains "dirty guard: warns pre-existing changes will be swept" "swept" "$OUT"
+assert_contains "dirty guard: stray change swept into the bead's commit" "README" \
+    "$(git -C "$REPO8" show --stat HEAD)"
+
+REPO8B="$WORKDIR/repo8b"; mk_repo "$REPO8B"
+mkdir -p "$REPO8B/.bd-run-beads/oldrun"
+echo "stale log" > "$REPO8B/.bd-run-beads/oldrun/run.log"
+FIX9B="$WORKDIR/fix9b"; mkdir -p "$FIX9B"
+mk_bead "$FIX9B" tb-r "root fix" open "" ""
+
+: > "$CLAUDE_LOG"
+OUT="$(cd "$REPO8B" && FIXDIR="$FIX9B" "$RUNNER" --test-cmd true --log-dir .bd-run-beads tb-r 2>&1)"
+assert_contains "dirty guard: pre-existing log-dir content is excluded" \
+    "RUN tb-r sonnet" "$(cat "$CLAUDE_LOG")"
 
 # --- case 9/10: work-log step reuses the skill; on/off; warn-only gate --------
 # With --work-log on, the session prompt gains an "invoke the work-log skill"
-# step placed BEFORE the commit step (so the entry lands in the bead's own
-# commit), and a session that doesn't grow work-log.md draws a run.log
-# warning but never fails the run. With off, neither appears.
+# step placed BEFORE the "do not commit" instruction. The prompt never asks
+# the session to commit, push, or close — that's the runner's job now. A
+# session that doesn't grow work-log.md draws a run.log warning but never
+# fails the run.
 
+REPO9="$WORKDIR/repo9"; mk_repo "$REPO9"
 FIX8="$WORKDIR/fix8"; mkdir -p "$FIX8"
 mk_bead "$FIX8" tb-r "root fix" open "" ""
 
 : > "$CLAUDE_LOG"
-OUT="$(cd "$WORKDIR" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt9.txt" \
-    "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs9" --work-log on tb-r 2>&1)"
+OUT="$(cd "$REPO9" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt9.txt" \
+    "$RUNNER" --test-cmd true --log-dir .bd-run-beads --work-log on tb-r 2>&1)"
 PROMPT="$(cat "$WORKDIR/prompt9.txt")"
+assert_contains "prompt: states the session is unattended" "unattended" "$PROMPT"
+assert_contains "prompt: forbids commit/push/close" "Do not commit" "$PROMPT"
+assert_eq "prompt: no commit instruction remains" "" \
+    "$(grep -o 'Commit the changes' "$WORKDIR/prompt9.txt" || true)"
+assert_eq "prompt: no close instruction remains" "" \
+    "$(grep -o 'Close it: bd close' "$WORKDIR/prompt9.txt" || true)"
 assert_contains "work-log on: prompt invokes the skill" "work-log skill (/work-log)" "$PROMPT"
 wl_line="$(line_no "work-log skill" "$PROMPT")"
-commit_line="$(line_no "Commit the changes" "$PROMPT")"
-assert_eq "work-log on: skill step precedes commit step" "yes" \
-    "$( (( wl_line < commit_line )) && echo yes || echo no )"
-run9=("$WORKDIR/logs9"/*)
+forbid_line="$(line_no "Do not commit" "$PROMPT")"
+assert_eq "work-log on: skill step precedes do-not-commit instruction" "yes" \
+    "$( (( wl_line < forbid_line )) && echo yes || echo no )"
+run9=("$REPO9/.bd-run-beads"/*)
 assert_contains "work-log on: unchanged work-log.md draws warning" \
     "no work-log entry detected" "$(cat "${run9[0]}/run.log")"
 assert_eq "work-log on: warning does not fail the run" "closed" "$(cat "$FIX8/tb-r.status")"
 
-echo closed > "$FIX8/tb-r.status.reset" && echo open > "$FIX8/tb-r.status"
+echo open > "$FIX8/tb-r.status"
+REPO10="$WORKDIR/repo10"; mk_repo "$REPO10"
 : > "$CLAUDE_LOG"
-OUT="$(cd "$WORKDIR" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt10.txt" \
-    "$RUNNER" --test-cmd true --log-dir "$WORKDIR/logs10" --work-log off tb-r 2>&1)"
+OUT="$(cd "$REPO10" && FIXDIR="$FIX8" PROMPT_DUMP="$WORKDIR/prompt10.txt" \
+    "$RUNNER" --test-cmd true --log-dir .bd-run-beads --work-log off tb-r 2>&1)"
 assert_eq "work-log off: prompt has no skill step" "" \
     "$(grep -o 'work-log' "$WORKDIR/prompt10.txt" || true)"
-run10=("$WORKDIR/logs10"/*)
+run10=("$REPO10/.bd-run-beads"/*)
 assert_eq "work-log off: no warning logged" "" \
     "$(grep -o 'no work-log entry detected' "${run10[0]}/run.log" || true)"
 
-# --- case 8: auto-detect must not pick a broken .venv pytest shim -------------
+# --- case 11: auto-detect must not pick a broken .venv pytest shim ------------
 # Simulates a repo whose .venv predates a directory move: the shim exists and
 # is executable, but its shebang interpreter is gone. Detection must probe and
 # fall through to a working candidate (or disable) instead of trusting -x.
+# --dry-run exits before any git interaction, so no repo is needed.
 
 PROJ="$WORKDIR/proj"; mkdir -p "$PROJ/.venv/bin" "$PROJ/src"
 printf '#!/nonexistent/python\n' > "$PROJ/.venv/bin/pytest"

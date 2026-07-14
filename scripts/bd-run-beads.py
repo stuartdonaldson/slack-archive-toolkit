@@ -15,10 +15,30 @@ Model cue precedence (first match wins):
   2. title  `[<name>]` / `[<name>-ok]` e.g. "[haiku-ok] trivial join fields"
   3. --default-model (sonnet)
 
-After each session, two hard gates the model can't talk its way past: the
-test command must pass, and the bead must actually be closed. First failure
-stops the run; already-closed beads are skipped, so rerunning after a fix
-picks up where it left off.
+Each session runs headless (-p): nobody is present to approve permission
+prompts or answer questions, and nobody is present to review a commit
+before it lands. So privileged bookkeeping — git commit and bd close — is
+never delegated to the model session; the runner does it itself after its
+own gates pass. The session prompt claims the bead, implements it, runs the
+test suite, and (optionally) writes a work-log entry, then stops — it is
+explicitly told not to commit, push, or close.
+
+After each session: the test command must pass (hard gate). Then the
+runner inspects `git status --porcelain` (excluding --log-dir, which is
+never part of a bead's commit): if the bead is already closed and the tree
+is unchanged, nothing to do, move on. If the tree is unchanged and the bead
+is still open, the session produced nothing — that's fatal, naming the
+bead and its transcript. Otherwise the runner runs `git add -A` (scoped
+with a pathspec that excludes --log-dir when it lives inside the repo),
+commits with the bead title and id in the message, runs `bd close`, and
+re-reads the bead to confirm it actually closed. First failure stops the
+run; already-closed beads are skipped at the top of the loop, so rerunning
+after a fix picks up where it left off.
+
+Before the first session, a dirty-tree guard refuses to start (unless
+--allow-dirty) if the tree already has changes outside --log-dir — those
+would otherwise get swept into the first bead's commit. --allow-dirty
+proceeds but logs a warning that pre-existing changes will ride along.
 
 Logging: each executed run writes --log-dir/<UTC-stamp>/ containing run.log
 (plan, per-bead timings, git HEAD before/after, gate results, fatal errors)
@@ -30,9 +50,10 @@ text, tool calls, result/cost) is echoed to the console as the session runs.
 Work-log capture (--work-log auto|on|off, default auto = on when a
 work-log skill dir exists user- or project-level): each session is asked to
 invoke the existing work-log skill itself — reused, never reimplemented
-here — before committing, so the entry lands inside the bead's own commit
-and its provenance session-id is the session that did the work. The runner
-only warns (never fails) when work-log.md didn't grow during a bead.
+here — before it stops, so the entry lands inside the bead's own commit
+(written by the runner) and its provenance session-id is the session that
+did the work. The runner only warns (never fails) when work-log.md didn't
+grow during a bead.
 
 The prompt is delivered on the session's stdin, never as a positional
 argument — claude's --allowedTools is variadic and eats a trailing
@@ -199,12 +220,17 @@ def session_prompt(issue_id: str, test_cmd: str, work_log: bool) -> str:
             "to infer as inferred."
         )
     steps.append(
-        f"Commit the changes{' - including work-log.md -' if work_log else ''} "
-        f"with '{issue_id}' in the commit message. Do not push."
+        "Do not commit, do not push, and do not close the bead: this session "
+        "is unattended, so the runner itself commits and closes the bead "
+        "once its own gates pass."
     )
-    steps.append(f"Close it: bd close {issue_id}")
     numbered = "\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1))
-    return f"Work exactly one bd issue to completion: {issue_id}.\n{numbered}"
+    return (
+        "This session is unattended (headless): nobody is available to "
+        "approve permission prompts or answer questions, so proceed "
+        "autonomously using the tools available to you.\n"
+        f"Work exactly one bd issue to completion: {issue_id}.\n{numbered}"
+    )
 
 
 def _squeeze(text: str, limit: int) -> str:
@@ -271,6 +297,52 @@ def git_head() -> str:
     return proc.stdout.strip() or "?"
 
 
+def pathspec_exclude_for(path_str: str) -> list[str]:
+    """Pathspec excluding path_str, iff it resolves inside the repo (a
+    log-dir outside the repo needs no exclusion)."""
+    proc = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        return []
+    root = Path(proc.stdout.strip()).resolve()
+    target = Path(path_str).resolve()
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return []
+    return [":(exclude)" + rel.as_posix()]
+
+
+def git_status_porcelain(exclude: list[str]) -> str:
+    cmd = ["git", "status", "--porcelain"]
+    if exclude:
+        cmd += ["--", "."] + exclude
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.stdout
+
+
+def git_add_all(exclude: list[str]) -> None:
+    cmd = ["git", "add", "-A"]
+    if exclude:
+        cmd += ["--", "."] + exclude
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"git add failed: {proc.stderr.strip()}")
+
+
+def git_commit(message: str) -> None:
+    proc = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"git commit failed: {proc.stderr.strip()}")
+
+
+def bd_close(issue_id: str) -> None:
+    proc = subprocess.run([BD, "close", issue_id], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"bd close {issue_id} failed: {proc.stderr.strip()}")
+
+
 def main() -> None:
     global RUNLOG
 
@@ -295,6 +367,10 @@ def main() -> None:
     parser.add_argument("--work-log", choices=["auto", "on", "off"], default="auto",
                         help="have each session append a work-log.md entry via the "
                              "work-log skill (auto: on when the skill is installed)")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="proceed despite pre-existing changes in the tree "
+                             "(outside --log-dir); they ride along in the next "
+                             "bead's commit")
     args = parser.parse_args()
 
     if args.work_log == "auto":
@@ -335,6 +411,17 @@ def main() -> None:
         runlog.log(line, console=False)
     print(f"logs: {run_dir}")
 
+    log_exclude = pathspec_exclude_for(args.log_dir)
+
+    dirty = git_status_porcelain(log_exclude)
+    if dirty.strip():
+        if not args.allow_dirty:
+            die(f"working tree has pre-existing changes outside {args.log_dir}; "
+                "commit or stash them first, or pass --allow-dirty to sweep "
+                "them into the next bead's commit")
+        runlog.log("warning: --allow-dirty set; pre-existing changes will be "
+                    "swept into the next bead's commit")
+
     for issue_id in order:
         # a session may already have closed it (rerun, or manual work between)
         if issues.show(issue_id, fresh=True).get("status") == "closed":
@@ -374,9 +461,6 @@ def main() -> None:
                     runlog.log(f"   {tail_line}", console=False)
                 die(f"{issue_id}: test gate failed after session "
                     f"({test_cmd}); output: {tests_path}")
-        if issues.show(issue_id, fresh=True).get("status") != "closed":
-            die(f"{issue_id}: session ended without closing the bead "
-                f"(transcript: {stream_path})")
         if work_log:
             # warn-only: a missing log entry is a capture gap, not a reason
             # to strand the rest of the dependency tree
@@ -384,6 +468,24 @@ def main() -> None:
             if new_size <= work_log_size:
                 runlog.log(f"   warning: {issue_id}: no work-log entry detected "
                            f"(work-log.md unchanged)")
+
+        # Privileged bookkeeping: the session was told not to commit, push,
+        # or close - it happens here, after every gate above has passed.
+        bead_closed = issues.show(issue_id, fresh=True).get("status") == "closed"
+        tree_changed = bool(git_status_porcelain(log_exclude).strip())
+        if bead_closed and not tree_changed:
+            runlog.log(f"== {issue_id}: already closed, tree unchanged; nothing to commit")
+        elif not bead_closed and not tree_changed:
+            die(f"{issue_id}: session produced no changes and did not close "
+                f"the bead (transcript: {stream_path})")
+        else:
+            title = issues.show(issue_id).get("title") or issue_id
+            git_add_all(log_exclude)
+            git_commit(f"{title} ({issue_id})")
+            bd_close(issue_id)
+            if issues.show(issue_id, fresh=True).get("status") != "closed":
+                die(f"{issue_id}: bd close did not result in closed status")
+
         runlog.log(
             f"== {issue_id} done in {time.monotonic() - started:.0f}s head={git_head()}"
         )

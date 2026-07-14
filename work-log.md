@@ -265,3 +265,80 @@ Open: the 7 worker sessions predate the work-log integration, so they are unlogg
 ### Key Learnings:
 claude CLI: --allowedTools is variadic and swallows a trailing positional prompt — deliver headless prompts via stdin; -p with --output-format stream-json requires --verbose.
 After a repo move, venv shims keep absolute shebangs to the old path: executable-but-dead. Probe test commands (pytest --collect-only, exit 0 or 5) instead of trusting -x.
+
+## 2026-07-13 10:57:11
+_session c6b06d84 · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: include threads whose replies fall in scope (fix cross-period thread blindness) — SlackBackup-7jn
+Rationale: `select_messages_in_range()` admitted a thread only when the parent ts fell inside the export window, so a thread parented before the window that received in-window replies was entirely absent from the digest — revived/long-running conversations vanished. The monthly exporter already handled the analogous late-reply case; the digest never did.
+Outcome [user-facing]: A thread is now included when the parent OR at least one reply has ts in range; when only replies are in range the full thread is emitted with `in_scope: false` on the parent record. `_channel_activity()` excludes `in_scope: false` parents from root_message_count, participant sets, and first/last timestamps.
+Outcome [developer-facing]: Tests updated in tests/test_export_digest_logic.py; full suite 279 passing. Committed `8891e36`, closed, not pushed (per run-scoped instruction).
+
+## 2026-07-13 11:39:46
+_session 6c3f789d · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: per-channel seq giving deterministic flat chronological order — SlackBackup-4ao
+Rationale: Digest messages nest replies under parents and sort top-level entries by root ts, so the true channel timeline isn't directly readable. A per-channel monotonic sequence number gives a deterministic flat reconstruction without duplicating records — needed for a downstream LLM to infer relationships between top-level continuation messages.
+Outcome [developer-facing]: `build_digest()` flattens each channel's emitted records (every root plus nested reply), sorts ascending by ts, and assigns `seq = 1..N` in place; `manifest.counting_rules` documents seq semantics. Full suite 279 passing. Committed `4aaec03`, closed, not pushed.
+
+## 2026-07-13 11:41:22
+_session 6d8bac57 · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: preserve reactions, edited, subtype, and unfurl evidence on digest messages — SlackBackup-efk
+Rationale: `_clean()` reduced messages to ts/user/display_name/text/files, silently dropping evidence verified present in real archives — reactions (~20% of sampled messages), edited flags (~7%), subtype, and Slack unfurls (the only explicit cross-message reference evidence Slack records). Scope guard: `export_month` shares `_clean()` and must not change monthly output, since new fields would churn every sealed month file.
+Outcome [developer-facing]: Added `_clean(msg, users_map, evidence=False)` keyword param; `evidence=True` passed only from `select_messages_in_range()`, so `export_month` is untouched. Full suite 286 passing. Committed `5755eaa`, closed, not pushed.
+
+## 2026-07-13 11:43:13
+_session 21515257 · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: channel_url, message-file ids, and message anchors on channel files — SlackBackup-lwx
+Rationale: Three additive joins needed so digest consumers can link back into Slack and correlate message-attached files with the channel-level files list, distinguishing message attachments from standalone channel Canvases.
+Outcome [developer-facing]: Added `digest_channel_url()` helper (channel_url on every channels[] entry); `_clean()` files projection now keeps file `id`; `_load_channel_files()` selects MESSAGE_ID and emits `message_ts` when non-null (null means a standalone Canvas), deduping in favor of MESSAGE_ID-anchored rows. 6 new tests; full suite 292 passing. Committed `25240dd`, closed, not pushed.
+
+## 2026-07-13 11:48:25
+_session d5c7eb2a · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: thread_ts on replies and Pacific-local timestamps — SlackBackup-s1n
+Rationale: Two mechanical additive fields needed so a reply record is self-describing once extracted from its nesting, and so timestamps read in the workspace's local time without requiring the downstream LLM to convert UTC.
+Outcome [developer-facing]: `_enrich_for_digest()` now threads `parent_ts` through recursion so every reply carries `thread_ts` equal to its parent's ts (root messages do not); added `_format_local_pacific()` (zoneinfo, stdlib) producing `posted_at_local` on every message and reply, including correct DST offset (-08:00 Jan, -07:00 Jul). Full suite 294 passing. Committed `283c13c`, closed, not pushed.
+
+## 2026-07-13 11:51:30
+_session ca180a40 · v3 · 07-13 · backfilled_
+
+### Objective 1: Digest v2: mentions/links extraction and per-workspace user_index — SlackBackup-ugs
+Rationale: Message text keeps raw Slack tokens — `<@U123>` mentions are unresolvable inside the digest with no id-to-name map, and `<url|label>` links need parsing — so deterministic extraction was needed without ever modifying the text field itself.
+Outcome [developer-facing]: `_extract_mentions`/`_extract_links` parse `<@U...>` and `<url>`/`<url|label>` tokens, wired into `_clean()` under the `evidence=True` seam; link `type` resolves to `slack_message` (with target_channel_id/target_ts), `slack_file`, or `external`. `_collect_referenced_ids`/`_build_user_index` build a per-workspace `user_index` scoped to ids actually referenced (never merged across workspaces or the full roster). Full suite 304 passing. Committed `2e4bfef`, closed, not pushed.
+
+## 2026-07-13 11:55:57
+_session a22afff8 · v3 · 07-13 · backfilled_
+
+### Objective 1: Docs+ADR: digest v2 schema in DESIGN-export.md, slack-ingestion.md prompt update — SlackBackup-tdq
+Rationale: Documentation needed to catch up once all six implementation beads landed — the shipped `slack-llm-digest-v2` schema, the additive-evolution design decision, and the LLM-facing ingestion prompt all still described v1.
+Outcome [internal]: docs/DESIGN-export.md now documents the shipped schema field-for-field (in_scope, evidence fields, thread_ts, posted_at_local, seq, channel_url/message anchors, mentions/links, user_index) and marks the Known Gaps row for v1's missing evidence as resolved. New docs/adr/0001-digest-v2-additive-evidence.md records the additive-evolution decision (rejected: flat message-array redesign, prompt-side-only fixes).
+Outcome [developer-facing]: docs/slack-ingestion.md now points at `posted_at_local` instead of asking the LLM to convert UTC, and documents the new evidence fields. Full suite 304 passing. Committed `d30421b`, closed, not pushed.
+
+## 2026-07-13 19:35:00
+_session e5706656 · v3 · 07-13_
+
+### Objective 1: Finish digest v3 condensation (green phase of SlackBackup-vv0)
+Rationale: Prior session left red-phase tests uncommitted (3 failing by design); "the following is the final work from a prior session, finish this off please and test it." v3 drops `posted_at_utc` (redundant with `posted_at_local`'s offset and `ts`) and writes the digest compact — measured v2 waste was ~26% indent whitespace plus ~1.0 MB of redundant timestamps. `message_url` deliberately kept per ADR-0001: the LLM must never construct a `p<ts>` link.
+Outcome [user-facing]: Digest now emits `schema_version: slack-llm-digest-v3`, compact-serialized, without `posted_at_utc`; `export_month`/`users_out` stay pretty-printed.
+Outcome [developer-facing]: `_enrich_for_digest`/`build_digest`/`_run_digest` updated; `counting_rules.posted_at_local` note added; docs/adr/0002-digest-v3-condensation.md written (adr-quality-check passed); DESIGN-export.md v3 section + resolved-gaps row; slack-ingestion.md v2→v3. All 3 red tests green, suite green.
+
+### Objective 2: Cross-workspace mention index + Block Kit mention fix  [accreted]
+Transition: User interrupted the final real-digest verification run with a new spec — a compact per-PAX mention index — and decided via Q&A to fold it into the still-uncommitted v3 change ("Fold index into v3", top-level digest key, "Stay at v3").
+Rationale: "Make it easy to answer: where a PAX is mentioned … without duplicating message text or precomputing every possible report." Identity unification restricted to deterministic evidence (email, exact/variant-normalized F3 name, real-name/username support); conflicting evidence flagged `ambiguous`, never merged — this narrows ADR-0001's "all merging is LLM-side" boundary, recorded as ADR-0003. SlackBackup-rie (Block Kit backblasts lose their *PAX*: mentions because extraction only read `msg.text`) was pulled in as a prerequisite: the spec's own sample message (ao-heritage-park ts 1783887179.871339) is the confirmed rie bug case.
+Rejected: Persisting raw emails for matching — `_clean_user` has always stripped them deliberately; instead profiles gain `email_hash` (truncated SHA-256, one-way), the only email-derived value in any output.
+Outcome [user-facing]: Digest gains top-level `mentions` index (aliases/accounts/match_confidence/workspaces→channels→message_ts, ts-only); bot-posted Block Kit backblasts now contribute their PAX mentions.
+Outcome [developer-facing]: `build_mentions_index` + `_block_texts` + `_normalize_name`/`_match_name`/`_identity_conflict` in export_logic.py; `email_hash` in `_clean_user`; 15 new red-phase tests written first, then green (suite: 320 passed); ADR-0003; DESIGN-export.md §Mentions index + sample JSON + gap rows; slack-ingestion.md identity guidance now defers cross-workspace merging to the index's confidence flags.
+Open: Real-archive regeneration/verification and the single v3 commit + bead close-out (1sx/vv0/du5/rie) deferred to SlackBackup-1cw (sonnet-ok) — the regen run was declined twice this session, so nothing is committed yet.
+
+### Key Learnings:
+Raw slackdump `S_USER` rows carry `profile.email` for nearly every user (1941/1943 in f3kirkland) even though every exported document strips it — deterministic cross-workspace matching is possible without ever persisting an address.
+
+## 2026-07-13 20:24:29
+_session 03e6fde0-b969-4bbb-af83-c2e03b453248 · v3 · 07-13_
+
+### Objective 1: bd-run-beads: move commit/close from the headless session into the runner
+Rationale: A headless run in another repo (RankChoiceVoting) stalled because git commit isn't on any allowlist a `-p` session can approve, so the session finished work but couldn't commit or close its bead, stranding the rest of the dependency tree's beads. Privileged bookkeeping (git commit, bd close) had to move out of the model session, which cannot be trusted to gate its own unattended actions, and into the runner, which enforces it after its own gates pass.
+Outcome [developer-facing]: `session_prompt()` now opens with an explicit "this session is unattended" statement and ends with a step forbidding commit/push/close, instead of instructing the session to do them. After a session exits 0 and the test gate passes, the runner itself computes tree-changed/bead-closed state via `git status --porcelain` (excluding `--log-dir` via a pathspec when the log dir is inside the repo), and either: skips (already closed, tree unchanged), dies naming the bead and transcript (no-op: tree unchanged and bead still open), or runs `git add -A` + `git commit -m "<title> (<id>)"` + `bd close <id>` itself and re-verifies the close. Added a pre-loop dirty-tree guard (refuses to start if the tree has changes outside `--log-dir`, unless `--allow-dirty`, which logs a sweep warning). `scripts/test_bd_run_beads.sh` reworked: fake `bd` now supports `close` and tolerates `update`; fake `claude` no longer touches bd/git, it just drops a `work-<id>.txt` marker (or nothing, under `NO_CHANGES=1`) to simulate a session's file changes; execution/gate/dirty-guard cases now run inside real temp git repos via a new `mk_repo` helper. All 41 assertions pass (`./scripts/test_bd_run_beads.sh`).
