@@ -312,7 +312,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v2"
+    assert result["schema_version"] == "slack-llm-digest-v3"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
@@ -321,8 +321,12 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
     parent_a = next(m for m in result["messages"] if m["ts"] == A_TS and m["workspace"] == "f3pugetsound")
     assert parent_a["channel_id"] == "C1"
     assert parent_a["message_url"] == "https://f3pugetsound.slack.com/archives/C1/p1775811600000100"
-    assert "posted_at_utc" in parent_a
+    # v3 drops posted_at_utc: redundant with posted_at_local (whose offset
+    # preserves UTC derivability) and with ts itself (SlackBackup-1sx).
+    assert "posted_at_utc" not in parent_a
+    assert "posted_at_local" in parent_a
     assert parent_a["replies"][0]["message_url"].startswith("https://f3pugetsound.slack.com/archives/C1/")
+    assert "posted_at_utc" not in parent_a["replies"][0]
 
     # No top-level merged author/users table - identity stays per-message.
     assert "users" not in result
@@ -1126,6 +1130,8 @@ def test_enrich_for_digest_reply_has_thread_ts_parent_does_not():
     assert parent["posted_at_local"] == export_logic._format_local_pacific(1000.0001)
     assert reply["thread_ts"] == "1000.000100"
     assert reply["posted_at_local"] == export_logic._format_local_pacific(1100.0001)
+    assert "posted_at_utc" not in parent
+    assert "posted_at_utc" not in reply
 
 
 def test_extract_mentions_order_and_dedupe():
@@ -1272,3 +1278,296 @@ def test_enrich_for_digest_posted_at_local_has_dst_offset():
 
     assert "-08:00" in jan_local
     assert "-07:00" in jul_local
+
+
+# --- Block Kit mention/link extraction (SlackBackup-rie) ---
+# Bot-posted backblasts (F3 Nation/PAXminer crosspost) put the *PAX*: line
+# with its <@U...> mentions in blocks[0].text.text; top-level text is a
+# narrative-only fallback. Extraction must cover both sources.
+
+
+def test_clean_extracts_mentions_from_block_section_text():
+    msg = {
+        "ts": "1783887179.871339", "bot_id": "B0A3N3YRWE8", "username": "F3 Nation",
+        "text": "narrative fallback with no pax list",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": "*PAX*: <@U0AAA>, <@U0BBB>, Singlet, Van Winkle"}},
+        ],
+    }
+
+    cleaned = export_logic._clean(msg, {}, evidence=True)
+
+    assert cleaned["mentions"] == ["U0AAA", "U0BBB"]
+    assert cleaned["text"] == "narrative fallback with no pax list"
+
+
+def test_clean_mentions_ordered_across_text_then_blocks_deduped():
+    msg = {
+        "ts": "1000.000100", "user": "U0X",
+        "text": "shout out <@U0AAA>",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*PAX*: <@U0AAA>, <@U0CCC>"}},
+        ],
+    }
+
+    cleaned = export_logic._clean(msg, {"U0X": "Al"}, evidence=True)
+
+    assert cleaned["mentions"] == ["U0AAA", "U0CCC"]
+
+
+def test_clean_extracts_links_from_block_section_text():
+    msg = {
+        "ts": "1000.000100", "user": "U0X", "text": "see below",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": "sign up at <https://example.com/q-sheet|the Q sheet>"}},
+        ],
+    }
+
+    cleaned = export_logic._clean(msg, {"U0X": "Al"}, evidence=True)
+
+    assert cleaned["links"] == [
+        {"url": "https://example.com/q-sheet", "label": "the Q sheet", "type": "external"},
+    ]
+
+
+# --- Cross-workspace mention index (SlackBackup-du5) ---
+# Top-level digest "mentions" key: inverted index keyed by canonical F3
+# name; only message ts stored, grouped workspace -> channel; counts,
+# first/last, and URLs are derived downstream. Deterministic identity
+# unification (email_hash / normalized F3 name + support); conflicting
+# evidence is never merged, only flagged.
+
+
+def _mentions_profiles_doc(*ws_profiles):
+    return {
+        "schema_version": "slack-user-profiles-v1",
+        "workspaces": [
+            {"workspace": ws, "status": "ok", "profiles": profiles}
+            for ws, profiles in ws_profiles
+        ],
+    }
+
+
+def _mention_profile(uid, display_name, *, name=None, real_name=None, email_hash=None, f3_name=None):
+    profile = {
+        "id": uid, "name": name, "real_name": real_name, "display_name": display_name,
+        "title": None, "deleted": False, "slack_roles": [], "email_hash": email_hash,
+    }
+    if f3_name is not None:
+        profile["derived_leadership"] = {"possible_f3_name": f3_name}
+    return profile
+
+
+def _digest_msg(ts, workspace, channel, channel_id, mentions, replies=None):
+    msg = {
+        "ts": ts, "user": "U0POSTER", "text": "…", "workspace": workspace,
+        "channel": channel, "channel_id": channel_id,
+    }
+    if mentions:
+        msg["mentions"] = mentions
+    if replies:
+        msg["replies"] = replies
+    return msg
+
+
+def test_mentions_index_basic_single_workspace_entry():
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0BUS", "Bus Boy")]),
+    )
+    messages = [
+        _digest_msg("1783887179.871339", "f3kirkland", "ao-heritage-park", "C0A6DGHR7D3", ["U0BUS"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    entry = index["Bus Boy"]
+    assert entry["aliases"] == ["Bus Boy"]
+    assert entry["accounts"] == [["f3kirkland", "U0BUS"]]
+    assert entry["match_confidence"] == "high"
+    channel = entry["workspaces"]["f3kirkland"]["channels"]["C0A6DGHR7D3"]
+    assert channel["name"] == "ao-heritage-park"
+    assert channel["message_ts"] == ["1783887179.871339"]
+
+
+def test_mentions_index_stores_only_ts_no_urls_or_text():
+    profiles = _mentions_profiles_doc(("f3kirkland", [_mention_profile("U0BUS", "Bus Boy")]))
+    messages = [_digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0BUS"])]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    dumped = json.dumps(index)
+    assert "slack.com" not in dumped
+    assert "message_url" not in dumped
+    assert "text" not in index["Bus Boy"]["workspaces"]["f3kirkland"]["channels"]["C1"]
+
+
+def test_mentions_index_merges_accounts_on_email_hash_high_confidence():
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0AA", "Bus Boy", email_hash="abc123def456")]),
+        ("f3redmond", [_mention_profile("U0BB", "BusBoy", email_hash="abc123def456")]),
+    )
+    messages = [
+        _digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0AA"]),
+        _digest_msg("2000.000100", "f3redmond", "ao-y", "C2", ["U0BB"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    assert len(index) == 1
+    entry = next(iter(index.values()))
+    assert entry["accounts"] == [["f3kirkland", "U0AA"], ["f3redmond", "U0BB"]]
+    assert entry["match_confidence"] == "high"
+    assert set(entry["workspaces"]) == {"f3kirkland", "f3redmond"}
+
+
+def test_mentions_index_merges_f3_name_from_profile_variants_with_real_name_support():
+    """"Pure LEAD" display in one workspace (f3 name parsed out of the role
+    suffix) matches plain "Pure" in another; matching real_name upgrades the
+    merge to high confidence."""
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0AA", "Pure LEAD", real_name="Pat Smith", f3_name="Pure")]),
+        ("f3redmond", [_mention_profile("U0BB", "Pure", real_name="Pat Smith")]),
+    )
+    messages = [
+        _digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0AA"]),
+        _digest_msg("2000.000100", "f3redmond", "ao-y", "C2", ["U0BB"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    assert len(index) == 1
+    entry = next(iter(index.values()))
+    assert entry["accounts"] == [["f3kirkland", "U0AA"], ["f3redmond", "U0BB"]]
+    assert entry["match_confidence"] == "high"
+    assert "Pure LEAD" in entry["aliases"] and "Pure" in entry["aliases"]
+
+
+def test_mentions_index_folds_simple_name_variants_medium_without_support():
+    """Case/space/punctuation/hyphen variants normalize together; with no
+    email or real-name support the merge is medium confidence."""
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0AA", "Bus Boy")]),
+        ("f3redmond", [_mention_profile("U0BB", "bus-boy")]),
+    )
+    messages = [
+        _digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0AA"]),
+        _digest_msg("2000.000100", "f3redmond", "ao-y", "C2", ["U0BB"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    assert len(index) == 1
+    entry = next(iter(index.values()))
+    assert entry["accounts"] == [["f3kirkland", "U0AA"], ["f3redmond", "U0BB"]]
+    assert entry["match_confidence"] == "medium"
+    assert sorted(entry["aliases"]) == ["Bus Boy", "bus-boy"]
+
+
+def test_mentions_index_conflict_not_merged_flagged_ambiguous():
+    """Same normalized name but different email hashes AND different real
+    names: two different PAX sharing an F3 name. Never merged; one key with
+    unmerged identity clusters."""
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0AA", "Mulligan", real_name="Alex North", email_hash="aaaa11112222")]),
+        ("f3seattle", [_mention_profile("U0BB", "Mulligan", real_name="Chris South", email_hash="bbbb33334444")]),
+    )
+    messages = [
+        _digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0AA"]),
+        _digest_msg("2000.000100", "f3seattle", "ao-y", "C2", ["U0BB"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    assert len(index) == 1
+    entry = index["Mulligan"]
+    assert entry["match_confidence"] == "ambiguous"
+    identities = entry["identities"]
+    assert len(identities) == 2
+    all_accounts = [acct for ident in identities for acct in ident["accounts"]]
+    assert sorted(map(tuple, all_accounts)) == [("f3kirkland", "U0AA"), ("f3seattle", "U0BB")]
+    assert "accounts" not in entry
+
+
+def test_mentions_index_groups_ts_per_channel_including_reply_mentions():
+    profiles = _mentions_profiles_doc(("f3kirkland", [_mention_profile("U0BUS", "Bus Boy")]))
+    reply = {"ts": "1500.000100", "user": "U0R", "text": "…", "workspace": "f3kirkland",
+             "channel": "ao-x", "channel_id": "C1", "mentions": ["U0BUS"], "thread_ts": "1400.000100"}
+    messages = [
+        _digest_msg("1400.000100", "f3kirkland", "ao-x", "C1", None, replies=[reply]),
+        _digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0BUS"]),
+        _digest_msg("2000.000100", "f3kirkland", "ao-other", "C2", ["U0BUS"]),
+    ]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    channels = index["Bus Boy"]["workspaces"]["f3kirkland"]["channels"]
+    assert channels["C1"]["message_ts"] == ["1000.000100", "1500.000100"]
+    assert channels["C2"]["message_ts"] == ["2000.000100"]
+
+
+def test_mentions_index_scoped_to_mentioned_users_only():
+    profiles = _mentions_profiles_doc(
+        ("f3kirkland", [_mention_profile("U0BUS", "Bus Boy"), _mention_profile("U0NOPE", "Never Mentioned")]),
+    )
+    messages = [_digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0BUS"])]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    assert list(index) == ["Bus Boy"]
+
+
+def test_mentions_index_unknown_uid_without_profile_keyed_by_uid():
+    profiles = _mentions_profiles_doc(("f3kirkland", []))
+    messages = [_digest_msg("1000.000100", "f3kirkland", "ao-x", "C1", ["U0GONE"])]
+
+    index = export_logic.build_mentions_index(messages, profiles)
+
+    entry = index["U0GONE"]
+    assert entry["accounts"] == [["f3kirkland", "U0GONE"]]
+    assert entry["match_confidence"] == "unknown"
+
+
+def test_clean_user_emits_email_hash_never_raw_email():
+    raw = {
+        "id": "U0AA", "name": "pat.smith", "real_name": "Pat Smith",
+        "profile": {"display_name": "Bus Boy", "email": "Pat.Smith@Example.com"},
+    }
+
+    cleaned = export_logic._clean_user(raw)
+
+    import hashlib
+    expected = hashlib.sha256(b"pat.smith@example.com").hexdigest()[:12]
+    assert cleaned["email_hash"] == expected
+    assert "Pat.Smith@Example.com" not in json.dumps(cleaned)
+    assert "email" not in cleaned
+
+
+def test_clean_user_email_hash_none_when_no_email():
+    raw = {"id": "U0AA", "name": "bot", "profile": {"display_name": "Botty"}}
+
+    cleaned = export_logic._clean_user(raw)
+
+    assert cleaned["email_hash"] is None
+
+
+def test_build_digest_emits_top_level_mentions_index(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["schema_version"] == "slack-llm-digest-v3"
+    assert isinstance(result["mentions"], dict)
+    assert "mentions_index" in result["manifest"]["counting_rules"]

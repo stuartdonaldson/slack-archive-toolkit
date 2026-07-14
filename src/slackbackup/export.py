@@ -180,7 +180,7 @@ def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, da
         channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
         handler=handler, profiles_doc=profiles_doc,
     )
-    out_path.write_text(json.dumps(result, indent=2))
+    out_path.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     ok = sum(1 for c in result["channels"] if c["status"] == "ok")
     missing = sum(1 for c in result["channels"] if c["status"] == "missing_archive")

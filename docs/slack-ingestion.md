@@ -18,12 +18,12 @@ Preserve source context whenever possible:
 
 Report all timestamps and event times in local Pacific time, not UTC. A digest message already
 carries its Pacific-local time in the `posted_at_local` field (`schema_version:
-"slack-llm-digest-v2"`) — use that value directly rather than converting `posted_at_utc`
-yourself. When useful, include the timezone abbreviation, such as PST or PDT.
+"slack-llm-digest-v3"`) — use that value directly; it is the digest's only timestamp field.
+When useful, include the timezone abbreviation, such as PST or PDT.
 
 When referencing a **conversation, message, thread, channel, canvas, file, AO, or event**, include the full clickable Slack link whenever one is available. If no direct link is available, say so.
 
-Treat identities as workspace-local. Do not merge people across workspaces unless strongly supported by the data. Prefer F3 names/display names in output.
+Treat identities as workspace-local. The digest's top-level `mentions` index already unifies accounts across workspaces where the evidence is deterministic — trust its `high` and `medium` confidence merges, treat `ambiguous` entries as unresolved (never merge them yourself), and do not merge people beyond what the index supports unless strongly supported by the data. Prefer F3 names/display names in output.
 
 Do not treat profile titles or display names as definitive. Use them as signals only unless confirmed by stronger sources.
 
@@ -41,7 +41,7 @@ Flag uncertainty instead of guessing.
 
 # Evidence fields available in the digest
 
-A `slack-llm-digest-v2` message may carry these fields — treat them as raw evidence, not
+A `slack-llm-digest-v3` message may carry these fields — treat them as raw evidence, not
 conclusions, and do not infer a fact these fields could have carried but don't (e.g. do not
 assume a message was edited just because its wording looks off):
 
@@ -56,8 +56,15 @@ assume a message was edited just because its wording looks off):
   later root messages; never cite `seq` itself to a user.
 * `user_index` — a per-workspace `{user_id: {display_name, is_bot}}` map scoped to users actually
   referenced in that workspace's digest slice. Use it to resolve a `user` or `mentions` ID to a
-  display name; never merge an ID across workspaces — the same ID in two workspaces is two
-  different people.
+  display name; never merge an ID on your own across workspaces — cross-workspace identity comes
+  only from the `mentions` index (below).
+* `mentions` (top-level index, distinct from the per-message `mentions` field) — per-PAX mention
+  locations keyed by canonical F3 name: `aliases`, workspace-local `accounts`, a
+  `match_confidence` (`high`/`medium`/`unknown`/`ambiguous`), and
+  `workspaces → channels → message_ts`. Use it to answer where/when/how often a PAX is mentioned;
+  derive counts and first/last dates from `message_ts`, and cite by looking up the source message
+  (its `message_url`) via ts — never construct a link yourself. An `ambiguous` entry lists
+  unmerged `identities[]` — report them as possibly-distinct people, never pooled.
 
 # Be ready to answer
 

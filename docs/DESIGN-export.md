@@ -344,12 +344,29 @@ export engine. Handler selection:
 
 ### Output shape
 
-`schema_version: "slack-llm-digest-v2"`. v2 evolves v1 **additively** — every v1 field/shape
-still holds; v2 only adds fields (see the ADR below for the design decision behind this).
+`schema_version: "slack-llm-digest-v3"`. v2 evolved v1 **additively** — every v1 field/shape
+still held; v2 only added fields (see `docs/adr/0001-digest-v2-additive-evidence.md` for that
+decision). v3 makes three changes:
+
+- **Condensation** — drops the redundant `posted_at_utc` field (UTC is always derivable from
+  `posted_at_local`'s offset or from `ts`) and serializes the digest file compactly
+  (`json.dumps(..., separators=(",", ":"))` instead of `indent=2`) — see
+  `docs/adr/0002-digest-v3-condensation.md`. `message_url` is deliberately retained even though
+  it too is derivable from `workspace`/`channel_id`/`ts`, because the downstream LLM must never
+  construct a `p<ts>` permalink itself (ADR-0001).
+- **Cross-workspace mention index** — a top-level `mentions` key, an inverted index keyed by
+  canonical F3 name storing only message `ts` grouped workspace → channel, with accounts unified
+  on deterministic evidence only (email hash; normalized F3 name plus real-name/username
+  support) and conflicts flagged `ambiguous`, never merged — see
+  `docs/adr/0003-mentions-index-deterministic-identity.md` and §Mentions index below.
+- **Block Kit mention extraction** — per-message `mentions`/`links` extraction reads
+  `blocks[].text.text` in addition to the top-level `text`, so bot-posted backblasts (whose
+  *PAX*: line lives in a section block while `text` is a narrative-only fallback) no longer lose
+  their PAX list (SlackBackup-rie).
 
 ```jsonc
 {
-  "schema_version": "slack-llm-digest-v2",
+  "schema_version": "slack-llm-digest-v3",
   "generated_at": "2026-06-23T18:00:00Z",
   "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
@@ -363,7 +380,8 @@ still holds; v2 only adds fields (see the ADR below for the design decision behi
       "seq": "per-channel (not global) monotonic integer, 1..N, over every emitted record (root + nested replies) ascending by true post ts; lets a consumer flatten thread nesting back into true chronological order.",
       "mentions": "<@U...> user ids parsed from a message's text, first-appearance order, deduped; omitted when none.",
       "links": "Slack angle-bracket link tokens (<url>/<url|label>) parsed from a message's text, omitted when none; type is slack_message/slack_file/external.",
-      "user_index": "top-level {workspace: {user_id: {display_name, is_bot}}}, scoped to ids referenced in that workspace's digest slice, never merged across workspaces."
+      "user_index": "top-level {workspace: {user_id: {display_name, is_bot}}}, scoped to ids referenced in that workspace's digest slice, never merged across workspaces.",
+      "mentions_index": "top-level mentions key: inverted per-PAX mention index keyed by canonical F3 name; ts-only locations grouped workspace -> channel; deterministic identity unification with confidence flags (see §Mentions index)."
     },
     "known_limitations": [
       "Private or inaccessible channels may be absent",
@@ -405,25 +423,39 @@ still holds; v2 only adds fields (see the ADR below for the design decision behi
       "links": [ { "url": "https://example.com", "label": "this", "type": "external" } ],
       "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
       "message_url": "https://f3pugetsound.slack.com/archives/C.../p1718...",
-      "posted_at_utc": "2026-06-21T08:00:00Z", "posted_at_local": "2026-06-21T01:00:00-07:00",
+      "posted_at_local": "2026-06-21T01:00:00-07:00",
       "seq": 42,
       "reply_count": 2, "thread_participant_count": 2, "thread_last_reply_utc": "2026-06-21T09:00:00Z",
       "replies": [
         { "ts": "1718...", "user": "U456", "display_name": "John Smith", "text": "reply text",
           "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
           "message_url": "https://f3pugetsound.slack.com/archives/C.../p1718...",
-          "posted_at_utc": "2026-06-21T09:00:00Z", "posted_at_local": "2026-06-21T02:00:00-07:00",
+          "posted_at_local": "2026-06-21T02:00:00-07:00",
           "thread_ts": "1718...", "seq": 43 }
       ] },
     { "ts": "1717...", "user": "U999", "display_name": "Old Poster", "text": "old thread parent, only here because a reply landed in scope",
       "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C...",
       "message_url": "https://f3pugetsound.slack.com/archives/C.../p1717...",
-      "posted_at_utc": "2026-03-15T08:00:00Z", "posted_at_local": "2026-03-15T01:00:00-07:00",
+      "posted_at_local": "2026-03-15T01:00:00-07:00",
       "in_scope": false, "seq": 1,
       "reply_count": 1, "replies": [ "..." ] }
   ],
   "user_index": {
     "f3pugetsound": { "U123": { "display_name": "Jane Doe", "is_bot": false } }
+  },
+  "mentions": {
+    "Bus Boy": {
+      "aliases": [ "Bus Boy" ],
+      "accounts": [ [ "f3kirkland", "U0BD3GFUUTZ" ] ],
+      "match_confidence": "high",
+      "workspaces": {
+        "f3kirkland": {
+          "channels": {
+            "C0A6DGHR7D3": { "name": "ao-heritage-park", "message_ts": [ "1783887179.871339" ] }
+          }
+        }
+      }
+    }
   },
   "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] }
 }
@@ -437,8 +469,9 @@ across a parallel index. `reactions`/`edited`/`subtype`/`unfurls`/`mentions`/`li
 evidence fields (only ever attached by `select_messages_in_range`'s `evidence=True` cleaning path,
 never by `export_month`'s plain per-channel-month export) and are each omitted when absent rather
 than emitted as `null`/`[]`. `posted_at_local` is Pacific local time (`America/Los_Angeles`,
-DST-aware, ISO 8601 with UTC offset) alongside `posted_at_utc` — added so a consumer never has to
-convert timezones itself. `seq` is a per-channel (not global) monotonic counter over every emitted
+DST-aware, ISO 8601 with UTC offset) — the digest's only timestamp field; UTC is derivable from
+either its offset or the message's `ts` epoch, so v3 dropped v2's separate `posted_at_utc`.
+`seq` is a per-channel (not global) monotonic counter over every emitted
 record — root and nested reply alike — assigned in true post-time order; sorting a channel's
 records by `seq` reproduces chronological order even though replies stay nested under their
 parent. `thread_ts` appears only on a reply (equal to its parent's `ts`), never on a root message.
@@ -478,6 +511,29 @@ the raw per-workspace profile roster lives in `export users`'s own output (see �
 Export below). The name was changed from the earlier `raw_profile_matches`, which read as if it
 held raw profile data when it never did.
 
+#### Mentions index
+
+The top-level `mentions` key (v3, `docs/adr/0003-mentions-index-deterministic-identity.md`) is a
+compact inverted index over users actually mentioned in this digest, built as a post-pass over
+the final merged `messages` (replies included). It answers "where is this PAX mentioned, first
+and last mention, total mentions, which channels/workspaces, with links back to the source"
+without duplicating message text or precomputing reports: each entry stores only ascending
+message `ts` grouped `workspaces → channels`, and counts, first/last dates, and Slack URLs are
+derived downstream from `ts` + `channel_id` + workspace (URL construction stays out of the LLM's
+hands — it derives from the source message's `message_url`, not from `p<ts>` arithmetic).
+
+Identity unification across workspaces is **deterministic only** — user ids stay
+workspace-local (`accounts` is `[workspace, user_id]` pairs, never a global id): a matching
+`email_hash` merges at `high` confidence; a normalized-F3-name match (case/space/punctuation/
+hyphen variants fold; the f3 handler's `possible_f3_name` strips role suffixes like
+"Pure LEAD" → "Pure") merges at `high` with real-name/username support, `medium` without. Same
+normalized name with conflicting evidence (both email hashes present and differing AND both
+real names present and differing) is never merged: one key, `match_confidence: "ambiguous"`,
+with the unmerged clusters listed under `identities[]`. A mentioned id with no roster profile
+keeps an entry keyed by its raw id at confidence `unknown`. Raw email addresses are never
+persisted anywhere — `email_hash` (truncated SHA-256 of the lowercased address, added to the
+user-profiles export) is the only email-derived value in any output.
+
 ---
 
 ## User Profiles Export (`export users`)
@@ -495,7 +551,7 @@ already-archived channel per workspace (whichever is archived first) rather than
   "workspaces": [
     { "workspace": "f3pugetsound", "status": "ok", "profiles": [
         { "id": "U123", "name": "jane.doe", "real_name": "Jane Doe", "display_name": "Jane Doe",
-          "deleted": false, "slack_roles": ["admin"] }
+          "deleted": false, "slack_roles": ["admin"], "email_hash": "a1b2c3d4e5f6" }
     ] },
     { "workspace": "f3kirkland", "status": "missing_archive", "profiles": [] }
   ]
@@ -507,6 +563,9 @@ from `is_primary_owner`, `is_owner`, `is_admin`, `is_bot`, `is_app_user`, `is_re
 `is_ultra_restricted`, `is_stranger` (account-status flags like `is_invited_user` are excluded —
 not a role). `_clean_user` otherwise strips avatar URLs, email/phone, presence, and
 `enterprise_user` — identity fields only, same noise-stripping philosophy as message cleaning.
+`email_hash` is the one email-derived exception: a truncated one-way SHA-256 of the lowercased
+address, kept solely so the digest's mentions index can match one PAX across workspaces
+deterministically (ADR-0003); the raw address itself is still never persisted.
 
 ---
 
@@ -564,6 +623,9 @@ Python, not bash/jq. The nightly script (`scripts/nightly-backup-digest.sh`) for
 | No channel-purpose classification in the digest | `docs/llm-digest2-idea.md` proposed a `channel_category` field (ao/announcement/iso/classifieds/etc.) inferred from channel name/description. | Deferred — channel-naming conventions aren't consistent across all `f3*` workspaces, so accuracy would vary; if added, follow the existing `derive_leadership`-style pattern (heuristic value plus a `_basis` field), never an authoritative claim. |
 | Single-document digest size | `docs/llm-digest2-idea.md` proposed ZIP/per-workspace-file packaging once the merged digest gets large. A real digest (2026-06-25, 7 workspaces, 381 channels) is ~11.4 MB. | Deferred — no evidence yet that 11.4 MB is actually unworkable for the newsletter-prompt use case; revisit only if that changes, since splitting `messages` would reverse the original "one valid JSON object" decision (`docs/llm-export-suggestion.md`). |
 | v1 digest dropped raw Slack evidence (reactions, edits, subtypes, unfurls) and left timezone conversion, message/channel citation, and cross-workspace identity resolution to the LLM | `schema_version: "slack-llm-digest-v1"` carried only `ts`/`user`/`display_name`/`text`/`files` per message plus a UTC-only `posted_at_utc` — no reaction/edit/subtype/unfurl evidence, no `thread_ts` on a reply, no `channel_url`/message anchors, no `mentions`/`links` extraction, and no bounded per-workspace user index. | **Resolved** by `slack-llm-digest-v2` (see `docs/adr/0001-digest-v2-additive-evidence.md`) — additive fields only, all semantic inference still left to the downstream LLM. See §Output shape above for the full v2 field list. |
+| v2 digest was needlessly large — `indent=2` whitespace measured at ~26% of a real digest file, and `posted_at_utc` (redundant with `posted_at_local`/`ts`) added ~1.0 MB | A real v2 digest was ~22.6 MB. | **Resolved** by `slack-llm-digest-v3` (see `docs/adr/0002-digest-v3-condensation.md`) — `posted_at_utc` dropped, digest file written compact (`separators=(",", ":")`, no `indent`). `message_url` is kept despite being derivable, since the LLM must never construct a `p<ts>` link itself (ADR-0001). Measured ~15.7 MB post-condensation, parsed content identical minus `posted_at_utc`. |
+| Bot-posted Block Kit backblasts lost their PAX list — `mentions[]` extraction read only `msg.text`, but the *PAX*: line with its `<@U...>` mentions lives in `blocks[].text.text` while `text` is a narrative-only fallback | Confirmed on f3kirkland/ao-heritage-park ts=1783887179.871339: 14 PAX mentions existed only in blocks. Most backblasts in this deployment are bot-posted, so structured PAX data was silently missing digest-wide (SlackBackup-rie). | **Resolved** in v3 — `_clean`'s evidence path extracts mentions/links from top-level `text` plus every Block Kit block's `text.text`, deduped in first-appearance order across both sources. |
+| Cross-workspace mention tracking left wholly to the LLM — "where is this PAX mentioned" required a full-digest scan plus ad-hoc identity merging in every prompt | ADR-0001 deliberately deferred all identity merging, including the deterministic subset (same email, same F3 name + real name). | **Resolved** in v3 by the top-level `mentions` index (`docs/adr/0003-mentions-index-deterministic-identity.md`) — deterministic unification with confidence flags; ambiguous collisions flagged, never merged; ts-only locations, everything else derived downstream. |
 
 ---
 

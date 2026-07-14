@@ -22,10 +22,13 @@ def test_clean_user_strips_noise_and_resolves_display_name():
         "deleted": False, "profile": {"display_name": "Al", "email": "alice@example.com"},
     }
     cleaned = export_logic._clean_user(raw)
+    import hashlib
     assert cleaned == {
         "id": "U0A", "name": "alice.a", "real_name": "Alice Anderson",
         "display_name": "Al", "title": None, "deleted": False, "slack_roles": [],
+        "email_hash": hashlib.sha256(b"alice@example.com").hexdigest()[:12],
     }
+    assert "alice@example.com" not in json.dumps(cleaned)
 
 
 def test_clean_user_includes_title_when_present():

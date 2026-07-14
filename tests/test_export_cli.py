@@ -141,6 +141,21 @@ def test_digest_direct_path_reports_unknown_handler_cleanly(tmp_path, capsys):
     assert "bogus" in captured.err
 
 
+# --- SlackBackup-1sx: digest file is written compact, not pretty-printed ---
+
+
+def test_run_digest_writes_compact_json(tmp_path, monkeypatch):
+    """indent=2 whitespace was ~26% of a real digest file; the digest must be
+    written compact (and unescaped UTF-8) with content otherwise unchanged."""
+    _stub_profiles(monkeypatch)
+    out_path = tmp_path / "digest.json"
+
+    export._run_digest(Path("channels.json"), tmp_path, "f3*", 180, "2026-07-01", out_path, None)
+
+    text = out_path.read_text(encoding="utf-8")
+    assert text == json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
+
+
 # --- Change 2: --workspace has no default; required unless --jobs is given ---
 
 

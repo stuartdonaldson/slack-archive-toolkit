@@ -16,6 +16,7 @@ otherwise it's rewritten even though sealed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -114,6 +115,20 @@ def _extract_links(text: str | None) -> list[dict]:
     return links
 
 
+def _block_texts(msg: dict) -> list[str]:
+    """Text bodies of Block Kit blocks carrying a text object (section/
+    header). Bot-posted backblasts (F3 Nation/PAXminer crosspost) put the
+    *PAX*: line with its <@U...> mentions in blocks[].text.text while the
+    top-level msg.text is a narrative-only fallback, so mention/link
+    extraction must read both sources (SlackBackup-rie)."""
+    texts = []
+    for block in msg.get("blocks") or []:
+        text = block.get("text")
+        if isinstance(text, dict) and text.get("text"):
+            texts.append(text["text"])
+    return texts
+
+
 def _unfurls_from_attachments(attachments: list[dict]) -> list[dict]:
     unfurls = []
     for att in attachments:
@@ -165,11 +180,18 @@ def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False) -> dict
             unfurls = _unfurls_from_attachments(attachments)
             if unfurls:
                 base["unfurls"] = unfurls
-        text = msg.get("text")
-        mentions = _extract_mentions(text)
+        sources = [msg.get("text"), *_block_texts(msg)]
+        mentions: list[str] = []
+        links: list[dict] = []
+        for source in sources:
+            for uid in _extract_mentions(source):
+                if uid not in mentions:
+                    mentions.append(uid)
+            for link in _extract_links(source):
+                if link not in links:
+                    links.append(link)
         if mentions:
             base["mentions"] = mentions
-        links = _extract_links(text)
         if links:
             base["links"] = links
     return base
@@ -435,7 +457,7 @@ def _channel_context(catalog: dict, channel_id: str) -> dict:
     stays local-only; if the cache was never warmed for this channel, e.g.
     a fresh checkout, these are just None rather than triggering a live
     fetch). created_at is an ISO8601 string, not the raw epoch, matching
-    this module's posted_at_utc convention elsewhere."""
+    this module's posted_at_local convention elsewhere."""
     channel = catalog["channels"].get(channel_id, {})
     created = channel.get("created")
     return {
@@ -631,7 +653,6 @@ def _enrich_for_digest(msg: dict, workspace: str, channel: str, channel_id: str,
     msg["channel"] = channel
     msg["channel_id"] = channel_id
     msg["message_url"] = digest_message_url(workspace, channel_id, msg["ts"])
-    msg["posted_at_utc"] = _format_utc(float(msg["ts"]))
     msg["posted_at_local"] = _format_local_pacific(float(msg["ts"]))
     if parent_ts is not None:
         msg["thread_ts"] = parent_ts
@@ -794,6 +815,187 @@ def _build_user_index(profiles_doc: dict, referenced_ids_by_workspace: dict[str,
         if entries:
             index[workspace] = entries
     return index
+
+
+# --- cross-workspace mention index (slack-llm-digest-v3 "mentions" key).
+# Inverted index keyed by canonical F3 name answering "where is this PAX
+# mentioned" without duplicating message bodies or URLs: only message ts,
+# grouped workspace -> channel; counts, first/last dates, and Slack links
+# are all derivable downstream (ts + channel_id + workspace suffice).
+# Deterministic identity unification only - email_hash match, or normalized
+# F3-name match with real-name/username support; conflicting evidence is
+# never merged, just flagged ambiguous. Everything heuristic beyond that
+# stays with the downstream LLM, per ADR-0003. ---
+
+
+_MATCH_CONFIDENCE_RANK = {"medium": 0, "high": 1}
+
+
+def _normalize_name(name: str | None) -> str | None:
+    """Folds case, spaces, punctuation, and hyphens so simple variants of
+    the same F3 name ("Bus Boy" / "bus-boy" / "BusBoy") compare equal."""
+    if not name:
+        return None
+    return re.sub(r"[^a-z0-9]", "", name.lower()) or None
+
+
+def _match_alias(profile: dict) -> str:
+    """Raw display form recorded in the index's aliases list."""
+    return profile.get("display_name") or profile.get("real_name") or profile.get("name") or profile["id"]
+
+
+def _match_name(profile: dict) -> str:
+    """Canonical-name candidate used as the matching key: the handler's
+    parsed F3 name when present (strips role suffixes like "Pure LEAD" ->
+    "Pure"), else the same display-form fallback chain as the alias."""
+    derived = profile.get("derived_leadership") or {}
+    return derived.get("possible_f3_name") or _match_alias(profile)
+
+
+def _identity_conflict(a: dict, b: dict) -> bool:
+    """Same name but demonstrably different people: both accounts carry an
+    email hash and they differ, AND both carry a real name and those differ
+    too. Either signal alone is not a conflict (one PAX may use different
+    emails per workspace)."""
+    a_email, b_email = a.get("email_hash"), b.get("email_hash")
+    a_real, b_real = _normalize_name(a.get("real_name")), _normalize_name(b.get("real_name"))
+    return bool(a_email and b_email and a_email != b_email and a_real and b_real and a_real != b_real)
+
+
+def build_mentions_index(messages: list[dict], profiles_doc: dict) -> dict:
+    """Digest post-pass: walks the final merged messages (roots and nested
+    replies alike, each already carrying workspace/channel/channel_id/ts and
+    the extracted per-message mentions[]) and inverts them into per-PAX
+    mention locations. Scoped to users actually mentioned in this digest;
+    a mentioned id with no roster profile still gets an entry keyed by its
+    raw id with match_confidence "unknown" rather than vanishing."""
+    profiles_by_workspace = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+
+    # (workspace, uid) -> {channel_id: {"name": ..., "ts": [float-sortable ts]}}
+    occurrences: dict[tuple[str, str], dict[str, dict]] = {}
+
+    def _record(msg: dict) -> None:
+        for uid in msg.get("mentions", ()):
+            channels = occurrences.setdefault((msg["workspace"], uid), {})
+            slot = channels.setdefault(msg["channel_id"], {"name": msg["channel"], "ts": []})
+            slot["ts"].append(msg["ts"])
+        for reply in msg.get("replies", ()):
+            _record(reply)
+
+    for msg in messages:
+        _record(msg)
+
+    accounts = sorted(occurrences)
+    profile_of = {
+        acct: (profiles_by_workspace.get(acct[0], {}).get(acct[1])) for acct in accounts
+    }
+
+    # Union-find clustering over mentioned accounts using deterministic
+    # evidence only; cluster confidence is the weakest edge that formed it.
+    parent = {acct: acct for acct in accounts}
+    confidence: dict[tuple[str, str], str] = {acct: "high" for acct in accounts}
+
+    def _find(acct):
+        while parent[acct] != acct:
+            parent[acct] = parent[parent[acct]]
+            acct = parent[acct]
+        return acct
+
+    def _union(a, b, level: str) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra == rb:
+            if _MATCH_CONFIDENCE_RANK[level] > _MATCH_CONFIDENCE_RANK[confidence[ra]]:
+                confidence[ra] = level
+            return
+        parent[rb] = ra
+        confidence[ra] = min(
+            (confidence[ra], confidence[rb], level), key=_MATCH_CONFIDENCE_RANK.__getitem__
+        )
+
+    for i, a in enumerate(accounts):
+        pa = profile_of[a]
+        if pa is None:
+            continue
+        for b in accounts[i + 1:]:
+            pb = profile_of[b]
+            if pb is None:
+                continue
+            a_email, b_email = pa.get("email_hash"), pb.get("email_hash")
+            if a_email and a_email == b_email:
+                _union(a, b, "high")
+                continue
+            if _normalize_name(_match_name(pa)) == _normalize_name(_match_name(pb)):
+                if _identity_conflict(pa, pb):
+                    continue
+                support = (
+                    (_normalize_name(pa.get("real_name")) and
+                     _normalize_name(pa.get("real_name")) == _normalize_name(pb.get("real_name")))
+                    or (_normalize_name(pa.get("name")) and
+                        _normalize_name(pa.get("name")) == _normalize_name(pb.get("name")))
+                )
+                _union(a, b, "high" if support else "medium")
+
+    clusters: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for acct in accounts:
+        clusters.setdefault(_find(acct), []).append(acct)
+
+    def _cluster_body(members: list[tuple[str, str]]) -> dict:
+        aliases = sorted({
+            _match_alias(profile_of[m]) if profile_of[m] else m[1] for m in members
+        })
+        workspaces: dict[str, dict] = {}
+        for workspace, uid in members:
+            for channel_id, slot in occurrences[(workspace, uid)].items():
+                channels = workspaces.setdefault(workspace, {"channels": {}})["channels"]
+                merged = channels.setdefault(channel_id, {"name": slot["name"], "message_ts": []})
+                merged["message_ts"].extend(slot["ts"])
+        for ws_entry in workspaces.values():
+            for channel in ws_entry["channels"].values():
+                channel["message_ts"] = sorted(set(channel["message_ts"]), key=float)
+        return {
+            "aliases": aliases,
+            "accounts": [list(m) for m in sorted(members)],
+            "workspaces": workspaces,
+        }
+
+    def _cluster_key(members: list[tuple[str, str]]) -> str:
+        names = sorted({
+            _match_name(profile_of[m]) if profile_of[m] else m[1] for m in members
+        })
+        return names[0]
+
+    # Distinct clusters left sharing a normalized name are exactly the
+    # conflict cases - emit them under one key, unmerged, flagged.
+    by_key: dict[str, list[tuple[str, list]]] = {}
+    for root, members in clusters.items():
+        key = _cluster_key(members)
+        norm = _normalize_name(key) or key
+        by_key.setdefault(norm, []).append((key, members))
+
+    index: dict[str, dict] = {}
+    for group in by_key.values():
+        if len(group) == 1:
+            key, members = group[0]
+            body = _cluster_body(members)
+            level = confidence[_find(members[0])]
+            body["match_confidence"] = level if all(profile_of[m] for m in members) else "unknown"
+            index[key] = body
+        else:
+            key = sorted(k for k, _ in group)[0]
+            identities = [
+                _cluster_body(members) for _, members in sorted(group, key=lambda g: sorted(g[1]))
+            ]
+            index[key] = {
+                "aliases": sorted({alias for ident in identities for alias in ident["aliases"]}),
+                "match_confidence": "ambiguous",
+                "identities": identities,
+            }
+
+    return dict(sorted(index.items()))
 
 
 def _build_workspace_activity_index(channels_meta: list[dict], activity_by_channel: dict[tuple, dict]) -> list[dict]:
@@ -979,7 +1181,7 @@ def build_digest(
     )
 
     return {
-        "schema_version": "slack-llm-digest-v2",
+        "schema_version": "slack-llm-digest-v3",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": {"from": date_from, "to": date_to, "days": days, "workspace_glob": workspace_glob},
         "manifest": {
@@ -1024,6 +1226,22 @@ def build_digest(
                     "full roster, and never merged across workspaces (a shared user id in two "
                     "workspaces gets two separate entries, one per workspace)."
                 ),
+                "posted_at_local": (
+                    "DST-aware America/Los_Angeles wall-clock timestamp, ISO-8601 with UTC offset. "
+                    "Replaces v2's posted_at_utc; UTC is derivable from either the offset in this "
+                    "value or the message's ts epoch."
+                ),
+                "mentions_index": (
+                    "top-level mentions key: inverted index keyed by canonical F3 name over users "
+                    "actually mentioned in this digest. Per entry: aliases (raw display forms), "
+                    "accounts ([workspace, user_id] pairs - ids stay workspace-local), "
+                    "match_confidence (high: email or name+real-name/username evidence; medium: "
+                    "name match only; unknown: no roster profile; ambiguous: same name, conflicting "
+                    "evidence - identities[] lists the unmerged clusters, never pooled), and "
+                    "workspaces -> channels -> message_ts (ascending ts only; counts, first/last "
+                    "dates, and Slack URLs are derived from ts + channel_id + workspace, never "
+                    "duplicated here). Message text/URLs are never stored in the index."
+                ),
             },
             "known_limitations": [
                 "Private or inaccessible channels may be absent",
@@ -1035,6 +1253,7 @@ def build_digest(
         "workspace_activity_index": _build_workspace_activity_index(channels_meta, activity_by_channel),
         "messages": messages,
         "user_index": _build_user_index(profiles_doc, referenced_ids_by_workspace),
+        "mentions": build_mentions_index(messages, profiles_doc),
         "leadership": leadership,
     }
 
@@ -1070,8 +1289,12 @@ def _slack_roles(user: dict) -> list[str]:
 def _clean_user(user: dict) -> dict:
     """Field-reduces a raw Slack user object to identity fields only -
     drops avatar URLs, email/phone, presence, enterprise_user, etc., same
-    noise-stripping philosophy as _clean() for messages."""
+    noise-stripping philosophy as _clean() for messages. email_hash is the
+    one exception to the email drop: a truncated one-way digest kept solely
+    so the mentions index can match the same person across workspaces
+    deterministically - the raw address is never persisted anywhere."""
     profile = user.get("profile") or {}
+    email = profile.get("email")
     return {
         "id": user["id"],
         "name": user.get("name"),
@@ -1080,6 +1303,7 @@ def _clean_user(user: dict) -> dict:
         "title": profile.get("title") or None,
         "deleted": user.get("deleted", False),
         "slack_roles": _slack_roles(user),
+        "email_hash": hashlib.sha256(email.strip().lower().encode()).hexdigest()[:12] if email else None,
     }
 
 
