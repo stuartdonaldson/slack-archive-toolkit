@@ -22,7 +22,7 @@ import re
 import sqlite3
 import tempfile
 from calendar import monthrange
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, AbstractSet
@@ -289,6 +289,69 @@ def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
     return f"https://{workspace}.slack.com/archives/{channel_id}/p{ts.replace('.', '')}"
 
 
+def generate_calendar_reference(date_from_str: str, date_to_str: str) -> dict[str, str]:
+    """Generates a dict mapping 'YYYY-MM-DD' to 'DayOfWeek' for every day
+    between date_from_str and date_to_str (inclusive) to help the LLM
+    avoid date/day-of-week hallucinations.
+    """
+    fmt = "%Y-%m-%d"
+    try:
+        start_dt = datetime.strptime(date_from_str, fmt)
+        end_dt = datetime.strptime(date_to_str, fmt)
+    except ValueError:
+        return {}
+
+    reference = {}
+    curr = start_dt
+    while curr <= end_dt:
+        date_str = curr.strftime(fmt)
+        day_name = curr.strftime("%A")
+        reference[date_str] = day_name
+        curr += timedelta(days=1)
+    return reference
+
+
+def derive_channel_category(name: str, description: str | None = None) -> tuple[str, str]:
+    name_lower = name.lower()
+    desc_lower = (description or "").lower()
+
+    if name_lower.startswith("ao-"):
+        return "ao", "channel name starts with ao-"
+    elif name_lower.startswith("event-"):
+        return "event", "channel name starts with event-"
+    elif name_lower == "events":
+        return "event", "channel name is events"
+    elif name_lower.startswith("all-f3-") or name_lower == "all-events" or name_lower == "all-pax":
+        return "all_region", "channel name matches regional all-hands pattern"
+    elif name_lower in ("1st-f", "1stf"):
+        return "first_f", "channel name is 1st-f"
+    elif name_lower in ("2nd-f", "2ndf"):
+        return "second_f", "channel name is 2nd-f"
+    elif name_lower in ("3rd-f", "3rdf"):
+        return "third_f", "channel name is 3rd-f"
+    elif name_lower in ("helpdesk", "help"):
+        return "helpdesk", "channel name matches help pattern"
+    elif name_lower == "mumblechatter":
+        return "mumblechatter", "channel name is mumblechatter"
+    elif name_lower == "classifieds":
+        return "classifieds", "channel name is classifieds"
+    elif "nation_bot_logs" in name_lower or "bot-logs" in name_lower:
+        return "bot_log", "channel name matches bot log pattern"
+
+    if "workout" in desc_lower or "beatdown" in desc_lower:
+        return "ao", "description mentions workout/beatdown"
+    if "event" in desc_lower:
+        return "event", "description mentions event"
+    if "first f" in desc_lower:
+        return "first_f", "description mentions first f"
+    if "second f" in desc_lower or "social" in desc_lower or "fellowship" in desc_lower:
+        return "second_f", "description mentions second f / social / fellowship"
+    if "third f" in desc_lower or "faith" in desc_lower or "service" in desc_lower or "study" in desc_lower:
+        return "third_f", "description mentions third f / faith / study"
+
+    return "unknown", "no matching patterns in name or description"
+
+
 def _channel_context(catalog: dict, channel_id: str) -> dict:
     """description/creator/created_at for one channel, read-only from an
     already-loaded catalog cache (no API call, no refresh - the digest
@@ -298,13 +361,19 @@ def _channel_context(catalog: dict, channel_id: str) -> dict:
     this module's posted_at_utc convention elsewhere."""
     channel = catalog["channels"].get(channel_id, {})
     created = channel.get("created")
+    name = channel.get("name") or ""
+    desc = channel.get("description") or ""
+    category, basis = derive_channel_category(name, desc)
     return {
         "description": channel.get("description") or None,
         "creator": channel.get("creator") or None,
         "created_at": (
             datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
         ),
+        "channel_category": category,
+        "channel_category_basis": basis,
     }
+
 
 
 _BLOCK_TAGS = {"p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "br"}
@@ -893,6 +962,7 @@ def build_digest(
                 {
                     "workspace": workspace, "channel": channel, "channel_id": channel_id,
                     "status": "missing_archive", "files": [], **channel_info,
+                    "is_probably_bot_or_log_channel": (channel_info.get("channel_category") == "bot_log"),
                 }
             )
             continue
@@ -910,11 +980,15 @@ def build_digest(
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
         messages.extend(cleaned)
+        is_bot = (channel_info.get("channel_category") == "bot_log") or (
+            activity_fields["total_message_count"] > 0 and activity["_human_total_message_count"] == 0
+        )
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
                 "status": "ok", "files": _load_channel_files(channel_dir), **channel_info,
                 **activity_fields,
+                "is_probably_bot_or_log_channel": is_bot,
             }
         )
 
@@ -963,6 +1037,7 @@ def build_digest(
                 "total_message_count": "root_message_count plus reply_count",
                 "activity_status": "active when total_message_count > 0 in export_scope, else inactive",
             },
+            "calendar_reference_2026": generate_calendar_reference(date_from, date_to),
             "known_limitations": [
                 "Private or inaccessible channels may be absent",
                 "User profile completeness depends on Slack profile data",

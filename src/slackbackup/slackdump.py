@@ -103,6 +103,6 @@ def resume(channel_dir: Path) -> None:
 def convert_export(channel_dir: Path, out_dir: Path) -> None:
     """`convert -f export` takes the archive *directory* (containing
     slackdump.sqlite) as its source, not the .sqlite file path itself."""
-    result = _run(["convert", "-f", "export", "-o", str(out_dir), str(channel_dir)])
+    result = _run(["convert", "-files=false", "-f", "export", "-o", str(out_dir), str(channel_dir)])
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump convert -f export failed: {result.stderr}")

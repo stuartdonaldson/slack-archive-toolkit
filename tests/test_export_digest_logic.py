@@ -518,9 +518,12 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
     assert meta == {
         "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok", "files": [],
         "description": None, "creator": None, "created_at": None,
+        "channel_category": "unknown",
+        "channel_category_basis": "no matching patterns in name or description",
         "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
         "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
         "activity_status": "active", "activity_status_basis": "has messages during export_scope",
+        "is_probably_bot_or_log_channel": False,
     }
 
 
@@ -789,6 +792,9 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
         {
             "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
             "files": [], "description": None, "creator": None, "created_at": None,
+            "channel_category": "unknown",
+            "channel_category_basis": "no matching patterns in name or description",
+            "is_probably_bot_or_log_channel": False,
         }
     ]
     assert result["messages"] == []
