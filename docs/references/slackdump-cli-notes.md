@@ -1,6 +1,6 @@
 # slackdump CLI — operational notes
 
-Consolidated, hard-won knowledge about the `slackdump` binary (v4.4.0) gathered while
+Consolidated, hard-won knowledge about the `slackdump` binary (v4.4.2) gathered while
 building this project's backup/export/file-harvesting tooling. Purpose: avoid
 re-discovering the same gotchas, costs, and command behavior in a future session.
 Organized by topic so a specific question ("how do I list channels without getting

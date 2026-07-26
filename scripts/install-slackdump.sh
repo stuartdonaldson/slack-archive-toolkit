@@ -2,7 +2,7 @@
 # Downloads and checksum-verifies a pinned slackdump release, installs to $INSTALL_DIR.
 set -euo pipefail
 
-VERSION="v4.4.0"
+VERSION="v4.4.2"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/bin}"
 
 case "$(uname -s)-$(uname -m)" in
