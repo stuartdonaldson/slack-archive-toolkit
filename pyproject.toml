@@ -3,7 +3,7 @@ name = "slackbackup"
 version = "1.0.0"
 description = "Local backup/export/catalog/search tooling for slackdump-archived Slack workspaces"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["pypdf"]
 
 [project.scripts]
 slackbackup = "slackbackup.cli:main"

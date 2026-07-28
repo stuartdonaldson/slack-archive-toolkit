@@ -14,8 +14,9 @@ LOG_FILE="$HOME/slack-backups/nightly.log"
 
 # Task Scheduler -> wsl.exe runs this non-interactively, so ~/.bashrc/.profile
 # are never sourced and PATH is minimal - slackdump (installed to ~/bin by
-# scripts/install-slackdump.sh) wouldn't otherwise be found.
-export PATH="$HOME/bin:$PATH"
+# scripts/install-slackdump.sh) and uv (installed to ~/.local/bin, used below
+# to run ./slackbackup in this project's own venv) wouldn't otherwise be found.
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
 # Defense-in-depth on top of backup_logic._log()'s explicit flush=True:
 # Python fully block-buffers stdout once it's not a tty (i.e. redirected
@@ -34,6 +35,7 @@ cp "$REPO_ROOT/docs/f3-culture.md" \
    "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
    "$REPO_ROOT/docs/newsletter-prompt.md" \
    "$REPO_ROOT/docs/slack-ingestion.md" \
+   "$REPO_ROOT/docs/slt-report.md" \
    "$HOME/slack-exports/"
 
 {

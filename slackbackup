@@ -1,7 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --project /home/stuar/proj/SlackArchiver python3
 """Repo-root convenience entry point - equivalent to `python -m slackbackup.cli`.
-Runs under whatever `python3` is on PATH (activate the project venv first); it
-inserts ./src itself, so no install is strictly required.
+The shebang runs this under `uv run` against this project's own venv (not
+whatever `python3` happens to be first on PATH - see nightly.log
+ModuleNotFoundError incidents 2026-07-26..07-28 for what that caused), so
+third-party deps like pypdf are always available regardless of caller PATH.
+It also still inserts ./src itself, so no separate install step is needed.
 """
 import sys
 from pathlib import Path
