@@ -31,6 +31,7 @@ def _base_args(**overrides) -> argparse.Namespace:
         as_of="2026-07-01",
         out=None,
         leadership_handler=None,
+        split_by_month=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -54,18 +55,30 @@ def _stub_profiles(monkeypatch, raise_for_glob=None):
         fake_build_digest.calls.append(days)
         return {"channels": [], "messages": []}
 
+    def fake_build_monthly_digests(
+        channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
+        catalog_cache_dir=None, handler=None, profiles_doc=None,
+    ):
+        fake_build_monthly_digests.calls.append(days)
+        return {
+            "2026-04": {"channels": [], "messages": [], "export_scope": {"month": "2026-04"}},
+            "2026-05": {"channels": [], "messages": [], "export_scope": {"month": "2026-05"}},
+        }
+
     fake_build_digest.calls = []
+    fake_build_monthly_digests.calls = []
 
     monkeypatch.setattr(export.export_logic, "build_user_profiles", fake_build_user_profiles)
     monkeypatch.setattr(export.export_logic, "build_digest", fake_build_digest)
-    return fake_build_digest
+    monkeypatch.setattr(export.export_logic, "build_monthly_digests", fake_build_monthly_digests)
+    return fake_build_digest, fake_build_monthly_digests
 
 
 # --- Change 1: --days default of 180, and --jobs per-job fallback ---
 
 
 def test_run_job_falls_back_to_args_days_when_job_omits_days(tmp_path, monkeypatch):
-    fake_build_digest = _stub_profiles(monkeypatch)
+    fake_build_digest, _ = _stub_profiles(monkeypatch)
     job_file = _write_job(tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"])
     job = export_logic.load_job(job_file)
     args = _base_args(days=180)
@@ -76,7 +89,7 @@ def test_run_job_falls_back_to_args_days_when_job_omits_days(tmp_path, monkeypat
 
 
 def test_run_job_uses_jobs_own_days_when_present(tmp_path, monkeypatch):
-    fake_build_digest = _stub_profiles(monkeypatch)
+    fake_build_digest, _ = _stub_profiles(monkeypatch)
     job_file = _write_job(tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"], days=30)
     job = export_logic.load_job(job_file)
     args = _base_args(days=180)
@@ -90,7 +103,7 @@ def test_run_job_uses_jobs_own_days_when_present(tmp_path, monkeypatch):
 
 
 def test_digest_jobs_batch_continues_after_one_job_fails(tmp_path, monkeypatch):
-    fake_build_digest = _stub_profiles(monkeypatch, raise_for_glob="f3fail")
+    fake_build_digest, _ = _stub_profiles(monkeypatch, raise_for_glob="f3fail")
 
     jobs_dir = tmp_path / "jobs"
     jobs_dir.mkdir()
@@ -114,7 +127,7 @@ def test_digest_jobs_batch_continues_after_one_job_fails(tmp_path, monkeypatch):
 
 
 def test_digest_jobs_batch_skips_job_with_non_list_workspaces(tmp_path, monkeypatch):
-    fake_build_digest = _stub_profiles(monkeypatch)
+    fake_build_digest, _ = _stub_profiles(monkeypatch)
 
     jobs_dir = tmp_path / "jobs"
     jobs_dir.mkdir()
@@ -167,3 +180,65 @@ def test_digest_direct_path_requires_workspace_when_no_jobs(tmp_path, capsys):
     assert exit_code == 2
     captured = capsys.readouterr()
     assert "--workspace is required unless --jobs is given" in captured.err
+
+
+# --- --split-by-month: one digest document per calendar month ---
+
+
+def test_digest_split_by_month_rejects_out_without_month_placeholder(tmp_path, monkeypatch, capsys):
+    _stub_profiles(monkeypatch)
+    args = _base_args(
+        archive_root=str(tmp_path), out=str(tmp_path / "digest.json"), split_by_month=True,
+    )
+
+    exit_code = export._digest(args)
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "{month}" in captured.err
+
+
+def test_digest_split_by_month_writes_one_file_per_month(tmp_path, monkeypatch):
+    _, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    out_template = str(tmp_path / "digest-{month}.json")
+    args = _base_args(archive_root=str(tmp_path), out=out_template, split_by_month=True)
+
+    exit_code = export._digest(args)
+
+    assert exit_code == 0
+    assert fake_build_monthly_digests.calls == [180]
+    assert (tmp_path / "digest-2026-04.json").exists()
+    assert (tmp_path / "digest-2026-05.json").exists()
+
+
+def test_digest_split_by_month_default_out_includes_month_placeholder(tmp_path, monkeypatch):
+    _, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    args = _base_args(archive_root=str(tmp_path), split_by_month=True)
+
+    exit_code = export._digest(args)
+
+    assert exit_code == 0
+    assert fake_build_monthly_digests.calls == [180]
+
+
+def test_run_job_split_by_month_uses_build_monthly_digests(tmp_path, monkeypatch):
+    fake_build_digest, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    job_file = _write_job(
+        tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"], split_by_month=True,
+        out=str(tmp_path / "job-out-{as_of}-{month}.json"),
+    )
+    job = export_logic.load_job(job_file)
+    args = _base_args(days=180)
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+
+    assert fake_build_monthly_digests.calls == [180]
+    assert fake_build_digest.calls == []
+    assert (tmp_path / "job-out-2026-07-01-2026-04.json").exists()
+    assert (tmp_path / "job-out-2026-07-01-2026-05.json").exists()
+
+
+def test_resolve_job_out_substitutes_month_placeholder():
+    resolved = export_logic.resolve_job_out("~/exports/digest-{as_of}-{month}.json", "2026-07-01", month="2026-04")
+
+    assert resolved.name == "digest-2026-07-01-2026-04.json"

@@ -20,6 +20,12 @@
  *   --dry-run   print the register commands, call nothing (AC4)
  *   --all       refresh every workspace, not just the stale ones (AC5 override)
  *
+ * Positional args:
+ *   <workspace>…  refresh only the named workspace(s), forced open regardless of
+ *                 probe state, leaving all others untouched — e.g.
+ *                 `npm run refresh -- f3nation`. Names normalize like the CLI
+ *                 (case-insensitive, https:// and .slack.com stripped).
+ *
  * The xoxd cookie is only ever held in memory and passed inline to slackdump —
  * never written to disk by this helper (AC7).
  */
@@ -36,11 +42,14 @@ import {
   classifySession,
   buildRegisterArgs,
   matchWorkspaceToken,
+  selectWorkspaces,
 } from './auth_logic.mjs';
 
 const DRY_RUN = process.argv.includes('--dry-run');
 const ALL = process.argv.includes('--all');
 const KEEPALIVE = process.argv.includes('--keepalive');
+// Positional (non-flag) args name specific workspace(s) to refresh; empty = all.
+const ONLY = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 const TOKENS_PATH = process.env.SLACKDUMP_TOKENS || path.join(os.homedir(), '.slackdump-tokens.json');
 const PROFILE_DIR = process.env.SLACKDUMP_AUTH_PROFILE || path.join(os.homedir(), '.cache', 'slackdump-auth-profile');
 const SLACKDUMP = process.env.SLACKDUMP_BIN || 'slackdump';
@@ -144,10 +153,23 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`Probing ${workspaces.length} workspace session(s)…`);
+  // Positional selectors scope the run to specific workspace(s); those are then
+  // forced open regardless of their probe state (you asked for them by name, so
+  // refresh them even if the session still looks valid). --all forces the whole
+  // list open the same way. Without either, only genuinely-stale workspaces open.
+  const selected = selectWorkspaces(workspaces, ONLY);
+  if (ONLY.length > 0 && selected.length === 0) {
+    console.error(`No workspace in ${TOKENS_PATH} matches: ${ONLY.join(', ')}`);
+    console.error(`Known workspaces: ${workspaces.join(', ')}`);
+    process.exit(1);
+  }
+  const force = ALL || ONLY.length > 0;
+
+  const scope = ONLY.length > 0 ? `${selected.length} selected` : `${workspaces.length}`;
+  console.log(`Probing ${scope} workspace session(s)…`);
   const needing = [];
-  for (const ws of workspaces) {
-    const state = ALL ? 'stale' : probe(ws);
+  for (const ws of selected) {
+    const state = force ? 'stale' : probe(ws);
     const mark = state === 'valid' ? 'OK' : state === 'stale' ? 'NEEDS LOGIN' : 'ERROR (skipped)';
     console.log(`  ${ws.padEnd(24)} ${mark}`);
     if (state === 'stale') needing.push(ws);

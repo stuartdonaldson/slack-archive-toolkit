@@ -101,3 +101,27 @@ export function classifySession({ exitCode, stderr = '' } = {}) {
 export function buildRegisterArgs(workspace, token, cookie) {
   return ['workspace', 'new', '-token', token, '-cookie', cookie, workspace];
 }
+
+/** Normalize a workspace name/selector the same way the Python CLI's
+ *  workspace_logic.normalize does: lowercase, drop a leading https:// and a
+ *  trailing .slack.com, so 'F3Nation', 'f3nation', and
+ *  'https://f3nation.slack.com' all resolve to the same key. */
+export function normalizeWorkspace(raw) {
+  return String(raw)
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\.slack\.com$/, '');
+}
+
+/** Filter the full workspace list down to those named in `filters` (positional
+ *  CLI selectors). Empty/omitted filters -> the list unchanged (refresh-all
+ *  behavior). Matching is by normalized name; the result preserves the input
+ *  list's order, and a filter that matches nothing simply contributes nothing
+ *  (the caller is responsible for warning on an empty selection). */
+export function selectWorkspaces(workspaces, filters) {
+  if (!Array.isArray(workspaces)) return [];
+  if (!filters || filters.length === 0) return workspaces;
+  const wanted = new Set(filters.map(normalizeWorkspace));
+  return workspaces.filter((ws) => wanted.has(normalizeWorkspace(ws)));
+}

@@ -13,7 +13,7 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from . import catalog_logic, channel_logic, slackdump
+from . import catalog_logic, channel_logic, selector_logic, slackdump
 
 
 # Tiered backup cadence (SlackBackup-2ut). MODIFIABLE — the whole point is
@@ -246,6 +246,8 @@ def run(
     full: bool = False,
     cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
     today: date | None = None,
+    workspace_selector: str | None = None,
+    channel_selector: str | None = None,
 ) -> bool:
     """Returns True if every channel backed up successfully. Within each
     workspace, channels are ordered most-recently-active first (real
@@ -259,6 +261,27 @@ def run(
     others are being worked, instead of exhausting one bucket completely
     before moving to the next."""
     entries = channel_logic.validate(channels_file)
+
+    # Optional subset selectors (same comma-separated glob semantics as
+    # `export digest --workspace` - see selector_logic.matches_selector).
+    # Applied before the catalog warm-up and cadence/recency pipeline so
+    # everything downstream only ever sees the requested subset. An explicit
+    # selector that matches nothing is an error rather than a silent no-op,
+    # so a typo'd workspace/channel name doesn't look like a successful run
+    # that quietly backed up zero channels.
+    if workspace_selector is not None:
+        entries = [e for e in entries if selector_logic.matches_selector(workspace_selector, e["workspace"])]
+    if channel_selector is not None:
+        entries = [e for e in entries if selector_logic.matches_selector(channel_selector, e["name"])]
+    if (workspace_selector is not None or channel_selector is not None) and not entries:
+        parts = []
+        if workspace_selector is not None:
+            parts.append(f"--workspace '{workspace_selector}'")
+        if channel_selector is not None:
+            parts.append(f"--channel '{channel_selector}'")
+        raise channel_logic.ChannelError(
+            f"no channels in {channels_file} match {' and '.join(parts)}"
+        )
 
     # Warm each workspace's fast-tier catalog, but don't let one workspace with
     # an expired session abort the whole multi-workspace run - skip it and carry
@@ -283,18 +306,40 @@ def run(
         workspace = entry["workspace"]
         if workspace not in catalog_cache:
             catalog_cache[workspace] = catalog_logic.load(cache_dir, workspace)
-    entries = sorted(
-        entries,
-        key=lambda e: catalog_logic.effective_recency(catalog_cache[e["workspace"]], e["id"]),
-        reverse=True,
-    )
-    entries = _interleave_by_workspace(entries)
 
     all_ok = not skipped_workspaces
     counts = {"archive": 0, "resume": 0, "failed": 0, "skipped": 0}
     run_start = time.monotonic()
     today = datetime.now(timezone.utc).date() if today is None else today
     today_iso = today.isoformat()
+
+    # Cadence filter runs first, against the full unsorted/uninterleaved entry
+    # list, so the recency sort, interleaving, and per-workspace progress
+    # counters below only ever see channels actually being checked tonight -
+    # skipped channels no longer distort the interleaving order or inflate
+    # the X/Y counts of the channels that do get processed.
+    total_entries = len(entries)
+    due_entries = []
+    for entry in entries:
+        workspace = entry["workspace"]
+        record = catalog_cache[workspace].get("channels", {}).get(entry["id"], {})
+        # -full always re-syncs; the cadence filter only governs incremental runs.
+        if not full and not should_check_tonight(entry, record, today):
+            _log(
+                f"backup run: skipping {entry['name']} ({entry['id']}) in {workspace} "
+                "- not due tonight (cadence)"
+            )
+            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "skip")
+            counts["skipped"] += 1
+            continue
+        due_entries.append(entry)
+
+    entries = sorted(
+        due_entries,
+        key=lambda e: catalog_logic.effective_recency(catalog_cache[e["workspace"]], e["id"]),
+        reverse=True,
+    )
+    entries = _interleave_by_workspace(entries)
 
     # Per-workspace progress: X/Y where Y is how many channels this run handles
     # for the workspace and X the running position within it. Entries interleave
@@ -310,16 +355,6 @@ def run(
         workspace = entry["workspace"]
         ws_seen[workspace] += 1
         progress = f"[{ws_seen[workspace]}/{ws_totals[workspace]} in {workspace}]"
-        record = catalog_cache[workspace].get("channels", {}).get(entry["id"], {})
-        # -full always re-syncs; the cadence filter only governs incremental runs.
-        if not full and not should_check_tonight(entry, record, today):
-            _log(
-                f"backup run: skipping {entry['name']} ({entry['id']}) in {workspace} "
-                f"{progress} - not due tonight (cadence)"
-            )
-            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "skip")
-            counts["skipped"] += 1
-            continue
 
         _log(f"backup run: backing up {entry['name']} ({entry['id']}) in {workspace} {progress}")
         channel_start = time.monotonic()
@@ -346,7 +381,7 @@ def run(
         f", {len(skipped_workspaces)} workspace(s) skipped" if skipped_workspaces else ""
     )
     _log(
-        f"backup run: done - {len(entries)} channel(s), {counts['archive']} archive(s), "
+        f"backup run: done - {total_entries} channel(s), {counts['archive']} archive(s), "
         f"{counts['resume']} resume(s), {counts['skipped']} not-due skip(s), "
         f"{counts['failed']} failure(s){skipped_note}, {total_elapsed / 60:.1f} min total"
     )

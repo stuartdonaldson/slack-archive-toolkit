@@ -85,7 +85,9 @@ against this vision, not an accepted shortcut.
 - **Per-channel incremental backup** (`backup run/status`) — archives a channel on first
   contact, resumes incrementally thereafter, auto-heals a channel stuck on an unresumable empty
   archive, processes a multi-channel run most-recently-active-first, and logs timestamped
-  progress plus a final summary — see `docs/DESIGN.md`.
+  progress plus a final summary. `backup run` accepts optional `--workspace`/`--channel`
+  comma-separated glob selectors to back up a subset of `channels.json` (both AND together;
+  an explicit selector matching nothing errors) — see `docs/DESIGN.md`.
 - **Monthly export** (`export monthly`) — turn one archived channel into bounded, sealed,
   idempotent per-month JSON files with thread replies nested under their parent — see
   `docs/DESIGN-export.md`.

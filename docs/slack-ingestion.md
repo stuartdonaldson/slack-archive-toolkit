@@ -108,6 +108,26 @@ Use concise labels:
 
 Be concise and source-grounded. Use tables for people, roles, channels, sites, or regions. Include full clickable links for referenced Slack messages/channels/files whenever available. State uncertainty clearly. Do not invent missing details or over-report weak signals.
 
+## Slack Message Formatting
+
+When asked to prepare content to be posted in Slack:
+
+* Do not use Markdown tables. Slack handles pasted tables poorly.
+* Prefer short bulleted lists with one complete item per line.
+* Keep related information on the same line when practical.
+* Use bold labels to make entries easy to scan.
+* Include descriptive clickable links rather than raw URLs.
+* Write in standard Markdown so links and basic formatting are retained when copied from a rendered Markdown response and pasted into Slack.
+* Avoid complex indentation, nested lists, columns, footnotes, and decorative formatting.
+* Keep paragraphs short and add blank lines only when they improve readability.
+
+Preferred format:
+
+* **Region:** Name — [Provenance description](link)
+* **Role:** Person — [Source](link)
+
+Unless another format is requested, optimize the response for direct copy and paste into a Slack message.
+
 # Initial response
 
 After ingestion, respond only with:
@@ -118,4 +138,5 @@ After ingestion, respond only with:
 4. Obvious gaps or limitations
 
 Keep it brief. Do not generate a newsletter, event digest, or leadership report until asked.
+
 

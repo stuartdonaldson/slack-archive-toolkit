@@ -367,3 +367,80 @@ Rationale: du5's code/tests/docs were already complete in the working tree from 
 Outcome [developer-facing]: Verified against real archives — regenerated f3-pugetsound (17.2MB vs 22.6MB v2 baseline, 15998 messages/383 channels), dungeon-fh, and f3-nation digests; confirmed schema_version v3, no `posted_at_utc` field anywhere, `mentions` index well-formed (642 entries: 631 high, 11 ambiguous, correct structure), the known Block Kit backblast (f3kirkland ao-heritage-park, ts 1783887179.871339) now carries all 14 mentions and is indexed, and zero raw email leakage across 13,087 user profiles (all carry `email_hash`). Full suite green (320 tests).
 Outcome [user-facing]: Digest consumers (the newsletter LLM prompt) get a smaller v3 digest file plus a top-level cross-workspace mention index for "where/when is this PAX mentioned" queries.
 Outcome [internal]: Committed all v3 work as one commit (cc5f2db) and closed five beads together — SlackBackup-1sx, vv0, du5, rie, 1cw — since they were all facets of the same uncommitted change.
+## 2026-07-18 00:00:00
+_session aaba9b40 · v3 · 07-17_
+
+### Objective 1: Filter due channels before the backup loop, not during it
+Rationale: The cadence-based skip logic ran inside the per-channel processing loop, so skipped channels still occupied a slot in the recency sort, cross-workspace interleaving, and per-workspace X/Y progress counters — making progress counts and interleave spacing inaccurate for the channels actually being backed up. Moving the `should_check_tonight` filter to a pre-pass, before sort/interleave, keeps those downstream calculations scoped to only the channels really processed.
+Outcome [developer-facing]: `run()` in src/slackbackup/backup_logic.py now filters entries for cadence-due status first, then sorts by recency and interleaves only the due set; progress counters (`ws_totals`/`ws_seen`) and interleave order reflect only processed channels. Total-channel count in the final summary log preserved via a `total_entries` count captured before filtering. All 47 backup-related tests pass unchanged.
+
+## 2026-07-22 10:11:22
+_session ba389005 · v3 · 07-18→07-22_
+
+### Objective 1: Add `--workspace`/`--channel` subset selectors to `backup run`
+Rationale: Started from "what's a quick way to update one or more channels and regenerate the f3pugetsound digest only?" — the only path was a hand-filtered channels.json or knowing channel IDs. Developer chose the durable fix: "yes do the enhancement to backup", and clarified the channel selector's shape mid-implementation — "the channel should be able to use wildcards and comma separated channel names". Filters apply before the catalog warm-up and cadence/recency pipeline (digest `--workspace` semantics); both AND together; an explicit selector matching nothing raises rather than silently backing up zero channels.
+Outcome [user-facing]: `backup run channels.json <root> --workspace f3pugetsound --channel '1st-f,mumble*'` now backs up a subset; empty match exits 1 with a clear message; omitting both is byte-identical to prior behavior.
+Outcome [developer-facing]: `backup_logic.run()` gained `workspace_selector`/`channel_selector` via `selector_logic.matches_selector`; 5 new tests; `docs/CONTEXT.md` capability note. SlackBackup-0z2 (closed). Full suite 325 passed.
+
+### Objective 2: Audit the nightly log for correctness and performance options  [accreted]
+Transition: developer redirected to operations once the code change landed — "look at the ~/slack-backups/nightly log and see if everything worked as expected and if there are any options you see for improving performance".
+Rationale: Establish whether the unattended backup+digest is healthy and where the wall-clock time actually goes before proposing any optimization.
+Outcome [internal]: 2026-07-21 run was functionally clean — 391 channels, 0 failures, all 3 digests regenerated with 0 missing archives. Surfaced one defect (keepalive.sh exit 126, see Obj 3) and quantified the performance profile: ~229 of 264 processed channels cluster at a fixed ~13s floor (≈68% of the 74-min backup), processing is strictly sequential despite per-workspace rate limits, and f3pugetsound is ~47% of the work. Recommended cross-workspace parallelism (~2.4× estimated) as the main lever; per-channel-floor investigation as a measured second.
+Open: parallelism enhancement recommended but not filed or implemented.
+
+### Objective 3: Fix keepalive.sh and reset auth  [accreted]
+Transition: the log audit found keepalive.sh had been failing `Permission denied` (exit 126) for 12 nights; developer directed the fix + a live auth reset — "fix keepalive.sh and run it so we reset our auth".
+Rationale: The headless auth keep-alive never ran, so sessions survived only by cookie longevity — one rotation from a stranded backup. Restore the exec bit (git-tracked mode) and run it to prove the path.
+Outcome [user-facing]: `keepalive.sh` exec bit restored (staged `100644→100755`); ran clean (exit 0), cookie still valid, 8/8 profile-present workspaces re-registered; preflight confirmed all 9 valid. f3nation (absent from the browser profile) then registered manually from a pasted token+cookie — developer supplied the `xoxd-` cookie in-chat despite the caution, so a credential-rotation reminder was issued.
+Open: f3nation is a separate identity from the shared-cookie set — whether the account is the same was left unresolved here.
+
+### Objective 4: Add a targeted workspace selector to refresh-auth  [accreted]
+Transition: onboarding f3nation into the persistent profile via `npm run refresh` meant clicking ENTER through all 9 workspaces; developer wanted it scoped — "can you do an npm refresh on f3nation specifically? i don't want to have to manually login again to each workspace".
+Rationale: refresh-auth had only all-or-stale modes. Positional workspace name(s) now scope the run and force just those open regardless of probe state, folding a single workspace into the profile so headless keep-alive picks it up thereafter — without touching the other 8.
+Outcome [user-facing]: `npm run refresh -- f3nation` refreshes only the named workspace(s); names normalize like the CLI (case/`https://`/`.slack.com`); unknown name exits 1 before any browser. README documented.
+Outcome [developer-facing]: pure `selectWorkspaces()`/`normalizeWorkspace()` in `auth_logic.mjs` (5 new tests, 18 total pass); CLI wiring in `refresh-auth.mjs` verified live up to the browser boundary. SlackBackup-b31 (closed).
+Open: a dry-run keep-alive showed the profile now parses 9 teams (was 8) and would register f3nation with the *shared* cookie — validity of that for f3nation is unverified; a controlled real-keepalive+preflight test was offered, not yet run. Nothing from this session is committed or pushed.
+
+### Key Learnings:
+slackdump imposes a fixed ~13s per-channel floor on archive/resume independent of new-message volume — the dominant cost of a multi-channel backup, not data transfer.
+keepalive keys off the *parsed* team count in the persistent Chromium profile's `localConfig_v2` (`parseXoxcTokens`), not a raw leveldb substring match — the profile string can linger for a workspace that no longer parses as a team; the authoritative check is `node refresh-auth.mjs --keepalive --dry-run`.
+## 2026-07-23 00:00:00
+_session 99a0714d · v3 · 07-23_
+
+### Objective 1: Split the f3pugetsound digest job into one document per calendar month
+Rationale: The nightly f3pugetsound job produces one complete merged digest across all workspaces/channels; the user wanted it broken down by month instead, with the constraint that "as new content is added, replies may come in the following month, so a reply belongs in the month where the original message started."
+Outcome [developer-facing]: Added `export_logic.build_monthly_digests` + `partition_messages_by_month`, refactoring `build_digest`'s body into shared `_gather_digest_data`/`_assemble_digest` phases so both entry points reuse the same channel-loading and assembly logic. A message's month is decided by its thread root's ts, not its own ts, so a reply landing in a later calendar month stays nested under its parent in the parent's month file rather than getting its own entry or being double-counted.
+Outcome [user-facing]: New `export digest --split-by-month` CLI flag and job-file `split_by_month` field; `out`/`--out` must contain a literal `{month}` placeholder, validated up front (`load_job`/`_digest`) to avoid one file being silently overwritten every month.
+Outcome [developer-facing]: 16 new tests (bucketing rule including the cross-month-reply fixture case, per-month activity recomputation, CLI wiring, job validation); full suite 337 passed. `docs/DESIGN-export.md` gained a "Monthly digest splitting" section.
+Outcome [internal]: `jobs/f3-pugetsound.json` (gitignored operator config) switched to `split_by_month: true` with `out` now containing `{month}`, so the actual nightly job matches the request.
+## 2026-07-23 12:00:00
+_session 99a0714d · v3 · 07-23_
+
+### Objective 1: Render CHANGELOG.md for the period since the last cut
+Rationale: User asked to "update changelog" following the split-by-month digest work. The draft `changelog-generate` skill's coverage check found the 2026-07-11→07-23 range 100% v3-tagged (a first — the seed dry run was 1/17), so the render proceeded without inferring any facing tags, unlike the prior partial-coverage section already in the file.
+Outcome [user-facing]: New `## [Unreleased] — 2026-07-11 to 2026-07-23` section prepended to CHANGELOG.md (digest v2→v3 evolution, `--split-by-month`, backup/export selectors, keepalive.sh fix), each section now carrying its own inline `_Coverage: ..._` line instead of one file-wide caveat.
+Outcome [internal]: Logged the run to `~/.claude/skills/changelog-generate/feedback-log.md` per the skill's draft-usage protocol (signal: works-as-designed, provisional pending user reaction).
+
+### Objective 2: Generate the f3pugetsound monthly digest  [accreted]
+Transition: Immediate follow-on request once the split-by-month feature and changelog were done — verify the feature against the real archive.
+Rationale: Prove `export digest --split-by-month` end-to-end against the actual `jobs/f3-pugetsound.json` job (updated earlier this session to `split_by_month: true`), not just the unit-test fixtures.
+Outcome [user-facing]: `./slackbackup export digest --archive-root ~/slack-backups --jobs 'jobs/f3-pugetsound.json'` produced 5 monthly digest files (2026-03 through 2026-07) plus the companion user-profiles file in `~/slack-exports/` — 0 missing archives across all 7 workspaces / 383 channels in every month.
+## 2026-07-28 10:35:00
+_session 5547f9d2 · v3 · 07-28_
+
+### Objective 1: Diagnose and fix the nightly backup failure
+Rationale: User reported nightly backups weren't happening and pointed at `~/slack-backup/nightly.log` (a typo for the real path). `~/slack-backups/nightly.log` showed three straight failed nights (07-26 through 07-28): both `backup run` and `export digest` crashed at import time with `ModuleNotFoundError: No module named 'pypdf'`. Root cause was two-layered: `pypdf` had been added as an `import` in `export_logic.py` (uncommitted, part of the file-content-extraction work — see Objective 2) without ever being installed anywhere the nightly Scheduled Task could reach, and the `./slackbackup` entry point's shebang ran under "whatever `python3` is first on PATH" rather than this project's own venv. Developer pushed back on my first fix (prefixing the nightly script's calls with `uv run --project`) — "shouldn't slackbackup be running from the correct virtual environment?" — which pointed at the right layer: fix the entry point itself, not every caller of it.
+Rejected: wrapping only `scripts/nightly-backup-digest.sh`'s two `./slackbackup` invocations with `uv run --project`. Works for that one script but leaves the same trap for any other invocation (manual runs, other tooling).
+Outcome [developer-facing]: `./slackbackup`'s shebang is now `#!/usr/bin/env -S uv run --project /home/stuar/proj/SlackArchiver python3`, so it always resolves this project's own venv (and its dependencies) regardless of caller PATH. Verified against a stripped-down PATH matching the Scheduled Task's environment. Nightly script's PATH also gained `~/.local/bin` so the shebang's own `uv` can be found. Full suite (347 tests) green.
+Outcome [internal]: Committed as 4bea0a4 and pushed to origin/main.
+
+### Objective 2: Backfill work-log/CHANGELOG for accumulated uncommitted feature work  [accreted]
+Transition: developer asked to "look at the other changes and update the work log and changelog then commit" — a large amount of prior work (multiple untracked sessions) had accumulated in the working tree with no log entries and was never committed.
+Rationale: `git diff` on the remaining tracked files showed real completed feature work with tests already passing, not work-in-progress scaffolding: attached-file content extraction (PDF via `pypdf`, docx/pptx/xlsx via stdlib `zipfile` + regex over OOXML text runs) so an LLM digest reader gets a document's substance, not just its filename/link; images are now included in a channel's `files[]` (metadata + `local_path` only, no extraction) instead of being filtered out entirely; and `export monthly`/`export digest`/`export users` all gained a `~/slack-backups` default for `--archive-root` (and `--out` defaults accordingly) so the common case no longer needs the flag spelled out every time. A companion doc, `docs/slt-report.md`, was added as a new LLM prompt template (Senior Leadership Team report) alongside the existing newsletter/FNG/culture prompt docs, and `docs/slack-ingestion.md` gained a "Slack Message Formatting" section (no Markdown tables, prefer short bulleted lists) for content meant to be pasted back into Slack.
+Outcome [user-facing]: `export monthly --archive-root`/`export digest --archive-root`/`export users --archive-root` are now optional (default `~/slack-backups`); a channel's Canvas/file listing includes images (with `local_path` when the blob was downloaded) alongside PDFs/Office docs/plain text, and PDF/docx/pptx/xlsx attachments now carry extracted `content` text in the digest. New `docs/slt-report.md` prompt template for SLT reports; `docs/slack-ingestion.md` documents Slack-safe formatting conventions.
+Outcome [developer-facing]: `export_logic.py` gained `_extract_pdf_text`/`_extract_zip_xml_text`/`_extract_file_content` dispatch and `_resolve_local_path`; `_load_channel_files` no longer filters out `image/*`. 19 new tests across content extraction, local_path resolution, and the existing monthly-split assembly path. `pypdf` is now a declared `pyproject.toml`/`uv.lock` dependency (the gap that caused Objective 1's failure).
+Outcome [internal]: A live-archive survey (2026-07-24, 483 channel databases) informed scoping extraction to PDF/docx/pptx/xlsx (46 files, ~31 MB) rather than images/video (5,539 images/12.3 GB, 243 videos/6.8 GB, would need a vision/audio model, out of scope) — noted in `docs/DESIGN-export.md` but not previously captured in this log since the originating session(s) predate this entry and were never logged.
+Open: rationale for this objective is reconstructed from the code diff and docs, not from the original developer's own words — no prior work-log entry or session transcript exists for this work to quote from.
+
+### Key Learnings:
+`env -S uv run --project <path> python3` in a shebang line resolves a project's own venv (installing/syncing it on demand if needed) even when the invoking shell's PATH has no reference to that project at all — a more robust fix than requiring every caller to remember `uv run --project`.

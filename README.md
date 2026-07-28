@@ -87,15 +87,15 @@ you register or re-register.
 
 Per-channel-month exports (a different, narrower artifact than the digest below) are
 also available: `./slackbackup export monthly --from ... --to ... --workspace ...
---channel ... --archive-root ~/slack-backups --out ~/slack-exports`.
+--channel ... --out ~/slack-exports` (`--archive-root` defaults to `~/slack-backups`).
 
 ### 5. Generate the digest
 
 ```bash
-./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*'
+./slackbackup export digest --workspace 'f3*'
 # -> ~/slack-exports/f3-digest-<today>.json
-# Defaults: trailing 180 days. --workspace is required unless --jobs is given.
-# Override with --days, --as-of, --out.
+# Defaults: --archive-root ~/slack-backups, trailing 180 days.
+# --workspace is required unless --jobs is given. Override with --archive-root, --days, --as-of, --out.
 ```
 
 One merged JSON document: all in-range messages with thread nesting, per-channel and
@@ -112,10 +112,10 @@ job. This is what the nightly script runs after the blanket digest. See
 ### 6. Generate the user profile report
 
 ```bash
-./slackbackup export users --archive-root ~/slack-backups --workspace 'f3*'
+./slackbackup export users --workspace 'f3*'
 # -> ~/slack-exports/f3-user-profiles-<today>.json
-# --workspace is required.
-# Override with --out.
+# Defaults: --archive-root ~/slack-backups. --workspace is required.
+# Override with --archive-root, --out.
 ```
 
 The full per-workspace user roster — display names, profile titles, Slack account roles

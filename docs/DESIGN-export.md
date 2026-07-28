@@ -283,16 +283,33 @@ the digest stays purely local and never triggers a Slack API call of its own; if
 never warmed for a channel (e.g. a fresh checkout with no `~/.cache/slackbackup/`), those fields
 are simply `null` rather than blocking on a live fetch.
 
-### Non-image files & Canvases — read from the archive's own `FILE` table, not `convert`
+### Files & Canvases (all types, including images) — read from the archive's own `FILE` table, not `convert`
 
 `slackdump convert -f export` never surfaces a channel-level Canvas at all: a Canvas isn't a
 reply to any message (`FILE.MESSAGE_ID` is empty for it, per the table's own comment), so it has
 no anchor in the message-export day files. `_load_channel_files` instead reads
-`slackdump.sqlite`'s `FILE` table directly, filters out images, and for HTML-like content
-(Canvases — real HTML on disk despite the `application/vnd.slack-docs` mimetype — and plain
-`text/*`) extracts a `content` field so an LLM can read the file's substance, not just its name.
-PDFs, videos, and external links with no downloaded blob stay metadata-only (`content: null`) —
-extracting those would need a new dependency (e.g. a PDF text layer reader), not yet justified.
+`slackdump.sqlite`'s `FILE` table directly — every file, images included — and resolves
+`local_path` (relative to the archive root) whenever the blob was actually downloaded by
+`slackdump archive`/`resume` (default `-files=true`; see `docs/references/slackdump-cli-notes.md`).
+
+Content extraction (`_extract_file_content`) additionally populates a `content` field, so an LLM
+can read the file's substance and not just its name, for the types cheap to read without a heavy
+dependency:
+
+| Mimetype | Method |
+|---|---|
+| `application/vnd.slack-docs` (Canvas), `text/html` | stdlib `HTMLParser`, block/table-aware text extraction |
+| `text/*` | read verbatim |
+| `application/pdf` | `pypdf` page text extraction (a declared project dependency) |
+| `.docx`/`.pptx`/`.xlsx` (OOXML) | these are just zip archives of XML — stdlib `zipfile` + a regex over `<w:t>`/`<a:t>` text runs (docx/pptx) or `sharedStrings.xml` (xlsx); no new dependency |
+
+Everything else — images, video, audio, external links with no downloaded blob — stays
+metadata-only (`content: null`) but still carries `local_path` when the blob exists, so a reader
+or downstream tool can open it directly even without extracted text. A survey of live archives
+(2026-07-24, 483 channel databases) found the PDF/docx/pptx/xlsx corpus small (46 files, ~31 MB)
+and images/video dominant by volume (5,539 images/12.3 GB, 243 videos/6.8 GB) — extraction was
+scoped to the former; the latter get no OCR/transcription (out of scope, would need a vision/audio
+model, not a parser).
 
 Cross-referencing a post to a file it mentions needs no extra index: Slack embeds the literal
 permalink in a message's raw text (e.g. `<https://f3pugetsound.slack.com/docs/T.../F...|Q
@@ -414,7 +431,8 @@ decision). v3 makes three changes:
   ],
   "messages": [
     { "ts": "1718...", "user": "U123", "display_name": "Jane Doe", "text": "...text <@U456> check <https://example.com|this>",
-      "files": [ { "id": "F...", "name": "photo.jpg", "filetype": "jpg", "permalink": "https://..." } ],
+      "files": [ { "id": "F...", "name": "photo.jpg", "filetype": "jpg", "permalink": "https://...",
+                   "local_path": "f3pugetsound/ao-active-book-club/__uploads/F.../photo.jpg" } ],
       "reactions": [ { "name": "+1", "count": 2, "users": ["U456", "U789"] } ],
       "edited": { "user": "U123", "at_utc": "2026-06-21T08:05:00Z" },
       "subtype": "channel_join",
@@ -595,7 +613,7 @@ unsupported type) can specify:
 | Field | Meaning | Fallback if absent |
 |-------|---------|--------------------|
 | `type` | Must be `"digest"` | — (required) |
-| `archive_root` | Archive root to read | `--archive-root` |
+| `archive_root` | Archive root to read | `--archive-root` (itself defaults to `~/slack-backups`) |
 | `channels_file` | `channels.json` to select from | `--channels-file` |
 | `workspaces` | Explicit workspace list (used as the selector) | `--workspace` |
 | `channels` | Channel selector within those workspaces | `*` |
@@ -603,13 +621,41 @@ unsupported type) can specify:
 | `out` | Output path; supports an `{as_of}` template placeholder | — (required) |
 | `users_out` | Companion user-profiles JSON path (also `{as_of}`-templated) | none — no roster written |
 | `leadership_handler` | Handler name for tagging/leadership (see §Pluggable leadership handlers) | `none` (opt-in per job) |
+| `split_by_month` | Write one digest document per calendar month instead of one merged document (see §Monthly digest splitting) | `false` |
 
 Path handling: `expand_job_path` does `~`/`$VAR` expansion on any path read from a job file, and
-`resolve_job_out` applies `{as_of}` templating before that expansion. When `users_out` is set,
-the companion roster is written from **one shared** `build_user_profiles` call also used to build
-the digest, avoiding converting every workspace's archive twice. All job-file parsing lives in
-Python, not bash/jq. The nightly script (`scripts/nightly-backup-digest.sh`) forwards
-`--jobs "$REPO_ROOT/jobs/*.json"` after its blanket digest/users export.
+`resolve_job_out` applies `{as_of}` (and, when splitting by month, `{month}`) templating before
+that expansion. When `users_out` is set, the companion roster is written from **one shared**
+`build_user_profiles` call also used to build the digest, avoiding converting every workspace's
+archive twice. All job-file parsing lives in Python, not bash/jq. The nightly script
+(`scripts/nightly-backup-digest.sh`) forwards `--jobs "$REPO_ROOT/jobs/*.json"` after its blanket
+digest/users export.
+
+### Monthly digest splitting (`split_by_month` / `--split-by-month`)
+
+`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v3` schema as
+`build_digest`, but as a `{month: document}` mapping instead of one merged document — one file per
+calendar month (`export_scope.month` is stamped on each). It shares `build_digest`'s first phase
+(`_gather_digest_data`: converts every matched channel's archive once, range-bounds, and
+thread-nests) and only differs in the second phase: `partition_messages_by_month` buckets the
+already-nested top-level message list by **each root message's own month**, then
+`_assemble_digest` runs once per bucket to recompute that month's `channels[]` activity counts,
+`workspace_activity_index`, `user_index`, and `mentions` against just that month's slice.
+
+Because a message's month is decided by its **thread root**, not by the message's own `ts`, a
+reply that lands in a later calendar month than its parent stays nested under that parent in the
+parent's month file — it never gets its own top-level entry in the later month, and is not
+double-counted in that later month's activity totals. `leadership` is identical across every
+month's file (it reflects current roster roles, not per-period activity), and channel-level
+`files[]`/Canvases are attached to every month a channel appears in rather than being split by a
+file's own upload date, since files aren't message-anchored the way threads are.
+
+CLI: `export digest --split-by-month` (direct path) or a job's `"split_by_month": true` (jobs
+path). Either way, `out` **must** contain a literal `{month}` placeholder — `load_job` (jobs path)
+and `_digest` (direct path) both reject the run up front otherwise, rather than silently
+overwriting one file every month. The direct path's default `--out`
+(`~/slack-exports/f3-digest-<as_of>.json`) gains a `-{month}` suffix automatically when
+`--split-by-month` is given without an explicit `--out`.
 
 ---
 

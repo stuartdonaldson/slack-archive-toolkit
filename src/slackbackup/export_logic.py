@@ -16,12 +16,16 @@ otherwise it's rewritten even though sealed.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import tempfile
+import zipfile
+
+import pypdf
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -151,17 +155,24 @@ def _unfurls_from_attachments(attachments: list[dict]) -> list[dict]:
     return unfurls
 
 
-def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False) -> dict:
+def _clean(msg: dict, users_map: dict[str, str], evidence: bool = False, channel_dir: Path | None = None) -> dict:
     uid = msg.get("user") or msg.get("bot_id")
     resolved = users_map.get(uid) if uid is not None else None
     display_name = resolved or msg.get("username") or uid
     base = {"ts": msg["ts"], "text": msg.get("text"), "user": uid, "display_name": display_name}
     files = msg.get("files")
     if files:
-        base["files"] = [
-            {"id": f.get("id"), "name": f.get("name"), "filetype": f.get("filetype"), "permalink": f.get("permalink")}
-            for f in files
-        ]
+        cleaned_files = []
+        for f in files:
+            entry = {
+                "id": f.get("id"), "name": f.get("name"), "filetype": f.get("filetype"), "permalink": f.get("permalink"),
+            }
+            if channel_dir is not None:
+                # Only the digest path passes channel_dir - export_month has
+                # no equivalent field and keeps its existing schema untouched.
+                entry["local_path"] = _resolve_local_path(channel_dir, f.get("id"), f.get("name"))
+            cleaned_files.append(entry)
+        base["files"] = cleaned_files
     if evidence:
         reactions = msg.get("reactions")
         if reactions:
@@ -411,6 +422,8 @@ def load_job(job_file: Path) -> dict:
     workspaces = job["workspaces"]
     if not isinstance(workspaces, list) or not all(isinstance(w, str) for w in workspaces):
         raise ValueError(f"{job_file}: 'workspaces' must be a list of workspace names, got {workspaces!r}")
+    if job.get("split_by_month") and "{month}" not in job.get("out", ""):
+        raise ValueError(f"{job_file}: 'split_by_month' is set but 'out' has no {{month}} placeholder")
     return job
 
 
@@ -421,8 +434,11 @@ def expand_job_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value)))
 
 
-def resolve_job_out(out_template: str, as_of: str) -> Path:
-    return expand_job_path(out_template.replace("{as_of}", as_of))
+def resolve_job_out(out_template: str | Path, as_of: str, month: str | None = None) -> Path:
+    resolved = str(out_template).replace("{as_of}", as_of)
+    if month is not None:
+        resolved = resolved.replace("{month}", month)
+    return expand_job_path(resolved)
 
 
 def select_channels(channels_file: Path, workspace_glob: str = "f3*") -> list[dict]:
@@ -507,16 +523,56 @@ def _html_to_text(raw_html: str) -> str:
     return parser.text()
 
 
-# Content is only extracted for types we can read without a new dependency:
-# Slack Canvases (real HTML on disk despite this pseudo-mimetype) and plain
-# text/*. Everything else (PDF, video, external Google Sheets links with no
-# downloadable blob at all, ...) stays metadata-only - content: None.
+# Content is extracted for types we can read cheaply: Slack Canvases (real
+# HTML on disk despite this pseudo-mimetype), plain text/*, PDF (pypdf), and
+# the OOXML Office formats (docx/pptx/xlsx - all just zip archives of XML,
+# read with stdlib zipfile, no new dependency for those three). Images and
+# anything else (video, audio, external Google Sheets links with no
+# downloadable blob at all, ...) stay metadata-only - content: None.
 _HTML_LIKE_MIMETYPES = {"application/vnd.slack-docs", "text/html"}
+_DOCX_MIMETYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_PPTX_MIMETYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+_XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+_TEXT_RUN_RE = re.compile(r"<[aw]:t[^>]*>(.*?)</[aw]:t>", re.DOTALL)
+_SHARED_STRING_RE = re.compile(r"<t[^>]*>(.*?)</t>", re.DOTALL)
+
+
+def _extract_pdf_text(path: Path) -> str | None:
+    try:
+        reader = pypdf.PdfReader(str(path))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception:
+        return None
+    text = text.strip()
+    return text or None
+
+
+def _extract_zip_xml_text(path: Path, member_glob: str, pattern: re.Pattern) -> str | None:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = sorted(n for n in zf.namelist() if fnmatch.fnmatch(n, member_glob))
+            parts = []
+            for name in names:
+                xml = zf.read(name).decode("utf-8", errors="replace")
+                parts.extend(pattern.findall(xml))
+    except (zipfile.BadZipFile, OSError):
+        return None
+    text = "\n".join(p for p in parts if p).strip()
+    return text or None
 
 
 def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
     if path is None or not path.exists():
         return None
+    if mimetype == "application/pdf":
+        return _extract_pdf_text(path)
+    if mimetype == _DOCX_MIMETYPE:
+        return _extract_zip_xml_text(path, "word/document.xml", _TEXT_RUN_RE)
+    if mimetype == _PPTX_MIMETYPE:
+        return _extract_zip_xml_text(path, "ppt/slides/slide*.xml", _TEXT_RUN_RE)
+    if mimetype == _XLSX_MIMETYPE:
+        return _extract_zip_xml_text(path, "xl/sharedStrings.xml", _SHARED_STRING_RE)
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -546,15 +602,29 @@ def _clean_file(data: dict) -> dict:
     }
 
 
+def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str | None) -> str | None:
+    """Path (relative to the archive root - two levels above channel_dir,
+    i.e. <workspace>/<channel>/...) to the downloaded blob for a file, if
+    slackdump actually fetched it. None when the file was never attached to
+    a channel_dir (no local archive context) or the blob isn't on disk."""
+    if channel_dir is None or file_id is None:
+        return None
+    local_path = channel_dir / "__uploads" / file_id / (name or "")
+    if not local_path.exists():
+        return None
+    return str(local_path.relative_to(channel_dir.parent.parent))
+
+
 def _load_channel_files(channel_dir: Path) -> list[dict]:
     """Reads channel_dir's slackdump.sqlite FILE table directly - not via
     convert_fn's message-anchored export, which never surfaces these at
     all for an unattached channel Canvas (FILE.MESSAGE_ID is NULL for
     channel Canvas files - a Canvas isn't a reply to anything). Read-only,
-    local-only, no API call. Non-image only (mimetype not image/*), matching
-    docs/DESIGN-files.md's existing non-image filtering convention. Deduped
-    by file id - the same row can repeat across resume cycles, like MESSAGE.
-    When merging duplicate rows, prefer one with non-null MESSAGE_ID.
+    local-only, no API call. Includes images (metadata + local_path only,
+    since content extraction doesn't apply to them - see
+    _extract_file_content). Deduped by file id - the same row can repeat
+    across resume cycles, like MESSAGE. When merging duplicate rows, prefer
+    one with non-null MESSAGE_ID.
     """
     db_path = channel_dir / "slackdump.sqlite"
     if not db_path.exists():
@@ -574,8 +644,6 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
     by_id: dict[str, tuple[dict, str | None]] = {}
     for raw, message_id in rows:
         data = json.loads(raw)
-        if (data.get("mimetype") or "").startswith("image/"):
-            continue
         # When deduping by id, prefer rows with non-null MESSAGE_ID over null.
         file_id = data["id"]
         if file_id not in by_id or by_id[file_id][1] is None:
@@ -586,10 +654,10 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
         cleaned = _clean_file(data)
         if message_id is not None:
             cleaned["message_ts"] = message_id
-        local_path = channel_dir / "__uploads" / cleaned["id"] / (cleaned["name"] or "")
-        exists = local_path.exists()
-        cleaned["local_path"] = str(local_path.relative_to(channel_dir.parent.parent)) if exists else None
-        cleaned["content"] = _extract_file_content(cleaned["mimetype"] or "", local_path if exists else None)
+        blob_path = channel_dir / "__uploads" / cleaned["id"] / (cleaned["name"] or "")
+        exists = blob_path.exists()
+        cleaned["local_path"] = str(blob_path.relative_to(channel_dir.parent.parent)) if exists else None
+        cleaned["content"] = _extract_file_content(cleaned["mimetype"] or "", blob_path if exists else None)
         files.append(cleaned)
 
     files.sort(key=lambda f: f["created_at"] or "")
@@ -597,11 +665,18 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
 
 
 def select_messages_in_range(
-    all_messages: list[dict], users_map: dict[str, str], from_epoch: float, to_epoch: float
+    all_messages: list[dict],
+    users_map: dict[str, str],
+    from_epoch: float,
+    to_epoch: float,
+    channel_dir: Path | None = None,
 ) -> list[dict]:
     """Like export_month's filtering/nesting, but range-bounded only - no
     calendar-month bucketing, since a digest spans multiple months in one
-    document."""
+    document. channel_dir, when given, lets _clean() resolve message-attached
+    files[] to their downloaded blob (local_path) - optional since not every
+    caller has an archive on disk (e.g. tests exercising nesting/range logic
+    in isolation)."""
     by_thread: dict[str, list[dict]] = {}
     for msg in all_messages:
         if _is_parent(msg):
@@ -609,7 +684,8 @@ def select_messages_in_range(
         by_thread.setdefault(msg["thread_ts"], []).append(msg)
     for thread_ts, replies in by_thread.items():
         by_thread[thread_ts] = [
-            _clean(m, users_map, evidence=True) for m in sorted(replies, key=lambda m: float(m["ts"]))
+            _clean(m, users_map, evidence=True, channel_dir=channel_dir)
+            for m in sorted(replies, key=lambda m: float(m["ts"]))
         ]
 
     messages = []
@@ -624,7 +700,7 @@ def select_messages_in_range(
         )
         if not parent_in_range and not reply_in_range:
             continue
-        cleaned = _clean(msg, users_map, evidence=True)
+        cleaned = _clean(msg, users_map, evidence=True, channel_dir=channel_dir)
         if replies:
             cleaned["replies"] = replies
         if not parent_in_range:
@@ -1051,61 +1127,38 @@ def _build_workspace_activity_index(channels_meta: list[dict], activity_by_chann
     return index
 
 
-def build_digest(
+def _gather_digest_data(
     channels_file: Path,
     archive_root: Path,
     workspace_glob: str,
     days: int | None,
     as_of: str,
     convert_fn: Callable[[Path, Path], None],
-    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
-    handler=_default_handler,
-    profiles_doc: dict | None = None,
-) -> dict:
-    """Reads every (workspace, channel) in `channels_file` matching
-    `workspace_glob`, converts each channel's archive (via `convert_fn` -
-    normally `slackdump.convert_export`, injected so tests can fake it),
-    and merges messages from the trailing `days` days (or everything ever
-    archived, when `days` is None) into one chronologically-sorted
-    document. A channel with no archive on disk is recorded with status
-    "missing_archive" and skipped - one un-archived channel must not abort
-    a digest spanning many workspaces.
-
-    Has a top-level `user_index` section, but it is per-workspace (keyed by
-    workspace name, never merged): the same Slack user id in two different
-    workspaces is not the same identity, so an id is looked up only within
-    its own workspace's profiles and never crosses workspace boundaries. It
-    is also bounded to ids actually referenced somewhere in that workspace's
-    digest slice (authors, mentions, reactions, channel creators, file
-    creators) - not the full roster. Author info itself still stays
-    embedded per-message, exactly as `_clean()` already resolves it.
-
-    Each "ok" channel's entry also carries its non-image files/Canvases
-    (see _load_channel_files) - read directly from the channel's own
-    archive, not via convert_fn, since an unattached channel Canvas never
-    surfaces in a message-anchored export.
-
-    `handler` (see handlers/__init__.py) supplies the digest's "leadership"
-    section - defaults to the "f3" handler for backward compatibility with
-    this project's original (F3-only) purpose; pass handler=None to disable
-    leadership inference entirely (an empty leadership section), which is
-    the right choice for a non-F3 workspace. `profiles_doc`, if the caller
-    already built one (e.g. to also write it out as a standalone
-    deliverable - see export.py's job runner), is reused as-is instead of
-    re-converting every workspace's archive a second time; it must already
-    be tagged by the same `handler`.
-    """
+    catalog_cache_dir: Path,
+    handler,
+    profiles_doc: dict | None,
+) -> tuple[list[dict], list[dict], dict[str, set[str]], dict, tuple[str | None, str]]:
+    """Shared first phase of build_digest/build_monthly_digests: reads
+    every (workspace, channel) in `channels_file` matching `workspace_glob`,
+    converts each channel's archive (via `convert_fn`), and returns the raw
+    ingredients an assembly pass needs - per-channel base metadata (no
+    activity counts yet, since those depend on which message slice is being
+    assembled), the full range-bounded/thread-nested message list, each
+    workspace's bot-id set, the profiles doc, and the resolved
+    (date_from, date_to) range. A channel with no archive on disk is
+    recorded with status "missing_archive" and skipped - one un-archived
+    channel must not abort a digest spanning many workspaces."""
     date_from, date_to = trailing_days_range(days, as_of)
     from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
     to_epoch = _date_epoch(date_to, "23:59:59")
 
-    # Built up front (not after the channel loop) because per-channel
-    # activity needs each workspace's bot-id set to tell a bot/log channel
-    # apart from a human one - is_bot is on the user roster, not on the
-    # cleaned message, and a bot frequently posts as an ordinary "U..."
-    # user account rather than via Slack's legacy bot_id field, so a
-    # bot_id-prefix check alone misses it (see SlackBackup follow-up: the
-    # f3kirkland nation_bot_logs bot posts as user U0A3GF12LEA).
+    # Built up front because per-channel activity needs each workspace's
+    # bot-id set to tell a bot/log channel apart from a human one - is_bot
+    # is on the user roster, not on the cleaned message, and a bot
+    # frequently posts as an ordinary "U..." user account rather than via
+    # Slack's legacy bot_id field, so a bot_id-prefix check alone misses it
+    # (see SlackBackup follow-up: the f3kirkland nation_bot_logs bot posts
+    # as user U0A3GF12LEA).
     if profiles_doc is None:
         profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
     bot_ids_by_workspace: dict[str, set[str]] = {
@@ -1116,8 +1169,6 @@ def build_digest(
 
     channels_meta: list[dict] = []
     messages: list[dict] = []
-    activity_by_channel: dict[tuple, dict] = {}
-    referenced_ids_by_workspace: dict[str, set[str]] = {}
 
     catalog_cache: dict[str, dict] = {}
 
@@ -1144,48 +1195,144 @@ def build_digest(
             all_messages = _load_all_messages(export_dir_path)
             users_map = _load_users_map(export_dir_path)
 
-        cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch)
-        activity = _channel_activity(cleaned, bot_ids_by_workspace.get(workspace, set()))
-        activity_by_channel[(workspace, channel_id)] = activity
-        activity_fields = {k: v for k, v in activity.items() if not k.startswith("_")}
+        cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch, channel_dir=channel_dir)
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
         _assign_digest_seq(cleaned)
         messages.extend(cleaned)
         files = _load_channel_files(channel_dir)
-        referenced_ids_by_workspace.setdefault(workspace, set()).update(
-            _collect_referenced_ids(cleaned, channel_info.get("creator"), files)
-        )
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
                 "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
                 "files": files, **channel_info,
-                **activity_fields,
             }
         )
 
     messages.sort(key=lambda m: float(m["ts"]))
+    return channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to)
+
+
+def _channels_for_slice(
+    channels_meta_base: list[dict], messages_slice: list[dict], bot_ids_by_workspace: dict[str, set[str]]
+) -> tuple[list[dict], dict[tuple, dict]]:
+    """Recomputes activity counts against just `messages_slice` (a full
+    digest's whole message list, or one month's bucket - see
+    partition_messages_by_month) and merges them onto each "ok" channel's
+    base metadata; "missing_archive" entries pass through unchanged. Also
+    returns the raw per-channel activity dicts (including the "_"-prefixed
+    aggregation-only fields), keyed by (workspace, channel_id), for
+    _build_workspace_activity_index."""
+    by_key: dict[tuple, list[dict]] = {}
+    for msg in messages_slice:
+        by_key.setdefault((msg["workspace"], msg["channel_id"]), []).append(msg)
+
+    channels_out: list[dict] = []
+    activity_by_channel: dict[tuple, dict] = {}
+    for meta in channels_meta_base:
+        if meta["status"] != "ok":
+            channels_out.append(meta)
+            continue
+        key = (meta["workspace"], meta["channel_id"])
+        activity = _channel_activity(by_key.get(key, []), bot_ids_by_workspace.get(meta["workspace"], set()))
+        activity_by_channel[key] = activity
+        activity_fields = {k: v for k, v in activity.items() if not k.startswith("_")}
+        channels_out.append({**meta, **activity_fields})
+    return channels_out, activity_by_channel
+
+
+def _referenced_ids_for_slice(
+    channels_meta_base: list[dict], messages_slice: list[dict]
+) -> dict[str, set[str]]:
+    """Like build_digest's original per-channel _collect_referenced_ids
+    accumulation, but driven off an already-merged/enriched message slice
+    (any subset of the full digest's messages, e.g. one month's bucket)
+    instead of per-channel raw cleaned messages. Files are channel-level
+    metadata with no natural month, so a file's creator is folded into
+    every slice that includes its channel rather than being split by the
+    file's own created_at."""
+    creator_by_key = {
+        (m["workspace"], m["channel_id"]): m.get("creator") for m in channels_meta_base if m["status"] == "ok"
+    }
+    files_by_key = {
+        (m["workspace"], m["channel_id"]): m.get("files", []) for m in channels_meta_base if m["status"] == "ok"
+    }
+    msgs_by_key: dict[tuple, list[dict]] = {}
+    for msg in messages_slice:
+        msgs_by_key.setdefault((msg["workspace"], msg["channel_id"]), []).append(msg)
+
+    referenced_ids_by_workspace: dict[str, set[str]] = {}
+    for key, msgs in msgs_by_key.items():
+        workspace = key[0]
+        ids = _collect_referenced_ids(msgs, creator_by_key.get(key), files_by_key.get(key, []))
+        referenced_ids_by_workspace.setdefault(workspace, set()).update(ids)
+    return referenced_ids_by_workspace
+
+
+def _root_month(msg: dict) -> str:
+    return _format_month(float(msg["ts"]))
+
+
+def partition_messages_by_month(messages: list[dict]) -> dict[str, list[dict]]:
+    """Splits a digest's top-level (thread-nested) message list into
+    per-month buckets keyed by each root message's own month - a reply
+    stays nested under its parent regardless of what month the reply
+    itself landed in, so it is bucketed with its thread's parent, not its
+    own ts. A root flagged in_scope: false (parent predates export_scope,
+    kept only so its in-range reply has somewhere to nest - see
+    select_messages_in_range) still buckets by its own ts, which may put
+    it in a month outside export_scope entirely."""
+    buckets: dict[str, list[dict]] = {}
+    for msg in messages:
+        buckets.setdefault(_root_month(msg), []).append(msg)
+    return buckets
+
+
+def _assemble_digest(
+    channels_meta_base: list[dict],
+    messages_slice: list[dict],
+    profiles_doc: dict,
+    handler,
+    date_from: str | None,
+    date_to: str,
+    days: int | None,
+    workspace_glob: str,
+    bot_ids_by_workspace: dict[str, set[str]],
+    month: str | None = None,
+) -> dict:
+    """Second phase shared by build_digest/build_monthly_digests: turns one
+    message slice (the full digest's messages, or one month's bucket) plus
+    the gathered channel/profile data into a complete slack-llm-digest-v3
+    document. `month`, when given, is stamped onto export_scope so a
+    consumer can tell which monthly file this is without parsing the
+    filename."""
+    channels_out, activity_by_channel = _channels_for_slice(channels_meta_base, messages_slice, bot_ids_by_workspace)
+    referenced_ids_by_workspace = _referenced_ids_for_slice(channels_meta_base, messages_slice)
 
     # Leadership candidates come from the full per-workspace roster
-    # (build_user_profiles/profiles_doc), not just this digest's posters -
-    # a leader who didn't happen to post in this window should still
-    # surface. This is the digest's *only* profile data; everyone else in
-    # the roster is intentionally left out (see build_user_profiles for the
-    # full list). Delegated entirely to `handler` - see its module docstring
-    # in handlers/__init__.py; an empty section when no handler is set.
+    # (build_user_profiles/profiles_doc), not just this slice's posters -
+    # a leader who didn't happen to post in this window (or this month)
+    # should still surface. This is the digest's *only* profile data;
+    # everyone else in the roster is intentionally left out (see
+    # build_user_profiles for the full list). Delegated entirely to
+    # `handler` - see its module docstring in handlers/__init__.py; an
+    # empty section when no handler is set.
     leadership = (
         handler.build_leadership(profiles_doc)
         if handler is not None
         else {"profile_role_matches": [], "by_region": [], "former_by_region": []}
     )
 
+    export_scope = {"from": date_from, "to": date_to, "days": days, "workspace_glob": workspace_glob}
+    if month is not None:
+        export_scope["month"] = month
+
     return {
         "schema_version": "slack-llm-digest-v3",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "export_scope": {"from": date_from, "to": date_to, "days": days, "workspace_glob": workspace_glob},
+        "export_scope": export_scope,
         "manifest": {
-            "workspaces_included": len({c["workspace"] for c in channels_meta}),
+            "workspaces_included": len({c["workspace"] for c in channels_meta_base}),
             "counting_rules": {
                 "root_message_count": "top-level messages only",
                 "reply_count": "nested replies under root messages",
@@ -1249,12 +1396,96 @@ def build_digest(
                 "Leadership roles may be inferred from display names unless explicitly confirmed",
             ],
         },
-        "channels": channels_meta,
-        "workspace_activity_index": _build_workspace_activity_index(channels_meta, activity_by_channel),
-        "messages": messages,
+        "channels": channels_out,
+        "workspace_activity_index": _build_workspace_activity_index(channels_out, activity_by_channel),
+        "messages": messages_slice,
         "user_index": _build_user_index(profiles_doc, referenced_ids_by_workspace),
-        "mentions": build_mentions_index(messages, profiles_doc),
+        "mentions": build_mentions_index(messages_slice, profiles_doc),
         "leadership": leadership,
+    }
+
+
+def build_digest(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    handler=_default_handler,
+    profiles_doc: dict | None = None,
+) -> dict:
+    """Merges messages from the trailing `days` days (or everything ever
+    archived, when `days` is None) across every (workspace, channel) in
+    `channels_file` matching `workspace_glob` into one chronologically-
+    sorted slack-llm-digest-v3 document. See _gather_digest_data and
+    _assemble_digest for the two phases this composes; see
+    build_monthly_digests for the equivalent split into one document per
+    calendar month.
+
+    Has a top-level `user_index` section, but it is per-workspace (keyed by
+    workspace name, never merged): the same Slack user id in two different
+    workspaces is not the same identity, so an id is looked up only within
+    its own workspace's profiles and never crosses workspace boundaries. It
+    is also bounded to ids actually referenced somewhere in that workspace's
+    digest slice (authors, mentions, reactions, channel creators, file
+    creators) - not the full roster. Author info itself still stays
+    embedded per-message, exactly as `_clean()` already resolves it.
+
+    Each "ok" channel's entry also carries its files/Canvases (images
+    included, see _load_channel_files) - read directly from the channel's own
+    archive, not via convert_fn, since an unattached channel Canvas never
+    surfaces in a message-anchored export.
+
+    `handler` (see handlers/__init__.py) supplies the digest's "leadership"
+    section - defaults to the "f3" handler for backward compatibility with
+    this project's original (F3-only) purpose; pass handler=None to disable
+    leadership inference entirely (an empty leadership section), which is
+    the right choice for a non-F3 workspace. `profiles_doc`, if the caller
+    already built one (e.g. to also write it out as a standalone
+    deliverable - see export.py's job runner), is reused as-is instead of
+    re-converting every workspace's archive a second time; it must already
+    be tagged by the same `handler`.
+    """
+    channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
+        channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+    )
+    return _assemble_digest(
+        channels_meta, messages, profiles_doc, handler, date_from, date_to, days, workspace_glob, bot_ids_by_workspace,
+    )
+
+
+def build_monthly_digests(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    handler=_default_handler,
+    profiles_doc: dict | None = None,
+) -> dict[str, dict]:
+    """Same data and same slack-llm-digest-v3 schema as build_digest, but
+    split into one document per calendar month (keyed "YYYY-MM") instead of
+    one merged document. A thread's replies stay with their parent's
+    month even when a reply itself lands in a later month - see
+    partition_messages_by_month - so a month's file is never missing a
+    reply that belongs to a thread it started. Each month's channel/
+    workspace_activity_index/user_index/mentions are recomputed against
+    just that month's message slice; "leadership" is unchanged across
+    months (it reflects current roster roles, not activity)."""
+    channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
+        channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+    )
+    buckets = partition_messages_by_month(messages)
+    return {
+        month: _assemble_digest(
+            channels_meta, month_messages, profiles_doc, handler, date_from, date_to, days, workspace_glob,
+            bot_ids_by_workspace, month=month,
+        )
+        for month, month_messages in sorted(buckets.items())
     }
 
 

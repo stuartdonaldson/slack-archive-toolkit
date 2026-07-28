@@ -33,13 +33,27 @@ def register(groups: argparse._SubParsersAction) -> None:
         help="back up every channel listed in channels.json",
         epilog=(
             "Example:\n  ./slackbackup backup run channels.json ~/slack-backups\n"
-            "Output: <archive_root>/<workspace>/<channel>/slackdump.sqlite per tracked channel."
+            "  ./slackbackup backup run channels.json ~/slack-backups --workspace f3pugetsound\n"
+            "  ./slackbackup backup run channels.json ~/slack-backups --channel '1st-f,mumble*'\n"
+            "Output: <archive_root>/<workspace>/<channel>/slackdump.sqlite per tracked channel.\n"
+            "--workspace/--channel are comma-separated glob selectors that filter channels.json\n"
+            "to a subset (both AND together); an explicit selector matching nothing is an error."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_run.add_argument("-f", "--full", action="store_true")
     p_run.add_argument("channels_file")
     p_run.add_argument("archive_root")
+    p_run.add_argument(
+        "--workspace",
+        dest="workspace_selector",
+        help="comma-separated workspace glob(s) to back up (e.g. 'f3pugetsound' or 'f3*')",
+    )
+    p_run.add_argument(
+        "--channel",
+        dest="channel_selector",
+        help="comma-separated channel-name glob(s) to back up (e.g. '1st-f,mumble*')",
+    )
     p_run.set_defaults(handler=_run)
 
     p_list = sub.add_parser(
@@ -80,7 +94,13 @@ def _channel(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     try:
-        all_ok = backup_logic.run(Path(args.channels_file), Path(args.archive_root), args.full)
+        all_ok = backup_logic.run(
+            Path(args.channels_file),
+            Path(args.archive_root),
+            args.full,
+            workspace_selector=args.workspace_selector,
+            channel_selector=args.channel_selector,
+        )
     except channel_logic.ChannelError as exc:
         print(f"backup run: {exc}", file=sys.stderr)
         return 1

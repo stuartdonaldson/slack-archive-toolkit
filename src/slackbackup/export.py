@@ -16,6 +16,9 @@ from pathlib import Path
 
 from . import export_logic, handlers, selector_logic, slackdump
 
+DEFAULT_ARCHIVE_ROOT = Path.home() / "slack-backups"
+DEFAULT_EXPORTS_DIR = Path.home() / "slack-exports"
+
 
 def register(groups: argparse._SubParsersAction) -> None:
     group = groups.add_parser("export", help="export an archived channel to bounded monthly JSON")
@@ -37,7 +40,10 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_monthly.add_argument("--to", dest="date_to", required=True)
     p_monthly.add_argument("--workspace", required=True)
     p_monthly.add_argument("--channel", required=True)
-    p_monthly.add_argument("--archive-root", required=True)
+    p_monthly.add_argument(
+        "--archive-root", default=str(DEFAULT_ARCHIVE_ROOT),
+        help=f"defaults to {DEFAULT_ARCHIVE_ROOT}",
+    )
     p_monthly.add_argument("--out", required=True)
     p_monthly.set_defaults(handler=_monthly)
 
@@ -62,8 +68,14 @@ def register(groups: argparse._SubParsersAction) -> None:
             "Example:\n  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*'\n"
             "  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*,dungeons-*'\n"
             "  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*' --days 30\n"
+            "  ./slackbackup export digest --archive-root ~/slack-backups --workspace 'f3*' \\\n"
+            "      --split-by-month --out '~/slack-exports/f3-digest-{as_of}-{month}.json'\n"
             "  ./slackbackup export digest --jobs 'jobs/*.json'\n"
             "Output: --out, defaulting to ~/slack-exports/f3-digest-<as-of>.json.\n"
+            "With --split-by-month, one document per calendar month instead of one merged document -\n"
+            "a reply that lands in a later month than its thread's parent stays with the parent's\n"
+            "month file, never double-counted or split into its own entry. --out must then contain a\n"
+            "literal {month} placeholder (a job sets this via its own 'split_by_month'/'out' fields).\n"
             "With --jobs, each matched job's own archive-root/channels-file/workspaces/days/out/\n"
             "leadership-handler/users_out (see jobs/*.json) is used instead, one digest per job -\n"
             "--archive-root/--channels-file/--leadership-handler on the command line become the\n"
@@ -72,8 +84,9 @@ def register(groups: argparse._SubParsersAction) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_digest.add_argument(
-        "--archive-root", default=None,
-        help="required unless every --job entry defines its own archive_root",
+        "--archive-root", default=str(DEFAULT_ARCHIVE_ROOT),
+        help=f"defaults to {DEFAULT_ARCHIVE_ROOT}; also the fallback for a --job entry "
+        "that doesn't set its own archive_root",
     )
     p_digest.add_argument("--channels-file", default="./channels.json")
     p_digest.add_argument(
@@ -88,7 +101,15 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_digest.add_argument("--as-of", default=None, help="defaults to today (UTC)")
     p_digest.add_argument(
         "--out", default=None,
-        help="defaults to ~/slack-exports/f3-digest-<as-of>.json",
+        help="defaults to ~/slack-exports/f3-digest-<as-of>.json, or "
+        "~/slack-exports/f3-digest-<as-of>-{month}.json with --split-by-month; a custom --out must "
+        "contain a literal {month} placeholder when --split-by-month is given",
+    )
+    p_digest.add_argument(
+        "--split-by-month", action="store_true",
+        help="write one digest document per calendar month instead of one merged document - a "
+        "thread's replies stay with the month its parent message was posted in, even when a reply "
+        "itself lands in a later month",
     )
     p_digest.add_argument(
         "--jobs", default=None,
@@ -117,7 +138,10 @@ def register(groups: argparse._SubParsersAction) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_users.add_argument("--archive-root", required=True)
+    p_users.add_argument(
+        "--archive-root", default=str(DEFAULT_ARCHIVE_ROOT),
+        help=f"defaults to {DEFAULT_ARCHIVE_ROOT}",
+    )
     p_users.add_argument("--channels-file", default="./channels.json")
     p_users.add_argument(
         "--workspace", dest="workspace_glob", required=True,
@@ -164,31 +188,42 @@ def _list(args: argparse.Namespace) -> int:
     return 0
 
 
-DEFAULT_EXPORTS_DIR = Path.home() / "slack-exports"
-
-
 def _resolve_handler(name: str | None):
     if name in (None, "none"):
         return None
     return handlers.get(name)
 
 
-def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, days: int | None,
-                 as_of: str, out_path: Path, handler, profiles_doc: dict | None = None) -> None:
+def _write_digest(result: dict, out_path: Path, label: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    ok = sum(1 for c in result["channels"] if c["status"] == "ok")
+    missing = sum(1 for c in result["channels"] if c["status"] == "missing_archive")
+    print(
+        f"export digest: {label}{len(result['messages'])} messages from {ok} channels "
+        f"({missing} missing archive) -> {out_path}",
+        file=sys.stderr,
+    )
+
+
+def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, days: int | None,
+                 as_of: str, out_template: str, handler, profiles_doc: dict | None = None,
+                 split_by_month: bool = False) -> None:
+    if split_by_month:
+        results = export_logic.build_monthly_digests(
+            channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
+            handler=handler, profiles_doc=profiles_doc,
+        )
+        for month in sorted(results):
+            out_path = export_logic.resolve_job_out(out_template, as_of, month=month)
+            _write_digest(results[month], out_path, f"{month}: ")
+        return
+
     result = export_logic.build_digest(
         channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
         handler=handler, profiles_doc=profiles_doc,
     )
-    out_path.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-
-    ok = sum(1 for c in result["channels"] if c["status"] == "ok")
-    missing = sum(1 for c in result["channels"] if c["status"] == "missing_archive")
-    print(
-        f"export digest: {len(result['messages'])} messages from {ok} channels "
-        f"({missing} missing archive) -> {out_path}",
-        file=sys.stderr,
-    )
+    _write_digest(result, export_logic.resolve_job_out(out_template, as_of), "")
 
 
 def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> None:
@@ -196,6 +231,7 @@ def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> 
     channels_file = export_logic.expand_job_path(job.get("channels_file", args.channels_file))
     workspace_glob = ",".join(job["workspaces"])
     handler = _resolve_handler(job.get("leadership_handler", args.leadership_handler))
+    split_by_month = bool(job.get("split_by_month", False))
 
     profiles_doc = export_logic.build_user_profiles(
         channels_file, archive_root, workspace_glob, slackdump.convert_export, handler=handler,
@@ -208,7 +244,7 @@ def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> 
 
     _run_digest(
         channels_file, archive_root, workspace_glob, job.get("days", args.days), as_of,
-        export_logic.resolve_job_out(job["out"], as_of), handler, profiles_doc=profiles_doc,
+        job["out"], handler, profiles_doc=profiles_doc, split_by_month=split_by_month,
     )
 
 
@@ -224,14 +260,6 @@ def _digest(args: argparse.Namespace) -> int:
                 print(f"export digest: skipping job {job_file}: {exc}", file=sys.stderr)
                 exit_code = 1
                 continue
-            if not job.get("archive_root", args.archive_root):
-                print(
-                    f"export digest: skipping job {job_file}: no archive_root in job "
-                    "and no --archive-root fallback given",
-                    file=sys.stderr,
-                )
-                exit_code = 1
-                continue
             job.setdefault("archive_root", args.archive_root)
             try:
                 _run_job(job_file, job, args, as_of)
@@ -240,10 +268,6 @@ def _digest(args: argparse.Namespace) -> int:
                 exit_code = 1
                 continue
         return exit_code
-
-    if not args.archive_root:
-        print("export digest: --archive-root is required unless --jobs is given", file=sys.stderr)
-        return 2
 
     if not args.workspace_glob:
         print("export digest: --workspace is required unless --jobs is given", file=sys.stderr)
@@ -254,9 +278,17 @@ def _digest(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"export digest: {exc}", file=sys.stderr)
         return 2
-    out_path = Path(args.out) if args.out else DEFAULT_EXPORTS_DIR / f"f3-digest-{as_of}.json"
+    if args.out:
+        out_template = args.out
+    else:
+        suffix = "-{month}" if args.split_by_month else ""
+        out_template = str(DEFAULT_EXPORTS_DIR / f"f3-digest-{as_of}{suffix}.json")
+    if args.split_by_month and "{month}" not in out_template:
+        print("export digest: --split-by-month requires a {month} placeholder in --out", file=sys.stderr)
+        return 2
     _run_digest(
-        Path(args.channels_file), Path(args.archive_root), args.workspace_glob, args.days, as_of, out_path, handler,
+        Path(args.channels_file), Path(args.archive_root), args.workspace_glob, args.days, as_of, out_template,
+        handler, split_by_month=args.split_by_month,
     )
     return 0
 

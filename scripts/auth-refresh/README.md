@@ -25,10 +25,17 @@ export SLACKDUMP_AUTH_PROFILE="$HOME/.cache/slackdump-auth-profile"
 ## Use
 
 ```bash
-npm run refresh        # probe all workspaces; open a browser only for expired ones
-npm run refresh:dry    # same, but print the slackdump commands instead of running them
-node refresh-auth.mjs --all   # force-refresh every workspace
+npm run refresh          # probe all workspaces; open a browser only for expired ones
+npm run refresh:dry      # same, but print the slackdump commands instead of running them
+node refresh-auth.mjs --all          # force-refresh every workspace
+npm run refresh -- f3nation          # refresh only the named workspace(s), forced open
 ```
+
+Naming one or more workspaces (positional args) scopes the run to just those, opening
+each regardless of whether its session still looks valid and leaving all others
+untouched — the way to fold a single workspace (e.g. `f3nation`) into the persistent
+browser profile without clicking through every workspace. Names normalize like the CLI
+(case-insensitive; `https://` and `.slack.com` stripped).
 
 For each workspace that needs it, a browser window opens on that workspace's Slack —
 log in normally (SSO / 2FA included), wait for the workspace to load, press ENTER. The

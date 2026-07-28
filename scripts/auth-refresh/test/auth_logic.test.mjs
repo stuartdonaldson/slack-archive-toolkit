@@ -9,6 +9,7 @@ import {
   classifySession,
   buildRegisterArgs,
   matchWorkspaceToken,
+  selectWorkspaces,
 } from '../auth_logic.mjs';
 
 // --- loadWorkspaces (AC6): tokens.json object -> workspace name list ---
@@ -119,4 +120,29 @@ test('buildRegisterArgs builds the workspace-new argv', () => {
     buildRegisterArgs('f3cascades', 'xoxc-aaa', 'xoxd-SECRET'),
     ['workspace', 'new', '-token', 'xoxc-aaa', '-cookie', 'xoxd-SECRET', 'f3cascades'],
   );
+});
+
+// --- selectWorkspaces: filter the workspace list by name selector(s) ---
+const WS = ['f3pugetsound', 'f3nation', 'f3kirkland'];
+
+test('selectWorkspaces with no filters returns the list unchanged', () => {
+  assert.deepEqual(selectWorkspaces(WS, []), WS);
+  assert.deepEqual(selectWorkspaces(WS, undefined), WS);
+});
+
+test('selectWorkspaces returns only the named workspace', () => {
+  assert.deepEqual(selectWorkspaces(WS, ['f3nation']), ['f3nation']);
+});
+
+test('selectWorkspaces matches multiple names, preserving list order', () => {
+  assert.deepEqual(selectWorkspaces(WS, ['f3kirkland', 'f3pugetsound']), ['f3pugetsound', 'f3kirkland']);
+});
+
+test('selectWorkspaces normalizes filters (case, https://, .slack.com)', () => {
+  assert.deepEqual(selectWorkspaces(WS, ['F3Nation']), ['f3nation']);
+  assert.deepEqual(selectWorkspaces(WS, ['https://f3nation.slack.com']), ['f3nation']);
+});
+
+test('selectWorkspaces returns [] when nothing matches (caller warns)', () => {
+  assert.deepEqual(selectWorkspaces(WS, ['nope']), []);
 });

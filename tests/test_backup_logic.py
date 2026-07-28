@@ -625,3 +625,80 @@ def test_run_full_resync_ignores_cadence_and_checks_everything(tmp_path, monkeyp
     backup_logic.run(channels_file, tmp_path / "archive", full=True, cache_dir=cache_dir, today=TODAY)
 
     assert attempted == ["dormant"]
+
+
+def _selector_channels_file(tmp_path):
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "P1", "name": "1st-f", "workspace": "f3pugetsound"},
+        {"id": "P2", "name": "mumblechatter", "workspace": "f3pugetsound"},
+        {"id": "K1", "name": "1st-f", "workspace": "f3kirkland"},
+        {"id": "C1", "name": "all-f3-cascades", "workspace": "f3cascades"},
+    ]))
+    return channels_file
+
+
+def _attempt_recorder(monkeypatch):
+    attempted = []
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(
+        backup_logic, "backup_channel",
+        lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append((ws, slug)) or "archive",
+    )
+    return attempted
+
+
+def test_run_workspace_selector_filters_to_matching_workspaces(tmp_path, monkeypatch):
+    channels_file = _selector_channels_file(tmp_path)
+    attempted = _attempt_recorder(monkeypatch)
+
+    backup_logic.run(
+        channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache",
+        workspace_selector="f3pugetsound",
+    )
+
+    assert sorted(attempted) == [("f3pugetsound", "1st-f"), ("f3pugetsound", "mumblechatter")]
+
+
+def test_run_channel_selector_filters_across_workspaces(tmp_path, monkeypatch):
+    channels_file = _selector_channels_file(tmp_path)
+    attempted = _attempt_recorder(monkeypatch)
+
+    backup_logic.run(
+        channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache",
+        channel_selector="1st-f",
+    )
+
+    assert sorted(attempted) == [("f3kirkland", "1st-f"), ("f3pugetsound", "1st-f")]
+
+
+def test_run_selectors_and_together_and_accept_globs(tmp_path, monkeypatch):
+    channels_file = _selector_channels_file(tmp_path)
+    attempted = _attempt_recorder(monkeypatch)
+
+    backup_logic.run(
+        channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache",
+        workspace_selector="f3puget*", channel_selector="1st-f,mumble*",
+    )
+
+    assert sorted(attempted) == [("f3pugetsound", "1st-f"), ("f3pugetsound", "mumblechatter")]
+
+
+def test_run_selector_matching_nothing_raises(tmp_path, monkeypatch):
+    channels_file = _selector_channels_file(tmp_path)
+    _attempt_recorder(monkeypatch)
+
+    with pytest.raises(channel_logic.ChannelError):
+        backup_logic.run(
+            channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache",
+            workspace_selector="f3nonexistent",
+        )
+
+
+def test_run_no_selectors_backs_up_everything(tmp_path, monkeypatch):
+    channels_file = _selector_channels_file(tmp_path)
+    attempted = _attempt_recorder(monkeypatch)
+
+    backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
+
+    assert len(attempted) == 4

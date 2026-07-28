@@ -6,6 +6,7 @@ exporter) - different schema, same underlying fixtures.
 import json
 import shutil
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,28 @@ def test_load_job_accepts_workspaces_as_a_list(tmp_path):
     assert job["workspaces"] == ["f3pugetsound"]
 
 
+def test_load_job_rejects_split_by_month_without_month_placeholder(tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps({
+        "type": "digest", "archive_root": "/archive", "workspaces": ["f3pugetsound"],
+        "out": "out-{as_of}.json", "split_by_month": True,
+    }))
+
+    with pytest.raises(ValueError):
+        export_logic.load_job(job_file)
+
+
+def test_load_job_accepts_split_by_month_with_month_placeholder(tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps({
+        "type": "digest", "archive_root": "/archive", "workspaces": ["f3pugetsound"],
+        "out": "out-{as_of}-{month}.json", "split_by_month": True,
+    }))
+
+    job = export_logic.load_job(job_file)
+    assert job["split_by_month"] is True
+
+
 def test_digest_message_url():
     url = export_logic.digest_message_url("f3pugetsound", "C123", "1718990400.123456")
     assert url == "https://f3pugetsound.slack.com/archives/C123/p1718990400123456"
@@ -177,6 +200,56 @@ def test_select_messages_in_range_excludes_thread_when_parent_and_replies_all_be
     messages = export_logic.select_messages_in_range(all_messages, users_map, 5000.0, 6000.0)
 
     assert messages == []
+
+
+def test_select_messages_in_range_sets_local_path_on_message_file_when_blob_exists(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F0BBJTND1KR"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "1014.jpg").write_bytes(b"\xff\xd8\xff")
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "parent",
+            "files": [{"id": "F0BBJTND1KR", "name": "1014.jpg", "filetype": "jpg", "permalink": "https://x"}],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0, channel_dir=channel_dir)
+
+    assert messages[0]["files"][0]["local_path"] == (
+        "f3pugetsound/ao-active-book-club/__uploads/F0BBJTND1KR/1014.jpg"
+    )
+
+
+def test_select_messages_in_range_message_file_local_path_none_when_blob_missing(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "parent",
+            "files": [{"id": "F0BBJTND1KR", "name": "1014.jpg", "filetype": "jpg", "permalink": "https://x"}],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0, channel_dir=channel_dir)
+
+    assert messages[0]["files"][0]["local_path"] is None
+
+
+def test_select_messages_in_range_omits_local_path_when_no_channel_dir():
+    users_map = {"U0A": "Al"}
+    all_messages = [
+        {
+            "ts": "1000.000100", "user": "U0A", "text": "parent",
+            "files": [{"id": "F0BBJTND1KR", "name": "1014.jpg", "filetype": "jpg", "permalink": "https://x"}],
+        },
+    ]
+
+    messages = export_logic.select_messages_in_range(all_messages, users_map, 900.0, 1200.0)
+
+    assert "local_path" not in messages[0]["files"][0]
 
 
 def test_select_messages_in_range_carries_reactions_when_present():
@@ -536,14 +609,14 @@ IMAGE_FILE = {
 }
 
 
-def test_load_channel_files_excludes_images_and_includes_canvases(tmp_path):
+def test_load_channel_files_includes_canvases_and_images(tmp_path):
     channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
     channel_dir.mkdir(parents=True)
     _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
 
     files = export_logic._load_channel_files(channel_dir)
 
-    assert [f["id"] for f in files] == ["F05KESM0B7C"]
+    assert [f["id"] for f in files] == ["F05KESM0B7C", "F0BBJTND1KR"]
     canvas = files[0]
     assert canvas["name"] == "Upcoming_Q_Schedule"
     assert canvas["title"] == "Upcoming Q/Schedule"
@@ -551,6 +624,19 @@ def test_load_channel_files_excludes_images_and_includes_canvases(tmp_path):
     assert canvas["creator"] == "U77PPNBFD"
     assert canvas["created_at"] == "2023-07-30T22:40:54Z"
     assert canvas["permalink"] == CANVAS_FILE["permalink"]
+
+
+def test_load_channel_files_image_has_no_content_even_when_blob_exists(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F0BBJTND1KR"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "1014.jpg").write_bytes(b"\xff\xd8\xff")
+    _make_file_db(channel_dir / "slackdump.sqlite", [IMAGE_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["content"] is None
+    assert files[0]["local_path"] == "f3pugetsound/ao-active-book-club/__uploads/F0BBJTND1KR/1014.jpg"
 
 
 def test_load_channel_files_sets_local_path_only_when_file_exists_on_disk(tmp_path):
@@ -594,13 +680,89 @@ def test_extract_file_content_reads_plain_text_verbatim(tmp_path):
 
 
 def test_extract_file_content_none_for_unsupported_mimetype(tmp_path):
-    path = tmp_path / "report.pdf"
-    path.write_bytes(b"%PDF-1.4 fake")
-    assert export_logic._extract_file_content("application/pdf", path) is None
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"fake video bytes")
+    assert export_logic._extract_file_content("video/mp4", path) is None
 
 
 def test_extract_file_content_none_when_no_local_path():
     assert export_logic._extract_file_content("text/plain", None) is None
+
+
+_MINIMAL_PDF = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>endobj
+4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+5 0 obj<</Length 44>>
+stream
+BT /F1 12 Tf 10 100 Td (Hello world) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f
+trailer<</Size 6/Root 1 0 R>>
+startxref
+0
+%%EOF
+"""
+
+
+def test_extract_file_content_extracts_pdf_text(tmp_path):
+    path = tmp_path / "report.pdf"
+    path.write_bytes(_MINIMAL_PDF)
+    content = export_logic._extract_file_content("application/pdf", path)
+    assert content is not None
+    assert "Hello world" in content
+
+
+def test_extract_file_content_none_for_corrupt_pdf(tmp_path):
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"%PDF-1.4 not actually a pdf")
+    assert export_logic._extract_file_content("application/pdf", path) is None
+
+
+def test_extract_file_content_extracts_docx_text(tmp_path):
+    path = tmp_path / "notes.docx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="ns"><w:body><w:p><w:r><w:t>Hello docx</w:t></w:r></w:p></w:body></w:document>',
+        )
+    content = export_logic._extract_file_content(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", path
+    )
+    assert content == "Hello docx"
+
+
+def test_extract_file_content_extracts_pptx_text(tmp_path):
+    path = tmp_path / "slides.pptx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("ppt/slides/slide1.xml", '<p:sld xmlns:a="ns"><a:t>Hello pptx</a:t></p:sld>')
+    content = export_logic._extract_file_content(
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation", path
+    )
+    assert content == "Hello pptx"
+
+
+def test_extract_file_content_extracts_xlsx_shared_strings(tmp_path):
+    path = tmp_path / "sheet.xlsx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/sharedStrings.xml", '<sst xmlns="ns"><si><t>Hello xlsx</t></si></sst>')
+    content = export_logic._extract_file_content(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", path
+    )
+    assert content == "Hello xlsx"
+
+
+def test_extract_file_content_none_for_corrupt_office_zip(tmp_path):
+    path = tmp_path / "notes.docx"
+    path.write_bytes(b"not actually a zip")
+    content = export_logic._extract_file_content(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", path
+    )
+    assert content is None
 
 
 def test_load_channel_files_includes_extracted_content_for_canvas(tmp_path):
@@ -655,7 +817,7 @@ def test_load_channel_files_returns_empty_for_malformed_or_missing_archive(tmp_p
     assert export_logic._load_channel_files(channel_dir) == []
 
 
-def test_build_digest_includes_non_image_files_per_channel(tmp_path):
+def test_build_digest_includes_all_files_per_channel_images_and_non_image(tmp_path):
     archive_root = tmp_path / "archive"
     channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
     channel_dir.mkdir(parents=True)
@@ -679,7 +841,7 @@ def test_build_digest_includes_non_image_files_per_channel(tmp_path):
     )
 
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
-    assert [f["id"] for f in meta["files"]] == ["F05KESM0B7C"]
+    assert [f["id"] for f in meta["files"]] == ["F05KESM0B7C", "F0BBJTND1KR"]
 
 
 def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
@@ -1571,3 +1733,101 @@ def test_build_digest_emits_top_level_mentions_index(tmp_path):
     assert result["schema_version"] == "slack-llm-digest-v3"
     assert isinstance(result["mentions"], dict)
     assert "mentions_index" in result["manifest"]["counting_rules"]
+
+
+def _single_channel_digest_setup(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+    return channels_file, archive_root
+
+
+def test_partition_messages_by_month_buckets_by_root_ts_not_reply_ts():
+    root = {"ts": B_TS, "workspace": "f3pugetsound", "channel_id": "C1", "replies": [{"ts": B1_TS}]}
+    standalone = {"ts": C_TS, "workspace": "f3pugetsound", "channel_id": "C1"}
+
+    buckets = export_logic.partition_messages_by_month([root, standalone])
+
+    assert buckets["2026-04"] == [root]
+    assert buckets["2026-05"] == [standalone]
+    # The cross-month reply (B1, dated 2026-05) stays nested under its
+    # April parent rather than spawning its own May entry.
+    assert root["replies"][0]["ts"] == B1_TS
+
+
+def test_build_monthly_digests_keeps_late_reply_with_parent_month(tmp_path):
+    channels_file, archive_root = _single_channel_digest_setup(tmp_path)
+
+    results = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    april = results["2026-04"]
+    april_ts = {m["ts"] for m in april["messages"]}
+    assert april_ts == {A_TS, B_TS}
+    parent_b = next(m for m in april["messages"] if m["ts"] == B_TS)
+    assert parent_b["replies"][0]["ts"] == B1_TS
+
+    may = results["2026-05"]
+    may_ts = {m["ts"] for m in may["messages"]}
+    # Standalone C is May's only root; B1 (the cross-month reply) never
+    # appears as its own top-level entry in May - only nested under B.
+    assert may_ts == {C_TS}
+    assert all(m["ts"] != B1_TS for m in may["messages"])
+
+
+def test_build_monthly_digests_stamps_month_on_export_scope(tmp_path):
+    channels_file, archive_root = _single_channel_digest_setup(tmp_path)
+
+    results = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    for month, doc in results.items():
+        assert doc["export_scope"]["month"] == month
+        assert doc["schema_version"] == "slack-llm-digest-v3"
+
+
+def test_build_monthly_digests_recomputes_channel_activity_per_month(tmp_path):
+    channels_file, archive_root = _single_channel_digest_setup(tmp_path)
+
+    results = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    april_channel = next(c for c in results["2026-04"]["channels"] if c["channel"] == "helpdesk")
+    # A (replies A1, A2) + B (reply B1, cross-month) = 2 roots, 3 replies.
+    assert april_channel["root_message_count"] == 2
+    assert april_channel["reply_count"] == 3
+
+    may_channel = next(c for c in results["2026-05"]["channels"] if c["channel"] == "helpdesk")
+    # C is May's only root; B1 (April parent's reply) is not double-counted
+    # here - it's already counted under April's bucket.
+    assert may_channel["root_message_count"] == 1
+    assert may_channel["reply_count"] == 0
+
+
+def test_build_monthly_digests_matches_build_digest_totals(tmp_path):
+    channels_file, archive_root = _single_channel_digest_setup(tmp_path)
+
+    full = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+    monthly = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    total_roots = sum(len(doc["messages"]) for doc in monthly.values())
+    assert total_roots == len(full["messages"])
+    assert sorted(monthly) == ["2026-04", "2026-05", "2026-06"]
