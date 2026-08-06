@@ -53,6 +53,27 @@ cp "$REPO_ROOT/docs/f3-culture.md" \
     # always exits 0, so it never blocks the backup below.
     "$REPO_ROOT/scripts/preflight-auth.sh" channels.json
 
+    # Pick up newly-created public channels (e.g. "disc-it" was missed for
+    # weeks before someone noticed and registered it by hand) before backing
+    # up, so a channel created since last night's run gets archived in
+    # *this* run instead of waiting for someone to catch it manually.
+    # channel_logic.register_matching() was built for exactly this ("run
+    # nightly" is in its own docstring) - '*' '*' covers every currently
+    # registered workspace (not just f3*, e.g. dungeons-of-finn-hill too)
+    # and every channel name. It always skips private/archived/"shuttered*"
+    # channels and channels already in channels.json regardless of the glob.
+    # Note: this always does a FULL (non-member-only) channel listing per
+    # workspace - confirmed several minutes and rate-limit-prone per
+    # workspace in docs/references/slackdump-cli-notes.md, so this step can
+    # meaningfully add to the nightly run's total wall-clock time; slackdump
+    # backs off and retries automatically, it's just slow, not broken.
+    # "already-registered" is by far the most common outcome once
+    # channels.json is mostly caught up, so it's the one skip reason
+    # filtered out of the log - real additions and every other skip reason
+    # (private/archived/shuttered-name) still get logged in full.
+    ./slackbackup channel register '*' '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
+    echo "----- channel register exited ${PIPESTATUS[0]} -----"
+
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"
 
