@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import zipfile
 
@@ -1172,8 +1173,15 @@ def _gather_digest_data(
 
     catalog_cache: dict[str, dict] = {}
 
-    for entry in select_channels(channels_file, workspace_glob):
+    entries = select_channels(channels_file, workspace_glob)
+    for i, entry in enumerate(entries, 1):
         workspace, channel, channel_id = entry["workspace"], entry["name"], entry["id"]
+        # Debug SlackBackup nightly hang (2026-08-04/05, see sat-811): this
+        # loop shells out to `slackdump convert` once per channel with no
+        # other output in between, so a stall or OOM kill here is otherwise
+        # invisible in nightly.log until the whole job silently never
+        # finishes. Cheap enough to leave in permanently.
+        print(f"export digest: converting {workspace}/{channel} [{i}/{len(entries)}]", file=sys.stderr, flush=True)
         if workspace not in catalog_cache:
             catalog_cache[workspace] = catalog_logic.load(catalog_cache_dir, workspace)
         channel_info = _channel_context(catalog_cache[workspace], channel_id)
