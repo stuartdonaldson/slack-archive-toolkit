@@ -58,21 +58,30 @@ cp "$REPO_ROOT/docs/f3-culture.md" \
     # up, so a channel created since last night's run gets archived in
     # *this* run instead of waiting for someone to catch it manually.
     # channel_logic.register_matching() was built for exactly this ("run
-    # nightly" is in its own docstring) - '*' '*' covers every currently
-    # registered workspace (not just f3*, e.g. dungeons-of-finn-hill too)
-    # and every channel name. It always skips private/archived/"shuttered*"
-    # channels and channels already in channels.json regardless of the glob.
-    # Note: this always does a FULL (non-member-only) channel listing per
-    # workspace - confirmed several minutes and rate-limit-prone per
-    # workspace in docs/references/slackdump-cli-notes.md, so this step can
-    # meaningfully add to the nightly run's total wall-clock time; slackdump
-    # backs off and retries automatically, it's just slow, not broken.
-    # "already-registered" is by far the most common outcome once
-    # channels.json is mostly caught up, so it's the one skip reason
-    # filtered out of the log - real additions and every other skip reason
-    # (private/archived/shuttered-name) still get logged in full.
-    ./slackbackup channel register '*' '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
-    echo "----- channel register exited ${PIPESTATUS[0]} -----"
+    # nightly" is in its own docstring); it already only *registers*
+    # channels.json-missing ones, skipping private/archived/"shuttered*"/
+    # already-registered regardless of glob - nothing to optimize there.
+    # The unavoidable cost is the FULL (non-member-only) catalog listing
+    # register_matching does per workspace to even know what's out there to
+    # diff against - confirmed several minutes and rate-limit-prone per
+    # workspace in docs/references/slackdump-cli-notes.md, with no cheaper
+    # "just the new ones" API to fall back on. Scanning all 9 workspaces
+    # every night could meaningfully lengthen an already-long run, so
+    # instead rotate one workspace per night (day-of-year mod workspace
+    # count) - bounds the added cost to a single workspace's full listing
+    # while still rescanning every workspace roughly weekly, plenty
+    # responsive for "a new channel was created."
+    mapfile -t _known_workspaces < <(./slackbackup workspace list 2>/dev/null | tail -n +2 | awk '{print $1}')
+    if [ "${#_known_workspaces[@]}" -gt 0 ]; then
+        _day_of_year=$((10#$(date -u +%j)))
+        _ws_idx=$(( _day_of_year % ${#_known_workspaces[@]} ))
+        _ws_tonight="${_known_workspaces[$_ws_idx]}"
+        echo "channel register: scanning '$_ws_tonight' tonight (workspace $((_ws_idx + 1))/${#_known_workspaces[@]} in nightly rotation)"
+        ./slackbackup channel register "$_ws_tonight" '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
+        echo "----- channel register exited ${PIPESTATUS[0]} -----"
+    else
+        echo "channel register: skipping - could not list known workspaces" >&2
+    fi
 
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"
