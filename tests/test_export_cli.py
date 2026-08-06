@@ -14,6 +14,12 @@ import pytest
 from slackbackup import export, export_logic
 
 
+_SAMPLE_FILES_OUT_ENTRY = {
+    "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "id": "F1",
+    "content": "hello", "content_sha256": "abc123",
+}
+
+
 def _write_job(path: Path, **fields) -> Path:
     job = {"type": "digest", "out": str(path.parent / (path.stem + "-out-{as_of}.json"))}
     job.update(fields)
@@ -50,16 +56,20 @@ def _stub_profiles(monkeypatch, raise_for_glob=None):
 
     def fake_build_digest(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
-        catalog_cache_dir=None, handler=None, profiles_doc=None,
+        catalog_cache_dir=None, handler=None, profiles_doc=None, files_out_sink=None,
     ):
         fake_build_digest.calls.append(days)
+        if files_out_sink is not None:
+            files_out_sink.append(_SAMPLE_FILES_OUT_ENTRY)
         return {"channels": [], "messages": []}
 
     def fake_build_monthly_digests(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
-        catalog_cache_dir=None, handler=None, profiles_doc=None,
+        catalog_cache_dir=None, handler=None, profiles_doc=None, files_out_sink=None,
     ):
         fake_build_monthly_digests.calls.append(days)
+        if files_out_sink is not None:
+            files_out_sink.append(_SAMPLE_FILES_OUT_ENTRY)
         return {
             "2026-04": {"channels": [], "messages": [], "export_scope": {"month": "2026-04"}},
             "2026-05": {"channels": [], "messages": [], "export_scope": {"month": "2026-05"}},
@@ -242,3 +252,52 @@ def test_resolve_job_out_substitutes_month_placeholder():
     resolved = export_logic.resolve_job_out("~/exports/digest-{as_of}-{month}.json", "2026-07-01", month="2026-04")
 
     assert resolved.name == "digest-2026-07-01-2026-04.json"
+
+
+def test_run_job_writes_files_out_sidecar_when_job_sets_files_out(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(
+        tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"],
+        files_out=str(tmp_path / "job-files-{as_of}.json"),
+    )
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+
+    files_out_path = tmp_path / "job-files-2026-07-01.json"
+    assert files_out_path.exists()
+    doc = json.loads(files_out_path.read_text())
+    assert doc["schema_version"] == "slack-llm-files-v1"
+    assert doc["files"][0]["id"] == "F1"
+    assert doc["files"][0]["first_seen_at"] == doc["generated_at"]
+
+
+def test_run_job_omits_files_out_write_when_job_has_no_files_out_field(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"])
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+
+    assert list(tmp_path.glob("job-files-*.json")) == []
+
+
+def test_run_job_files_out_carries_forward_first_seen_at_across_runs(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(
+        tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"],
+        files_out=str(tmp_path / "job-files-{as_of}.json"),
+    )
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+    first_seen_at = json.loads((tmp_path / "job-files-2026-07-01.json").read_text())["files"][0]["first_seen_at"]
+
+    export._run_job(str(job_file), job, args, "2026-07-02")
+    second_run = json.loads((tmp_path / "job-files-2026-07-02.json").read_text())["files"][0]
+
+    assert second_run["first_seen_at"] == first_seen_at
+    assert second_run["content_changed_at"] is None

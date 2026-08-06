@@ -3,6 +3,7 @@ message ever archived (or the trailing N days, via --days) across every
 f3* workspace. Separate from test_export_logic.py (the per-channel-month
 exporter) - different schema, same underlying fixtures.
 """
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -385,7 +386,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v3"
+    assert result["schema_version"] == "slack-llm-digest-v4"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
@@ -1730,7 +1731,7 @@ def test_build_digest_emits_top_level_mentions_index(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v3"
+    assert result["schema_version"] == "slack-llm-digest-v4"
     assert isinstance(result["mentions"], dict)
     assert "mentions_index" in result["manifest"]["counting_rules"]
 
@@ -1793,7 +1794,7 @@ def test_build_monthly_digests_stamps_month_on_export_scope(tmp_path):
 
     for month, doc in results.items():
         assert doc["export_scope"]["month"] == month
-        assert doc["schema_version"] == "slack-llm-digest-v3"
+        assert doc["schema_version"] == "slack-llm-digest-v4"
 
 
 def test_build_monthly_digests_recomputes_channel_activity_per_month(tmp_path):
@@ -1831,3 +1832,262 @@ def test_build_monthly_digests_matches_build_digest_totals(tmp_path):
     total_roots = sum(len(doc["messages"]) for doc in monthly.values())
     assert total_roots == len(full["messages"])
     assert sorted(monthly) == ["2026-04", "2026-05", "2026-06"]
+
+
+# --- sat-811 Phase 1: files_out sidecar (schema v4) ---
+
+
+def test_digest_file_view_strips_content_and_derived_fields_adds_has_content():
+    full = {
+        "id": "F1", "name": "notes.txt", "content": "hello", "content_sha256": "abc",
+        "archive_status": "content_extracted", "blob_captured_at": "2026-01-01T00:00:00Z",
+    }
+    view = export_logic._digest_file_view(full)
+    assert "content" not in view
+    assert "content_sha256" not in view
+    assert "archive_status" not in view
+    assert "blob_captured_at" not in view
+    assert view["has_content"] is True
+    assert view["id"] == "F1"
+
+
+def test_digest_file_view_has_content_false_when_content_is_none():
+    view = export_logic._digest_file_view({"id": "F1", "content": None})
+    assert view["has_content"] is False
+
+
+def test_build_digest_channel_files_lose_content_but_gain_has_content(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<p>Coverage needed.</p>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    canvas = next(f for f in meta["files"] if f["id"] == "F05KESM0B7C")
+    image = next(f for f in meta["files"] if f["id"] == "F0BBJTND1KR")
+    assert "content" not in canvas
+    assert canvas["has_content"] is True
+    assert image["has_content"] is False
+
+
+def test_load_channel_files_sets_content_sha256_and_archive_status(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<p>Coverage needed.</p>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    canvas = next(f for f in files if f["id"] == "F05KESM0B7C")
+    image = next(f for f in files if f["id"] == "F0BBJTND1KR")
+    assert canvas["archive_status"] == "content_extracted"
+    assert canvas["content_sha256"] == hashlib.sha256(canvas["content"].encode("utf-8")).hexdigest()
+    assert image["archive_status"] == "no_blob"  # blob never downloaded in this fixture
+    assert image["content_sha256"] is None
+
+
+def test_load_channel_files_archive_status_tombstone_when_mode_is_tombstone(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    tombstoned = {**CANVAS_FILE, "id": "FDEAD1", "mode": "tombstone"}
+    _make_file_db(channel_dir / "slackdump.sqlite", [tombstoned])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["archive_status"] == "tombstone"
+
+
+def _canvas_update_message(ts: str, editor_text: str, file_id: str) -> dict:
+    return {
+        "type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": ts,
+        "blocks": [
+            {"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": f"{editor_text} made updates to a canvas tab: "},
+                    {"type": "canvas", "Raw": json.dumps({"type": "canvas", "file_id": file_id})},
+                ]},
+            ]},
+        ],
+    }
+
+
+def test_parse_canvas_update_message_extracts_editor_and_file_id():
+    msg = _canvas_update_message("1780000000.000100", "Daniel Hüsch", "F05KESM0B7C")
+    parsed = export_logic._parse_canvas_update_message(msg)
+    assert parsed == {"file_id": "F05KESM0B7C", "editor_name": "Daniel Hüsch", "ts": "1780000000.000100"}
+
+
+def test_parse_canvas_update_message_unwraps_double_wrapped_raw_from_slackdump_export():
+    """Regression: `slackdump convert -f export` has no native struct for
+    this rich_text sub-element, so it round-trips it through its own
+    generic {"type":..., "Raw": <json-string>} wrapper on top of whatever
+    was already in the archive - observed 2 levels deep on a real
+    f3nation message (sat-811 §9), not the 1 level a raw sqlite row
+    shows."""
+    double_wrapped = {
+        "type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": "1780000000.000100",
+        "blocks": [
+            {"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "James Carroll made updates to a canvas tab: "},
+                    {"type": "canvas", "Raw": json.dumps({
+                        "type": "canvas",
+                        "Raw": json.dumps({"type": "canvas", "file_id": "F0A7R2GS743"}),
+                    })},
+                ]},
+            ]},
+        ],
+    }
+    parsed = export_logic._parse_canvas_update_message(double_wrapped)
+    assert parsed == {"file_id": "F0A7R2GS743", "editor_name": "James Carroll", "ts": "1780000000.000100"}
+
+
+def test_parse_canvas_update_message_none_for_other_subtypes():
+    assert export_logic._parse_canvas_update_message({"subtype": "channel_join", "ts": "1.0"}) is None
+
+
+def test_parse_canvas_update_message_none_when_block_shape_unrecognized():
+    msg = {"type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": "1.0", "blocks": []}
+    assert export_logic._parse_canvas_update_message(msg) is None
+
+
+def test_resolve_canvas_event_resolves_single_editor_unambiguously():
+    profiles = {"U1": {"id": "U1", "real_name": "Daniel Hüsch"}}
+    event = {"ts": "1780000000.000100", "editor_name": "Daniel Hüsch", "channel": "ao-book-club", "channel_id": "C1"}
+    resolved = export_logic._resolve_canvas_event(event, profiles)
+    assert resolved["editor_user_id"] == "U1"
+    assert resolved["editor_match_confidence"] == "high"
+    assert resolved["message_ts"] == "1780000000.000100"
+
+
+def test_resolve_canvas_event_never_guesses_compound_editor():
+    profiles = {"U1": {"id": "U1", "real_name": "Daniel Hüsch"}, "U2": {"id": "U2", "real_name": "Justin Kinney"}}
+    event = {
+        "ts": "1780000000.000100", "editor_name": "Daniel Hüsch and Justin Kinney",
+        "channel": "ao-book-club", "channel_id": "C1",
+    }
+    resolved = export_logic._resolve_canvas_event(event, profiles)
+    assert "editor_user_id" not in resolved
+    assert "editor_match_confidence" not in resolved
+    assert resolved["editor_name"] == "Daniel Hüsch and Justin Kinney"
+
+
+def _canvas_update_convert_fn(channel_dir: Path, out_dir: Path) -> None:
+    """A convert_fn stand-in producing one human root message plus one
+    tabbed_canvas_updated system message referencing CANVAS_FILE."""
+    out = out_dir / channel_dir.name
+    out.mkdir(parents=True)
+    (out_dir / "users.json").write_text(json.dumps([
+        {"id": "U1", "name": "daniel", "real_name": "Daniel Hüsch", "profile": {"display_name": "Daniel"}},
+    ]))
+    (out / "2026-06-02.json").write_text(json.dumps([
+        {"type": "message", "user": "U1", "ts": "1780387200.000100", "text": "morning post"},
+        _canvas_update_message("1780387300.000100", "Daniel Hüsch", CANVAS_FILE["id"]),
+    ]))
+
+
+def test_gather_digest_data_strips_canvas_update_messages_and_fixes_counts(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert all(m.get("subtype") != "tabbed_canvas_updated" for m in result["messages"])
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta["root_message_count"] == 1  # the canvas notice no longer counts
+    assert meta["participant_count"] == 1  # USLACKBOT excluded
+
+
+def test_gather_digest_data_files_out_sink_collects_content_and_modification_history(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    sink: list[dict] = []
+    export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache", files_out_sink=sink,
+    )
+
+    entry = next(f for f in sink if f["id"] == CANVAS_FILE["id"])
+    assert entry["workspace"] == "f3pugetsound"
+    assert entry["channel_id"] == "C1"
+    assert entry["modification_history_completeness"] == "partial"
+    event = entry["modification_history"][0]
+    assert event["editor_name"] == "Daniel Hüsch"
+    assert event["editor_user_id"] == "U1"
+    assert event["message_ts"] == "1780387300.000100"
+
+
+def test_merge_files_out_first_run_stamps_first_seen_at_no_content_changed(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert doc["schema_version"] == "slack-llm-files-v1"
+    assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] is None
+
+
+def test_merge_files_out_carries_forward_first_seen_at_unchanged_content(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] is None
+
+
+def test_merge_files_out_stamps_content_changed_at_when_sha_differs(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "xyz"}]
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_merge_files_out_last_modified_at_is_max_of_modification_history():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "modification_history": [{"at": "2026-03-01T00:00:00Z"}, {"at": "2026-07-01T00:00:00Z"}],
+    }]
+    doc = export_logic.merge_files_out(entries, None, "2026-07-02T00:00:00Z")
+    assert doc["files"][0]["last_modified_at"] == "2026-07-01T00:00:00Z"

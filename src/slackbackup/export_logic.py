@@ -603,6 +603,24 @@ def _clean_file(data: dict) -> dict:
     }
 
 
+def _file_archive_status(data: dict, blob_exists: bool, content: str | None) -> str:
+    """One of content_extracted | no_blob | unsupported_type | tombstone
+    (sat-811 §8) - lets a files_out consumer tell "no text because Slack
+    deleted the file" apart from "no text because we can't parse this
+    type" apart from "we never captured the blob at all". The tombstone
+    check (Slack's FILE.mode == "tombstone" for a deleted file) is a
+    best-effort inference, not verified against a real tombstoned row in
+    this project's archives - a wrong guess here only costs a cosmetic
+    "unsupported_type"/"no_blob" instead of "tombstone", never content."""
+    if data.get("mode") == "tombstone":
+        return "tombstone"
+    if not blob_exists:
+        return "no_blob"
+    if content is not None:
+        return "content_extracted"
+    return "unsupported_type"
+
+
 def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str | None) -> str | None:
     """Path (relative to the archive root - two levels above channel_dir,
     i.e. <workspace>/<channel>/...) to the downloaded blob for a file, if
@@ -659,10 +677,158 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
         exists = blob_path.exists()
         cleaned["local_path"] = str(blob_path.relative_to(channel_dir.parent.parent)) if exists else None
         cleaned["content"] = _extract_file_content(cleaned["mimetype"] or "", blob_path if exists else None)
+        # sat-811 §8 (files_out sidecar change-detection): content_sha256
+        # lets a cumulative sidecar detect a real content edit even if the
+        # tabbed_canvas_updated notice that would have announced it was
+        # later deleted from the channel (see _extract_canvas_modification_events).
+        cleaned["content_sha256"] = (
+            hashlib.sha256(cleaned["content"].encode("utf-8")).hexdigest() if cleaned["content"] is not None else None
+        )
+        cleaned["blob_captured_at"] = _format_utc(blob_path.stat().st_mtime) if exists else None
+        cleaned["archive_status"] = _file_archive_status(data, exists, cleaned["content"])
         files.append(cleaned)
 
     files.sort(key=lambda f: f["created_at"] or "")
     return files
+
+
+_DIGEST_ONLY_FILE_KEYS = ("content", "content_sha256", "archive_status", "blob_captured_at")
+
+
+def _digest_file_view(file_entry: dict) -> dict:
+    """The digest's channels[].files[] entry (schema v4, sat-811 §3):
+    everything _load_channel_files produces except the extracted `content`
+    itself (and the sidecar-only fields that travel with it) - content
+    lives in the files_out sidecar now, joined by (workspace, channel_id,
+    id). `has_content` tells a consumer whether it's worth the join."""
+    out = {k: v for k, v in file_entry.items() if k not in _DIGEST_ONLY_FILE_KEYS}
+    out["has_content"] = file_entry.get("content") is not None
+    return out
+
+
+_CANVAS_MIMETYPE = "application/vnd.slack-docs"
+
+
+def _is_canvas_file(file_entry: dict) -> bool:
+    return file_entry.get("mimetype") == _CANVAS_MIMETYPE or file_entry.get("pretty_type") == "Canvas"
+
+
+_CANVAS_UPDATE_TEXT_RE = re.compile(r"^(.+?)\s+made updates to a canvas tab:\s*$")
+
+
+_CANVAS_UPDATE_UNWRAP_LIMIT = 5
+
+
+def _canvas_update_file_id(elements: list[dict]) -> str | None:
+    for el in elements:
+        # Verified against real archived tabbed_canvas_updated messages
+        # (sat-811 §9): the canvas block element's payload key is "Raw"
+        # (capital R), not "raw" - Slack's own inconsistent casing, not a
+        # typo here. slackdump's own `convert -f export` has no native Go
+        # struct for this rich_text sub-element type, so it round-trips the
+        # unrecognized element through its own generic {"type":...,
+        # "Raw": <json-string>} wrapper on top of whatever was already in
+        # the archive - observed 2 levels deep on a real f3nation message
+        # (once from Slack's own event shape, once more from slackdump's
+        # export step), so this unwraps repeatedly (bounded) until a
+        # "file_id" key surfaces, rather than assuming a fixed depth.
+        payload = el
+        for _ in range(_CANVAS_UPDATE_UNWRAP_LIMIT):
+            if not isinstance(payload, dict):
+                break
+            file_id = payload.get("file_id")
+            if file_id:
+                return file_id
+            raw = payload.get("Raw")
+            if not raw:
+                break
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                break
+    return None
+
+
+def _parse_canvas_update_message(msg: dict) -> dict | None:
+    """Parses a Slack `tabbed_canvas_updated` system message (sat-811 §9)
+    into {file_id, editor_name (raw, possibly compound), ts}, or None if
+    the block shape doesn't match - defensive, since this subtype's block
+    layout is reverse-engineered from the archive, not documented by
+    Slack. user is always USLACKBOT on this subtype; the real editor is
+    only present as a display-name string in the block text."""
+    if msg.get("subtype") != "tabbed_canvas_updated":
+        return None
+    editor_text = None
+    file_id = None
+    for block in msg.get("blocks") or []:
+        for outer in block.get("elements") or []:
+            elements = outer.get("elements") or []
+            if editor_text is None:
+                for el in elements:
+                    if el.get("type") == "text":
+                        match = _CANVAS_UPDATE_TEXT_RE.match(el.get("text") or "")
+                        if match:
+                            editor_text = match.group(1)
+                            break
+            if file_id is None:
+                file_id = _canvas_update_file_id(elements)
+    if file_id is None or editor_text is None:
+        return None
+    return {"file_id": file_id, "editor_name": editor_text, "ts": msg["ts"]}
+
+
+def _extract_canvas_modification_events(
+    all_messages: list[dict], channel: str, channel_id: str
+) -> dict[str, list[dict]]:
+    """Every `tabbed_canvas_updated` system message in one channel's raw
+    (unfiltered by export_scope - see sat-811 §8 "cumulative, not window-
+    relative") message stream, grouped by the canvas file_id it names.
+    Deduped by ts per file (resume cycles duplicate rows, like the FILE
+    table itself), sorted ascending. Editor-id resolution happens later,
+    once a workspace's profiles are available (see _resolve_canvas_editor)."""
+    by_file: dict[str, dict[str, dict]] = {}
+    for msg in all_messages:
+        parsed = _parse_canvas_update_message(msg)
+        if parsed is None:
+            continue
+        slot = by_file.setdefault(parsed["file_id"], {})
+        slot[parsed["ts"]] = {
+            "ts": parsed["ts"], "editor_name": parsed["editor_name"], "channel": channel, "channel_id": channel_id,
+        }
+    return {
+        file_id: sorted(events.values(), key=lambda e: float(e["ts"]))
+        for file_id, events in by_file.items()
+    }
+
+
+def _resolve_canvas_editor(name: str, profiles: dict[str, dict]) -> tuple[str | None, str | None]:
+    """Matches a canvas-update notice's raw editor display string against
+    a workspace's roster by normalized real_name. Only ever returns an id
+    for an unambiguous single match - "Never guess" (sat-811 §9)."""
+    norm = _normalize_name(name)
+    matches = [p for p in profiles.values() if _normalize_name(p.get("real_name")) == norm]
+    if len(matches) == 1:
+        return matches[0]["id"], "high"
+    return None, None
+
+
+def _resolve_canvas_event(event: dict, profiles: dict[str, dict]) -> dict:
+    out = {
+        "at": _format_utc(float(event["ts"])),
+        "editor_name": event["editor_name"],
+        "channel": event["channel"],
+        "channel_id": event["channel_id"],
+        "message_ts": event["ts"],
+    }
+    # Compound editors ("Daniel Hüsch and Justin Kinney") can't be resolved
+    # to one id - splitting them is only for detecting the compound case,
+    # never to guess which half made the edit.
+    if len(re.split(r"\s+and\s+", event["editor_name"])) == 1:
+        uid, confidence = _resolve_canvas_editor(event["editor_name"], profiles)
+        if uid is not None:
+            out["editor_user_id"] = uid
+            out["editor_match_confidence"] = confidence
+    return out
 
 
 def select_messages_in_range(
@@ -1138,6 +1304,7 @@ def _gather_digest_data(
     catalog_cache_dir: Path,
     handler,
     profiles_doc: dict | None,
+    files_out_sink: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, set[str]], dict, tuple[str | None, str]]:
     """Shared first phase of build_digest/build_monthly_digests: reads
     every (workspace, channel) in `channels_file` matching `workspace_glob`,
@@ -1148,7 +1315,14 @@ def _gather_digest_data(
     workspace's bot-id set, the profiles doc, and the resolved
     (date_from, date_to) range. A channel with no archive on disk is
     recorded with status "missing_archive" and skipped - one un-archived
-    channel must not abort a digest spanning many workspaces."""
+    channel must not abort a digest spanning many workspaces.
+
+    `files_out_sink`, when given, is appended to in place with one full
+    per-file entry (content, content_sha256, archive_status,
+    modification_history, ...) per channel file - the raw ingredients for
+    the files_out sidecar (sat-811 §3/§8/§9). The digest's own
+    channels_meta only ever gets the content-stripped view
+    (_digest_file_view) regardless of whether a sink was given."""
     date_from, date_to = trailing_days_range(days, as_of)
     from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
     to_epoch = _date_epoch(date_to, "23:59:59")
@@ -1164,6 +1338,14 @@ def _gather_digest_data(
         profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
     bot_ids_by_workspace: dict[str, set[str]] = {
         ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+    # For canvas-editor resolution (sat-811 §9) - same shape as the
+    # analogous per-workspace profile lookups elsewhere in this module
+    # (_build_user_index, build_mentions_index).
+    profiles_by_workspace: dict[str, dict[str, dict]] = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
         for ws_entry in profiles_doc["workspaces"]
         if ws_entry["status"] == "ok"
     }
@@ -1203,17 +1385,38 @@ def _gather_digest_data(
             all_messages = _load_all_messages(export_dir_path)
             users_map = _load_users_map(export_dir_path)
 
+        # Canvas edit history (sat-811 §9) is read from the whole raw
+        # stream, not the range-filtered slice below - it's cumulative like
+        # the files_out sidecar itself, not export_scope-bounded. Then the
+        # notices are stripped before range-filtering/counting: they carry
+        # no text, their author is always USLACKBOT, and left in they
+        # inflate root_message_count/participant_count for a bot account
+        # (see §9's "currently corrupt activity counts").
+        canvas_events_by_file = _extract_canvas_modification_events(all_messages, channel, channel_id)
+        all_messages = [m for m in all_messages if m.get("subtype") != "tabbed_canvas_updated"]
+
         cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch, channel_dir=channel_dir)
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
         _assign_digest_seq(cleaned)
         messages.extend(cleaned)
-        files = _load_channel_files(channel_dir)
+        files_full = _load_channel_files(channel_dir)
+        if files_out_sink is not None:
+            profiles = profiles_by_workspace.get(workspace, {})
+            for f in files_full:
+                entry = {**f, "workspace": workspace, "channel": channel, "channel_id": channel_id}
+                events = canvas_events_by_file.get(f["id"], [])
+                if events:
+                    entry["modification_history"] = [_resolve_canvas_event(e, profiles) for e in events]
+                if _is_canvas_file(f):
+                    entry.setdefault("modification_history", [])
+                    entry["modification_history_completeness"] = "partial"
+                files_out_sink.append(entry)
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
                 "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
-                "files": files, **channel_info,
+                "files": [_digest_file_view(f) for f in files_full], **channel_info,
             }
         )
 
@@ -1296,6 +1499,55 @@ def partition_messages_by_month(messages: list[dict]) -> dict[str, list[dict]]:
     return buckets
 
 
+def merge_files_out(
+    entries: list[dict], previous_sidecar: dict | None, generated_at: str
+) -> dict:
+    """Builds the cumulative files_out sidecar document (sat-811 §8) from
+    this run's raw per-file entries (as collected via build_digest's/
+    build_monthly_digests' `files_out_sink`) plus the previous sidecar
+    snapshot, if any. Cumulative, not window-relative - like
+    _load_channel_files itself, this reflects "what documents currently
+    exist in this region", not "what changed in export_scope".
+
+    Keyed by (workspace, channel_id, id) across runs:
+    - first_seen_at carries forward from the first run a file id appeared
+      in, else is stamped with this run's generated_at.
+    - content_changed_at is stamped with this run's generated_at only when
+      content_sha256 actually differs from the previous snapshot (and
+      carried forward unchanged otherwise) - see _load_channel_files for
+      why this is the durable signal even when a canvas's
+      tabbed_canvas_updated notice was deleted from the channel (sat-811
+      §9's "presence is authoritative, absence proves nothing").
+    - last_modified_at, when a file carries modification_history, is the
+      max of that history's `at` values - the primary currency signal for
+      a canvas (sat-811 §8's ranking).
+    """
+    previous_by_key: dict[tuple, dict] = {
+        (f["workspace"], f["channel_id"], f["id"]): f for f in (previous_sidecar or {}).get("files", [])
+    }
+
+    files_out: list[dict] = []
+    for entry in entries:
+        key = (entry["workspace"], entry["channel_id"], entry["id"])
+        prev = previous_by_key.get(key)
+        first_seen_at = prev["first_seen_at"] if prev is not None else generated_at
+        content_changed_at = prev.get("content_changed_at") if prev is not None else None
+        if prev is not None and prev.get("content_sha256") != entry.get("content_sha256"):
+            content_changed_at = generated_at
+        out = {**entry, "first_seen_at": first_seen_at, "content_changed_at": content_changed_at}
+        history = entry.get("modification_history")
+        if history:
+            out["last_modified_at"] = max(h["at"] for h in history)
+        files_out.append(out)
+
+    files_out.sort(key=lambda f: (f["workspace"], f["channel_id"], f["id"]))
+    return {
+        "schema_version": "slack-llm-files-v1",
+        "generated_at": generated_at,
+        "files": files_out,
+    }
+
+
 def _assemble_digest(
     channels_meta_base: list[dict],
     messages_slice: list[dict],
@@ -1336,12 +1588,22 @@ def _assemble_digest(
         export_scope["month"] = month
 
     return {
-        "schema_version": "slack-llm-digest-v3",
+        "schema_version": "slack-llm-digest-v4",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": export_scope,
         "manifest": {
             "workspaces_included": len({c["workspace"] for c in channels_meta_base}),
             "counting_rules": {
+                "has_content": (
+                    "v4: a channel file's extracted text moved out of this document into a "
+                    "companion files_out sidecar (same job, same as_of) - join on (workspace, "
+                    "channel_id, id). has_content: false means no text was ever extractable for "
+                    "this file (see the sidecar's archive_status), not that the sidecar is missing. "
+                    "tabbed_canvas_updated system messages (Slack's 'X made updates to a canvas "
+                    "tab' notices) are also stripped from messages[] in v4 and no longer inflate "
+                    "root_message_count/participant_count for the USLACKBOT account; see the "
+                    "sidecar's per-file modification_history for the edit events they carried."
+                ),
                 "root_message_count": "top-level messages only",
                 "reply_count": "nested replies under root messages",
                 "total_message_count": "root_message_count plus reply_count",
@@ -1423,11 +1685,12 @@ def build_digest(
     catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
     handler=_default_handler,
     profiles_doc: dict | None = None,
+    files_out_sink: list[dict] | None = None,
 ) -> dict:
     """Merges messages from the trailing `days` days (or everything ever
     archived, when `days` is None) across every (workspace, channel) in
     `channels_file` matching `workspace_glob` into one chronologically-
-    sorted slack-llm-digest-v3 document. See _gather_digest_data and
+    sorted slack-llm-digest-v4 document. See _gather_digest_data and
     _assemble_digest for the two phases this composes; see
     build_monthly_digests for the equivalent split into one document per
     calendar month.
@@ -1444,7 +1707,10 @@ def build_digest(
     Each "ok" channel's entry also carries its files/Canvases (images
     included, see _load_channel_files) - read directly from the channel's own
     archive, not via convert_fn, since an unattached channel Canvas never
-    surfaces in a message-anchored export.
+    surfaces in a message-anchored export. v4 drops each file's extracted
+    `content` from this view (has_content only) - pass `files_out_sink` to
+    also collect the full per-file entries (content included) for the
+    companion files_out sidecar; see merge_files_out.
 
     `handler` (see handlers/__init__.py) supplies the digest's "leadership"
     section - defaults to the "f3" handler for backward compatibility with
@@ -1458,6 +1724,7 @@ def build_digest(
     """
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+        files_out_sink=files_out_sink,
     )
     return _assemble_digest(
         channels_meta, messages, profiles_doc, handler, date_from, date_to, days, workspace_glob, bot_ids_by_workspace,
@@ -1474,8 +1741,9 @@ def build_monthly_digests(
     catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
     handler=_default_handler,
     profiles_doc: dict | None = None,
+    files_out_sink: list[dict] | None = None,
 ) -> dict[str, dict]:
-    """Same data and same slack-llm-digest-v3 schema as build_digest, but
+    """Same data and same slack-llm-digest-v4 schema as build_digest, but
     split into one document per calendar month (keyed "YYYY-MM") instead of
     one merged document. A thread's replies stay with their parent's
     month even when a reply itself lands in a later month - see
@@ -1483,9 +1751,12 @@ def build_monthly_digests(
     reply that belongs to a thread it started. Each month's channel/
     workspace_activity_index/user_index/mentions are recomputed against
     just that month's message slice; "leadership" is unchanged across
-    months (it reflects current roster roles, not activity)."""
+    months (it reflects current roster roles, not activity). files_out_sink
+    is collected once by the shared gather phase, not per month - a file
+    has no natural month (see build_digest)."""
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+        files_out_sink=files_out_sink,
     )
     buckets = partition_messages_by_month(messages)
     return {

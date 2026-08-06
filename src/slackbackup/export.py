@@ -208,11 +208,11 @@ def _write_digest(result: dict, out_path: Path, label: str) -> None:
 
 def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, days: int | None,
                  as_of: str, out_template: str, handler, profiles_doc: dict | None = None,
-                 split_by_month: bool = False) -> None:
+                 split_by_month: bool = False, files_out_sink: list[dict] | None = None) -> None:
     if split_by_month:
         results = export_logic.build_monthly_digests(
             channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
-            handler=handler, profiles_doc=profiles_doc,
+            handler=handler, profiles_doc=profiles_doc, files_out_sink=files_out_sink,
         )
         for month in sorted(results):
             out_path = export_logic.resolve_job_out(out_template, as_of, month=month)
@@ -221,9 +221,29 @@ def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, da
 
     result = export_logic.build_digest(
         channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
-        handler=handler, profiles_doc=profiles_doc,
+        handler=handler, profiles_doc=profiles_doc, files_out_sink=files_out_sink,
     )
     _write_digest(result, export_logic.resolve_job_out(out_template, as_of), "")
+
+
+def _write_files_out(job_file: str, files_out_path: Path, entries: list[dict]) -> None:
+    """Merges this run's raw per-file entries with whatever files_out
+    sidecar already sits at `files_out_path` (sat-811 §8 - cumulative, not
+    window-relative) and rewrites it. A previous file that fails to parse
+    is treated as absent rather than aborting the job - a corrupt sidecar
+    must not block tonight's digest."""
+    previous_sidecar = None
+    if files_out_path.exists():
+        try:
+            previous_sidecar = json.loads(files_out_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"export digest: job {job_file}: ignoring unreadable files_out {files_out_path}: {exc}", file=sys.stderr)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    doc = export_logic.merge_files_out(entries, previous_sidecar, generated_at)
+    files_out_path.parent.mkdir(parents=True, exist_ok=True)
+    files_out_path.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    print(f"export digest: job {job_file}: {len(doc['files'])} files -> {files_out_path}", file=sys.stderr)
 
 
 def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> None:
@@ -242,10 +262,16 @@ def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> 
         users_out_path.write_text(json.dumps(profiles_doc, indent=2))
         print(f"export digest: job {job_file}: user profiles -> {users_out_path}", file=sys.stderr)
 
+    files_out_sink: list[dict] | None = [] if "files_out" in job else None
+
     _run_digest(
         channels_file, archive_root, workspace_glob, job.get("days", args.days), as_of,
         job["out"], handler, profiles_doc=profiles_doc, split_by_month=split_by_month,
+        files_out_sink=files_out_sink,
     )
+
+    if files_out_sink is not None:
+        _write_files_out(job_file, export_logic.resolve_job_out(job["files_out"], as_of), files_out_sink)
 
 
 def _digest(args: argparse.Namespace) -> int:
