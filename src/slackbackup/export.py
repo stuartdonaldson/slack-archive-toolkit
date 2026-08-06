@@ -235,8 +235,8 @@ def _write_files_out(job_file: str, files_out_path: Path, entries: list[dict]) -
     previous_sidecar = None
     if files_out_path.exists():
         try:
-            previous_sidecar = json.loads(files_out_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+            previous_sidecar = json.loads(files_out_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             print(f"export digest: job {job_file}: ignoring unreadable files_out {files_out_path}: {exc}", file=sys.stderr)
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

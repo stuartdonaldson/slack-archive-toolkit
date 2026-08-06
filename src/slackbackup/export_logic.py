@@ -1522,15 +1522,21 @@ def merge_files_out(
       max of that history's `at` values - the primary currency signal for
       a canvas (sat-811 §8's ranking).
     """
-    previous_by_key: dict[tuple, dict] = {
-        (f["workspace"], f["channel_id"], f["id"]): f for f in (previous_sidecar or {}).get("files", [])
-    }
+    previous_by_key: dict[tuple, dict] = {}
+    for f in (previous_sidecar or {}).get("files", []):
+        if not isinstance(f, dict):
+            continue
+        try:
+            key = (f["workspace"], f["channel_id"], f["id"])
+        except KeyError:
+            continue  # malformed prior entry - treat as absent, not fatal (sat-811 §8)
+        previous_by_key[key] = f
 
     files_out: list[dict] = []
     for entry in entries:
         key = (entry["workspace"], entry["channel_id"], entry["id"])
         prev = previous_by_key.get(key)
-        first_seen_at = prev["first_seen_at"] if prev is not None else generated_at
+        first_seen_at = prev.get("first_seen_at", generated_at) if prev is not None else generated_at
         content_changed_at = prev.get("content_changed_at") if prev is not None else None
         if prev is not None and prev.get("content_sha256") != entry.get("content_sha256"):
             content_changed_at = generated_at
