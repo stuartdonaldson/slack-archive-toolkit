@@ -56,7 +56,12 @@ Two fix shapes were considered:
 → `export_logic.merge_files_out`), joined by `(workspace, channel_id, id)`. Unlike the digest,
   `files_out` is cumulative across runs (merged with whatever already exists at that path), not
   bounded by the digest's `--days` window — matching `_load_channel_files`'s existing behavior of
-  reading the whole archive's `FILE` table every run regardless of `days`.
+  reading the whole archive's `FILE` table every run regardless of `days`. The merge is additive:
+  a file recorded in a prior run but absent from this run's scan (its channel fell outside a
+  `--workspace`/`--channel` selector, its 90-day Slack retention window expired, or its archive is
+  transiently missing) is carried forward into the new sidecar unchanged, not dropped — Slack's own
+  retention already destroys the source; the sidecar must not additionally destroy its own record
+  of a file it saw while that file still existed.
 - `files_out` carries change-detection fields per file: `content_sha256`, `archive_status`
   (`content_extracted`/`no_blob`/`unsupported_type`/`tombstone`), `blob_captured_at`,
   `first_seen_at` (stamped once, carried forward), and `content_changed_at` (re-stamped only when

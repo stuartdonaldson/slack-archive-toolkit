@@ -2091,3 +2091,45 @@ def test_merge_files_out_last_modified_at_is_max_of_modification_history():
     }]
     doc = export_logic.merge_files_out(entries, None, "2026-07-02T00:00:00Z")
     assert doc["files"][0]["last_modified_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_merge_files_out_is_additive_carries_forward_entry_out_of_this_runs_scan():
+    """A file recorded in a prior run but absent from this run's entries
+    (channel fell outside a --workspace/--channel selector, its 90-day
+    Slack retention window expired, or its archive is transiently
+    missing) stays in the sidecar unchanged rather than being dropped -
+    the sidecar must not destroy its own record of a file Slack has
+    already destroyed."""
+    entries: list[dict] = []  # nothing seen this run - e.g. a narrow --channel selector
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert len(doc["files"]) == 1
+    assert doc["files"][0] == previous["files"][0]  # carried forward byte-for-byte
+
+
+def test_merge_files_out_skips_malformed_prior_entries():
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    previous = {"files": [
+        {"id": "F2"},  # missing workspace/channel_id - malformed, must not raise or leak into output
+        "not-a-dict",
+        {"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+         "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None},
+    ]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert [f["id"] for f in doc["files"]] == ["F1"]
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_merge_files_out_ignores_non_dict_previous_sidecar():
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+
+    doc = export_logic.merge_files_out(entries, "garbage", "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"

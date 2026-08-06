@@ -370,6 +370,13 @@ id)`:
 - `last_modified_at`, present only when `modification_history` is non-empty, is the max of that
   history's `at` values.
 
+The merge is **additive, not a rebuild from this run's scan alone**: a file recorded in a prior
+run's `files_out` but absent from this run's freshly-read entries — its channel fell outside a
+`--workspace`/`--channel` selector, its 90-day Slack retention window expired, or its archive is
+transiently missing — is carried forward into the merged sidecar unchanged rather than dropped.
+Slack's own retention already destroys the source; `files_out` must not additionally destroy its
+own record of a file it saw while that file still existed on Slack.
+
 ##### Canvas edit history from `tabbed_canvas_updated` (sat-811 §9 / sat-2s9)
 
 Slack posts a `tabbed_canvas_updated` system message into a channel whenever a Canvas tab is

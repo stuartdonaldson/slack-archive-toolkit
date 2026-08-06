@@ -1521,7 +1521,18 @@ def merge_files_out(
     - last_modified_at, when a file carries modification_history, is the
       max of that history's `at` values - the primary currency signal for
       a canvas (sat-811 §8's ranking).
+
+    Additive, not a rebuild from this run's scan alone: a file previously
+    recorded but absent from `entries` this run (its channel fell outside
+    --workspace/--channel selectors, its 90-day Slack retention window
+    expired, or its archive is transiently missing) is carried forward
+    unchanged rather than dropped - Slack's own 90-day free-tier retention
+    already destroys the source; the sidecar must not additionally destroy
+    its own record of a file we saw when it was still there.
     """
+    if not isinstance(previous_sidecar, dict):
+        previous_sidecar = None  # non-dict JSON (truncated/corrupt sidecar) - treat as absent, not fatal
+
     previous_by_key: dict[tuple, dict] = {}
     for f in (previous_sidecar or {}).get("files", []):
         if not isinstance(f, dict):
@@ -1532,7 +1543,7 @@ def merge_files_out(
             continue  # malformed prior entry - treat as absent, not fatal (sat-811 §8)
         previous_by_key[key] = f
 
-    files_out: list[dict] = []
+    files_by_key: dict[tuple, dict] = dict(previous_by_key)
     for entry in entries:
         key = (entry["workspace"], entry["channel_id"], entry["id"])
         prev = previous_by_key.get(key)
@@ -1544,8 +1555,9 @@ def merge_files_out(
         history = entry.get("modification_history")
         if history:
             out["last_modified_at"] = max(h["at"] for h in history)
-        files_out.append(out)
+        files_by_key[key] = out  # this run's view wins over the carried-forward previous entry
 
+    files_out = list(files_by_key.values())
     files_out.sort(key=lambda f: (f["workspace"], f["channel_id"], f["id"]))
     return {
         "schema_version": "slack-llm-files-v1",
