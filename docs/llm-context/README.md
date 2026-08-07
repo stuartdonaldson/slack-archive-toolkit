@@ -2,7 +2,7 @@
 
 This folder is a Markdown-first context pack for a shared ChatGPT session or ChatGPT Project. It prepares an LLM to safely answer questions about Slack-derived F3 information without treating profile signals or manually collected facts as current proof.
 
-See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources to curate into the completed pack](#sources-to-curate-into-the-completed-pack). **The pack is not yet validated or integrated** — the legacy documents remain the active sources for the nightly workflow and any deployed session/Project until Phase 3 (validation) and Phase 4 (integration) complete. Do not redirect automation or delete a legacy document based on this folder alone.
+See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources to curate into the completed pack](#sources-to-curate-into-the-completed-pack), have been validated (Phase 3; see [VALIDATION-RESULTS.md](VALIDATION-RESULTS.md)), and are now the active upload/copy source (Phase 4) — `scripts/nightly-backup-digest.sh` refreshes a curated `~/slack-exports/llm-context/` subtree from this folder each run, and `README.md`/`docs/OPERATIONS.md` reference it. The legacy documents named above remain available transitionally and are still refreshed nightly too, until [Phase 5](MIGRATION-PLAN.md#phase-5--retire-legacy-documents) retires them. Do not delete a legacy document based on this folder alone.
 
 ## Why Markdown for manual supplements
 

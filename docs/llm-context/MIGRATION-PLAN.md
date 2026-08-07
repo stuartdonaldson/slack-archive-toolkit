@@ -2,7 +2,7 @@
 
 ## Status
 
-**Phase 2 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files now exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added; the pack is not yet validated ([sat-ejk.3](#migration-tracking)) or integrated ([sat-ejk.4](#migration-tracking)), and no automation redirect or legacy retirement has occurred. Those actions are tracked by the epic and child issues in [Migration tracking](#migration-tracking).
+**Phase 4 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added. The pack was validated ([sat-ejk.3](#migration-tracking); see `VALIDATION-RESULTS.md` — 10/12 scenarios pass, two remediation issues filed rather than editing the pack ad hoc) and is now integrated ([sat-ejk.4](#migration-tracking)): the nightly copy workflow (`scripts/nightly-backup-digest.sh`), `README.md`, and `docs/OPERATIONS.md` reference the canonical pack, and `CLAUDE.md` carries the schema placement rule below. Legacy sources remain available; no legacy retirement has occurred ([sat-ejk.5](#migration-tracking)).
 
 ## Decision
 
@@ -155,7 +155,7 @@ Run `validation-set.md` against a matched digest, profile export, cumulative sid
 
 Update the documentation index, nightly context-copy workflow, and operator guidance to use the canonical pack. Establish the bounded runtime-copy layout. Add the approved schema placement rule to [CLAUDE.md](../../CLAUDE.md): digest/profile/sidecar schema change requires updates to [docs/DESIGN-export.md](../DESIGN-export.md) and `docs/llm-context/ingestion-contract.md`.
 
-**Exit criteria:** Active session and Project instructions use the pack; runtime copy behavior excludes planning and archival material; legacy sources remain available.
+**Exit criteria:** Active session and Project instructions use the pack; runtime copy behavior excludes planning and archival material; legacy sources remain available. **Met:** `scripts/nightly-backup-digest.sh` now copies a curated `~/slack-exports/llm-context/` subtree (contract, policy, domain context, both deployment-instruction files, prompts, active augmentations — excluding `README.md`, this plan, review notes, `VALIDATION-RESULTS.md`, `validation-set.md`, `augmentations/README.md`, and `augmentations/archive/`) alongside the unchanged legacy per-file copy; `README.md` §7–8 and its documentation table, and `docs/OPERATIONS.md`'s nightly step table, point at the canonical pack; `CLAUDE.md` carries the digest/profile/sidecar → `ingestion-contract.md` schema placement rule.
 
 ### Phase 5 — Retire legacy documents
 
@@ -193,9 +193,9 @@ The untracked State of the Nation transcript is in scope as a repository augment
 | --- | --- | --- |
 | `sat-ejk` | Parent epic: migrate LLM context pack | Open |
 | `sat-ejk.1` | Revise this migration plan from review decisions | Closed; Phase 1 |
-| `sat-ejk.2` | Create canonical context files | Open; Phase 2 |
-| `sat-ejk.3` | Validate the context pack | Open; depends on `sat-ejk.2` |
-| `sat-ejk.4` | Integrate canonical pack into workflows | Open; depends on `sat-ejk.3` |
+| `sat-ejk.2` | Create canonical context files | Closed; Phase 2 |
+| `sat-ejk.3` | Validate the context pack | Closed; depends on `sat-ejk.2` |
+| `sat-ejk.4` | Integrate canonical pack into workflows | In progress; depends on `sat-ejk.3`; Phase 4 |
 | `sat-ejk.5` | Retire legacy context documents | Open; depends on `sat-ejk.4` |
 | `sat-ejk.6` | Emit deterministic digest consistency metrics | Open; related export-pipeline work, not a prerequisite for the planning revision |
 

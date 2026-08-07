@@ -65,6 +65,11 @@ monolithic file — check all of these, not just `docs/DESIGN.md`:
 | docs/DESIGN-files.md | Channel catalog + canvas/file harvesting — **designed, not yet implemented** |
 | docs/references/slackdump-cli-notes.md | slackdump CLI behavior/cost/gotchas — check before re-deriving anything about how slackdump itself behaves |
 
+A digest/profile/sidecar schema change (docs/DESIGN-export.md is the schema authority) requires
+a matching update to docs/llm-context/ingestion-contract.md — it is the consumer-facing restatement
+of that schema for the LLM context pack and must not drift from it (see sat-ejk migration,
+docs/llm-context/MIGRATION-PLAN.md).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 

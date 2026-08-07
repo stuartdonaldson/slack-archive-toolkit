@@ -27,10 +27,34 @@ export PYTHONUNBUFFERED=1
 mkdir -p "$ARCHIVE_ROOT"
 mkdir -p "$HOME/slack-exports"
 
-# Prompt/context templates for the LLM reporting workflow (F3 culture notes,
-# ingestion/newsletter/FNG/report-query prompts) are canonical in docs/ and
-# git-tracked there; refresh the ~/slack-exports working copies from them each
-# run so manual edits to the operator's copies don't silently diverge from git.
+# Canonical LLM context pack (docs/llm-context/, sat-ejk migration) is the
+# active upload/copy source as of Phase 4 integration. Refresh a curated
+# ~/slack-exports/llm-context/ runtime subtree each run so operator uploads
+# stay in sync with git — mirrors only the deployment files named in
+# docs/llm-context/README.md's "Intended upload set" (contract, policy,
+# domain context, deployment instructions, prompts, active augmentations),
+# deliberately excluding planning/review/validation records
+# (MIGRATION-PLAN.md, REVIEW-*.md, VALIDATION-RESULTS.md, validation-set.md,
+# augmentations/README.md, augmentations/archive/) per MIGRATION-PLAN.md
+# Phase 4's "must avoid copying planning records ... into the runtime upload
+# area".
+mkdir -p "$HOME/slack-exports/llm-context/prompts" "$HOME/slack-exports/llm-context/augmentations"
+cp "$REPO_ROOT/docs/llm-context/ingestion-contract.md" \
+   "$REPO_ROOT/docs/llm-context/query-policy.md" \
+   "$REPO_ROOT/docs/llm-context/f3-domain-context.md" \
+   "$REPO_ROOT/docs/llm-context/project-instructions.md" \
+   "$REPO_ROOT/docs/llm-context/session-preamble.md" \
+   "$HOME/slack-exports/llm-context/"
+cp "$REPO_ROOT/docs/llm-context/prompts/"*.md "$HOME/slack-exports/llm-context/prompts/"
+cp "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-operations.md" \
+   "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-admins.md" \
+   "$HOME/slack-exports/llm-context/augmentations/"
+
+# Legacy prompt/context docs (F3 culture notes, ingestion/newsletter/FNG/
+# report-query prompts) remain transitional sources until sat-ejk.5 retires
+# them (MIGRATION-PLAN.md Phase 5) — keep refreshing their working copies too
+# so neither the legacy nor the canonical operator uploads silently diverge
+# from git.
 cp "$REPO_ROOT/docs/f3-culture.md" \
    "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
    "$REPO_ROOT/docs/newsletter-prompt.md" \
