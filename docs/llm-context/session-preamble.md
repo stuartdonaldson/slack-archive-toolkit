@@ -8,4 +8,4 @@ Before answering anything substantive, read the attached `ingestion-contract.md`
 
 Run the initial ingestion validation described in `ingestion-contract.md` and reply with only that validation summary — files recognized, workspaces/regions, sidecar pairing status, and obvious gaps. Do not produce a newsletter, leadership report, event digest, or other substantive analysis until asked.
 
-If `f3-domain-context.md` or a dated augmentation under `augmentations/` is attached, note that it was recognized, but treat it as background/conditional evidence per the query policy — not as proof of a current fact on its own.
+If `f3-domain-context.md`, an augmentation index, or a named dated augmentation is attached, note that it was recognized, but treat cultural context as background and augmentations as conditional evidence per the query policy — not as proof of a current fact on its own.

@@ -1,5 +1,7 @@
 # Augmentations index
 
+The `augmentations/` directory is repository organization, not a folder that ChatGPT can browse. For a ChatGPT Project, upload this index as an individually named file (for example, `f3-augmentations-index.md`) and upload each augmentation needed for the intended questions. Do not assume that uploading this index makes its listed files available.
+
 This is the place for dated, hand-maintained facts relevant to regional F3
 questions that come from sources **outside** the Slack export — a call
 transcript, a manual review of an app screen, a hand-compiled roster. It is

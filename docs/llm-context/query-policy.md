@@ -41,7 +41,7 @@ Do not report former, emeritus, retired, replaced, temporary, or event-specific 
 
 ### Dated augmentation evidence
 
-A dated manual augmentation (see `augmentations/`) is conditional evidence, not a fixed rank:
+A dated manual augmentation explicitly supplied with the data is conditional evidence, not a fixed rank:
 
 * It is the **primary** source for a fact the Slack exports structurally cannot express, such as the F3-Nation regional administrator roster.
 * When the Slack exports *can* express the same fact, treat the augmentation immediately below rank 5 (message/thread evidence) and apply recency and source strength rather than silently overriding the Slack record.
@@ -77,7 +77,7 @@ When materially conflicting sources still permit a working answer, use `Conteste
 Do not treat these roles as equivalent or as evidence for one another:
 
 * **Slack workspace admin/owner** — controls Slack workspace governance, permissions, and app installation. Source: workspace-local user-profile `slack_roles`.
-* **F3-Nation app/region admin** — configures F3-Nation app settings for that region via `/f3-nation-settings`. Source: a maintained/manual F3-Nation app-admin reference for that region (see `augmentations/f3-nation-admins.md`).
+* **F3-Nation app/region admin** — configures F3-Nation app settings for that region via `/f3-nation-settings`. Source: the explicitly supplied maintained/manual F3-Nation app-admin augmentation for that region.
 * **Regional SLT roles** (Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, and similar) — lead the region. Regional in scope.
 * **Site Q / AO Q / OIC** — scoped to a specific AO or site, not the whole region.
 

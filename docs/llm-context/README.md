@@ -19,7 +19,9 @@ Upload the completed versions of these context documents:
 1. `ingestion-contract.md`
 2. `query-policy.md`
 3. `f3-domain-context.md`
-4. Any applicable dated augmentation under `augmentations/`
+4. An explicitly uploaded augmentation index, plus each selected dated augmentation
+
+The repository uses folders to organize files; ChatGPT Project knowledge does not reliably browse those folders. Upload the augmentation index as a separately named file (for example, `f3-augmentations-index.md`) and upload the specific augmentation files it identifies. Do not upload the prompt library by default: `prompts/` is an operator-facing set of templates. Select and paste the matching prompt into a chat, or upload that individual prompt when it must be available as Project knowledge.
 
 ### Run artifacts in a shared project
 
