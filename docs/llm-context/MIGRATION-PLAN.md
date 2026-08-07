@@ -224,6 +224,7 @@ gaps remain the practical freshness signal, not a pack-wide policy.
 | `sat-ejk.5` | Retire legacy context documents | Closed; depends on `sat-ejk.4`; Phase 5 |
 | `sat-ejk.6` | Emit deterministic digest consistency metrics | Open; related export-pipeline work, not a prerequisite for the planning revision |
 | `sat-ejk.7` | Align Project knowledge guidance for refreshed run artifacts | Closed; post-migration support adjustment |
+| `sat-ejk.8` | Add explicit Project knowledge routing instructions | Closed; post-migration support adjustment |
 
 ## Validation checklist
 
