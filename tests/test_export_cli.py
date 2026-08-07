@@ -239,6 +239,11 @@ def test_digest_split_by_month_writes_one_file_per_month(tmp_path, monkeypatch):
 
 
 def test_digest_split_by_month_default_out_includes_month_placeholder(tmp_path, monkeypatch):
+    # Pre-existing test-hygiene bug (not previously caught): without this,
+    # the direct (--out-less) path falls through to export.DEFAULT_EXPORTS_DIR
+    # (~/slack-exports on a real machine) and this test actually wrote junk
+    # digest files there on every run.
+    monkeypatch.setattr(export, "DEFAULT_EXPORTS_DIR", tmp_path / "exports")
     _, fake_write_monthly_digests = _stub_profiles(monkeypatch)
     args = _base_args(archive_root=str(tmp_path), split_by_month=True)
 
@@ -246,6 +251,9 @@ def test_digest_split_by_month_default_out_includes_month_placeholder(tmp_path, 
 
     assert exit_code == 0
     assert fake_write_monthly_digests.calls == [180]
+    assert (tmp_path / "exports" / "f3-digest-2026-07-01-2026-04.json").exists()
+    assert (tmp_path / "exports" / "f3-digest-2026-07-01-2026-05.json").exists()
+    assert not (Path.home() / "slack-exports" / "f3-digest-2026-07-01-2026-04.json").exists()
 
 
 def test_run_job_split_by_month_uses_build_monthly_digests(tmp_path, monkeypatch):
