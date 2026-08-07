@@ -602,7 +602,14 @@ edit events they carried now live in the sidecar's per-file `modification_histor
       }
     }
   },
-  "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] }
+  "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] },
+  "consistency": {
+    "channel_id_duplicate_count": 0, "file_reference_count": 1, "file_has_content_true_count": 1,
+    "file_has_content_false_count": 0, "file_message_ts_present_count": 1, "file_message_ts_matched_count": 1,
+    "file_message_ts_unmatched_count": 0, "mention_unresolved_count": 0, "in_scope_false_orphan_count": 0,
+    "notes": { "scope": "...", "file_message_ts_unmatched_count": "...", "mention_unresolved_count": "...",
+               "in_scope_false_orphan_count": "..." }
+  }
 }
 ```
 
@@ -678,6 +685,26 @@ with the unmerged clusters listed under `identities[]`. A mentioned id with no r
 keeps an entry keyed by its raw id at confidence `unknown`. Raw email addresses are never
 persisted anywhere — `email_hash` (truncated SHA-256 of the lowercased address, added to the
 user-profiles export) is the only email-derived value in any output.
+
+#### Consistency block (sat-ejk.6)
+
+The top-level `consistency` key is a deterministic referential-integrity report over this
+document's own `channels`/`messages`/`user_index`, computed by `_compute_consistency` in
+`_assemble_digest` from data already gathered for this same document — no extra pass over the
+archive. It replaces the interim manual checklist that `docs/llm-context/ingestion-contract.md`
+used to carry as a "run this by hand" section (§Consistency and drift checks): `channel_id`
+duplicates per workspace, the digest's own file-reference/`has_content` split, how many
+`message_ts`-carrying files resolve to a real message in the same workspace/channel within this
+document, mentioned ids absent from `user_index`, and `in_scope: false` parents with no replies
+(an invariant that should always read `0`). Each count's `notes` entry restates how to interpret
+it, so the LLM ingestion side doesn't need this design doc to read the block correctly.
+
+Deliberately **not** covered here, since this build has no access to either: cross-source
+consistency against a manual augmentation document, and drift versus a prior upload — both stay
+consumer-side checks (see the ingestion contract). `file_message_ts_unmatched_count` in
+particular is expected to be nonzero on a `--split-by-month` digest, since a channel's files
+attach to every month it appears in rather than just the month containing the file's own
+`message_ts` — see §Monthly digest splitting.
 
 ---
 

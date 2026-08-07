@@ -2138,3 +2138,152 @@ def test_merge_files_out_ignores_non_dict_previous_sidecar():
     doc = export_logic.merge_files_out(entries, "garbage", "2026-07-01T00:00:00Z")
 
     assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
+
+
+# --- consistency metrics (sat-ejk.6: deterministic referential-integrity
+# counts over the digest's own channels/messages/user_index) ---
+
+
+def test_compute_consistency_counts_duplicate_channel_ids():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": []},
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": []},
+        {"workspace": "f3pugetsound", "channel_id": "C2", "files": []},
+        {"workspace": "f3kirkland", "channel_id": "C1", "files": []},  # different workspace, not a duplicate
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["channel_id_duplicate_count"] == 1
+
+
+def test_compute_consistency_file_reference_and_has_content_split():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True},
+            {"id": "F2", "has_content": False},
+            {"id": "F3", "has_content": False},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["file_reference_count"] == 3
+    assert result["file_has_content_true_count"] == 1
+    assert result["file_has_content_false_count"] == 2
+
+
+def test_compute_consistency_file_message_ts_matched_against_digest_messages():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "message_ts": "1000.0001"},  # matches the root below
+            {"id": "F2", "has_content": False, "message_ts": "9999.0001"},  # no matching message
+            {"id": "F3", "has_content": False},  # no message_ts at all - not counted as present
+        ]},
+    ]
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "replies": [
+            {"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, messages_slice, {})
+
+    assert result["file_message_ts_present_count"] == 2
+    assert result["file_message_ts_matched_count"] == 1
+    assert result["file_message_ts_unmatched_count"] == 1
+
+
+def test_compute_consistency_file_message_ts_matches_a_reply_too():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "message_ts": "1000.0002"},  # matches the reply, not the root
+        ]},
+    ]
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "replies": [
+            {"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, messages_slice, {})
+
+    assert result["file_message_ts_matched_count"] == 1
+    assert result["file_message_ts_unmatched_count"] == 0
+
+
+def test_compute_consistency_in_scope_false_orphan_flags_a_parent_with_no_replies():
+    # select_messages_in_range never actually produces this shape (an
+    # in_scope: false parent always carries the reply that pulled it in) -
+    # this exercises the sanity check as an invariant, not a reachable
+    # real-world case.
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "in_scope": False},
+    ]
+
+    result = export_logic._compute_consistency([], messages_slice, {})
+
+    assert result["in_scope_false_orphan_count"] == 1
+
+
+def test_compute_consistency_in_scope_false_with_replies_is_not_an_orphan():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "in_scope": False,
+         "replies": [{"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"}]},
+    ]
+
+    result = export_logic._compute_consistency([], messages_slice, {})
+
+    assert result["in_scope_false_orphan_count"] == 0
+
+
+def test_compute_consistency_mention_unresolved_against_user_index():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "mentions": ["U1", "U2"]},
+    ]
+    user_index = {"f3pugetsound": {"U1": {"display_name": "Al", "is_bot": False}}}
+
+    result = export_logic._compute_consistency([], messages_slice, user_index)
+
+    assert result["mention_unresolved_count"] == 1
+
+
+def test_compute_consistency_mention_resolved_when_present_in_user_index():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "mentions": ["U1"]},
+    ]
+    user_index = {"f3pugetsound": {"U1": {"display_name": "Al", "is_bot": False}}}
+
+    result = export_logic._compute_consistency([], messages_slice, user_index)
+
+    assert result["mention_unresolved_count"] == 0
+
+
+def test_compute_consistency_includes_interpretation_notes():
+    result = export_logic._compute_consistency([], [], {})
+
+    assert "scope" in result["notes"]
+    assert "in_scope_false_orphan_count" in result["notes"]
+    assert "mention_unresolved_count" in result["notes"]
+    assert "file_message_ts_unmatched_count" in result["notes"]
+
+
+def test_build_digest_emits_consistency_block(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["consistency"]["channel_id_duplicate_count"] == 0
+    assert result["consistency"]["in_scope_false_orphan_count"] == 0
+    assert "consistency" in result["manifest"]["counting_rules"]

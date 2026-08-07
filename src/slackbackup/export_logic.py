@@ -1578,6 +1578,103 @@ def merge_files_out(
     }
 
 
+def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], user_index: dict) -> dict:
+    """Deterministic referential-integrity metrics over this document's own
+    channels/messages/user_index - the "within this upload" checks from
+    docs/llm-context/ingestion-contract.md's Consistency and drift checks
+    §1, emitted so an LLM consumer reports them rather than eyeballing joins
+    and counts ad hoc. Cross-source consistency (an augmentation document's
+    roster/roles) and cross-run drift (versus a prior upload) stay
+    consumer-side - this build has no access to either. Counts only;
+    interpreting a count as a problem is left to the consumer, per `notes`
+    below and the ingestion contract."""
+    flat: list[dict] = []
+
+    def _walk(msg: dict) -> None:
+        flat.append(msg)
+        for reply in msg.get("replies", ()):
+            _walk(reply)
+
+    for msg in messages_slice:
+        _walk(msg)
+
+    ts_by_channel: dict[tuple, set[str]] = {}
+    for msg in flat:
+        ts_by_channel.setdefault((msg["workspace"], msg["channel_id"]), set()).add(msg["ts"])
+
+    channel_ids_seen: dict[str, set[str]] = {}
+    duplicate_channel_ids = 0
+    file_reference_count = 0
+    has_content_true = 0
+    has_content_false = 0
+    file_ts_present = 0
+    file_ts_matched = 0
+
+    for ch in channels_out:
+        channel_id = ch.get("channel_id")
+        if channel_id:
+            seen = channel_ids_seen.setdefault(ch["workspace"], set())
+            if channel_id in seen:
+                duplicate_channel_ids += 1
+            seen.add(channel_id)
+        for f in ch.get("files", ()):
+            file_reference_count += 1
+            if f.get("has_content"):
+                has_content_true += 1
+            else:
+                has_content_false += 1
+            message_ts = f.get("message_ts")
+            if message_ts is not None:
+                file_ts_present += 1
+                if message_ts in ts_by_channel.get((ch["workspace"], channel_id), ()):
+                    file_ts_matched += 1
+
+    in_scope_false_orphans = sum(
+        1 for msg in messages_slice if msg.get("in_scope") is False and not msg.get("replies")
+    )
+
+    unresolved_mentions = {
+        (msg["workspace"], uid)
+        for msg in flat
+        for uid in msg.get("mentions", ())
+        if uid not in user_index.get(msg["workspace"], {})
+    }
+
+    return {
+        "channel_id_duplicate_count": duplicate_channel_ids,
+        "file_reference_count": file_reference_count,
+        "file_has_content_true_count": has_content_true,
+        "file_has_content_false_count": has_content_false,
+        "file_message_ts_present_count": file_ts_present,
+        "file_message_ts_matched_count": file_ts_matched,
+        "file_message_ts_unmatched_count": file_ts_present - file_ts_matched,
+        "mention_unresolved_count": len(unresolved_mentions),
+        "in_scope_false_orphan_count": in_scope_false_orphans,
+        "notes": {
+            "scope": (
+                "Referential integrity within this document only (ingestion-contract.md's "
+                "'within the upload' checks). Cross-source consistency against an augmentation "
+                "document, and drift versus a prior upload, still need to be done by the consumer."
+            ),
+            "file_message_ts_unmatched_count": (
+                "A split-by-month digest attaches every channel file to every month it appears "
+                "in, not just the month containing its message_ts - a nonzero count here is "
+                "expected on a monthly document and only meaningful on the unsplit (merged) "
+                "digest."
+            ),
+            "mention_unresolved_count": (
+                "Mentioned user ids with no matching profile in user_index for that workspace - "
+                "a deleted or external account, not necessarily an error."
+            ),
+            "in_scope_false_orphan_count": (
+                "Should always be 0 - an in_scope: false parent with no replies would itself be a "
+                "referential-integrity bug, since a parent is only marked in_scope: false because "
+                "an in-scope reply pulled it in."
+            ),
+        },
+    }
+
+
 def _assemble_digest(
     channels_meta_base: list[dict],
     messages_slice: list[dict],
@@ -1598,6 +1695,7 @@ def _assemble_digest(
     filename."""
     channels_out, activity_by_channel = _channels_for_slice(channels_meta_base, messages_slice, bot_ids_by_workspace)
     referenced_ids_by_workspace = _referenced_ids_for_slice(channels_meta_base, messages_slice)
+    user_index = _build_user_index(profiles_doc, referenced_ids_by_workspace)
 
     # Leadership candidates come from the full per-workspace roster
     # (build_user_profiles/profiles_doc), not just this slice's posters -
@@ -1689,6 +1787,14 @@ def _assemble_digest(
                     "dates, and Slack URLs are derived from ts + channel_id + workspace, never "
                     "duplicated here). Message text/URLs are never stored in the index."
                 ),
+                "consistency": (
+                    "top-level consistency key: deterministic referential-integrity counts over "
+                    "this document alone (channel_id_duplicate_count, file_reference_count plus "
+                    "has_content true/false splits, file_message_ts_present/matched/unmatched "
+                    "counts, mention_unresolved_count, in_scope_false_orphan_count). See its own "
+                    "notes for how to interpret each count; cross-source and cross-run drift "
+                    "checks are not covered here and stay consumer-side."
+                ),
             },
             "known_limitations": [
                 "Private or inaccessible channels may be absent",
@@ -1699,9 +1805,10 @@ def _assemble_digest(
         "channels": channels_out,
         "workspace_activity_index": _build_workspace_activity_index(channels_out, activity_by_channel),
         "messages": messages_slice,
-        "user_index": _build_user_index(profiles_doc, referenced_ids_by_workspace),
+        "user_index": user_index,
         "mentions": build_mentions_index(messages_slice, profiles_doc),
         "leadership": leadership,
+        "consistency": _compute_consistency(channels_out, messages_slice, user_index),
     }
 
 

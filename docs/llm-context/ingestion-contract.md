@@ -193,13 +193,22 @@ Prepare to answer questions about:
 * canvases, files, documents, source links, and maintained references
 * gaps, conflicting evidence, stale records, unclear ownership, and continuity risks
 
-## Consistency and drift checks (interim, LLM-side)
+## Consistency and drift checks
 
-`export digest` does not yet emit a deterministic consistency block; this section is the interim manual check until one exists (tracked separately from this pack). Run it during ingestion validation, before substantive analysis:
+`export digest` emits a top-level `consistency` block — deterministic referential-integrity counts over that document's own `channels`/`messages`/`user_index`, computed at build time so you report them rather than inferring joins and counts ad hoc:
 
-1. **Referential integrity within the upload:** digest file references resolve against the sidecar in both directions, applying the asymmetry above; each file's `message_ts` matches a real digest message `ts` in the same workspace/channel; message `mentions` resolve against `user_index`; `channel_id` values are unique per workspace; `in_scope: false` parents actually have an in-scope reply.
-2. **Cross-source consistency:** a manual augmentation's roster names resolve to a profile in that workspace where expected; a region present in an augmentation but absent from the digest, or the reverse; a role an augmentation asserts that newer dated Slack evidence contradicts (apply the `Contested`/`Unresolved` handling in [query-policy.md](query-policy.md)); an augmentation's `collected:` date older than the digest's own date range.
-3. **Drift versus a prior upload, when one is available for comparison:** sidecar match rate, extracted-content coverage, unresolved-mention count, and channels with neither `topic` nor `purpose`. A declining match rate across uploads means an input needs fixing, not that one answer needs hedging.
+* `channel_id_duplicate_count` — `channel_id` values repeated within one workspace. Should be `0`.
+* `file_reference_count`, `file_has_content_true_count`, `file_has_content_false_count` — the digest's own `channels[].files[]` tally, split by `has_content`.
+* `file_message_ts_present_count`, `file_message_ts_matched_count`, `file_message_ts_unmatched_count` — of the files carrying a `message_ts`, how many resolve to a real message `ts` (root or reply) in the same workspace/channel within *this document*. On a `--split-by-month` digest a nonzero unmatched count is expected — a channel's files are attached to every month it appears in, not just the month containing the file's own `message_ts` — and is only a meaningful signal on the unsplit (merged) digest.
+* `mention_unresolved_count` — mentioned user ids with no matching profile in `user_index` for that workspace (a deleted or external account, not necessarily an error).
+* `in_scope_false_orphan_count` — `in_scope: false` parents with no replies. Should always be `0`; a nonzero value is a genuine referential-integrity bug in the export itself, not something to reason about.
+
+`consistency.notes` restates the interpretation of each count inline; treat that as authoritative over any paraphrase here if the two ever disagree.
+
+This block covers referential integrity **within the upload only**. Two checks it does not cover still need doing at ingestion time:
+
+1. **Cross-source consistency:** a manual augmentation's roster names resolve to a profile in that workspace where expected; a region present in an augmentation but absent from the digest, or the reverse; a role an augmentation asserts that newer dated Slack evidence contradicts (apply the `Contested`/`Unresolved` handling in [query-policy.md](query-policy.md)); an augmentation's `collected:` date older than the digest's own date range.
+2. **Drift versus a prior upload, when one is available for comparison:** sidecar match rate, extracted-content coverage, unresolved-mention count, and channels with neither `topic` nor `purpose`. A declining match rate across uploads means an input needs fixing, not that one answer needs hedging. `consistency`'s counts are per-document snapshots, not deltas — compute drift yourself by comparing two uploads' blocks.
 
 Report material findings from this check as part of [Initial ingestion validation](#initial-ingestion-validation), not buried inside a later substantive answer.
 
