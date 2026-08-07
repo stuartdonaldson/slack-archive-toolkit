@@ -455,3 +455,22 @@ Outcome [internal]: filed bd sat-pqf to track the Security reviewer's prompt-inj
 Outcome [user-facing]: verified the fix against production data — f3pugetsound (383 channels, the job that previously OOM-killed) and f3nation/dungeon-fh all regenerated cleanly with the v4 sidecar; also ran targeted re-backups for f3pugetsound `disc-it,all*` and f3nation `tech*` (0 failures) ahead of the regen.
 Outcome [developer-facing]: rewrote `docs/slack-ingestion.md` onto the better-organized v4 draft's structure (schema enumeration, identity rules, source priority, activity-counting fields, ingestion-validation checklist), corrected its 2 factual gaps, and folded the original's canvas-currency ranking/asymmetry warning back in; `slack-ingestion-v4.md` scratch file removed.
 Open: PR #6 merge still awaiting explicit user go-ahead — reviewed, hardened, and verified, but not yet merged.
+
+## 2026-08-07 10:47:48
+_session automated (bd-run-beads sat-ejk) · v3 · 08-07_
+
+### Objective 1: Build and land the canonical LLM context pack, then retire the legacy documents it replaces
+Rationale: Slack-derived LLM guidance (ingestion behavior, domain context, prompts, query policy) was scattered across seven standalone docs with no validation and no integration into the actual export pipeline; the pack consolidates these into docs/llm-context/ as the single canonical source, with the ingestion contract kept in sync with the digest/profile/sidecar schema per CLAUDE.md's cross-reference rule.
+Outcome [developer-facing]: docs/llm-context/ created with ingestion-contract.md, f3-domain-context.md, query-policy.md, session-preamble.md, project-instructions.md, prompts/, augmentations/, and scripts/lookup_profile.py; DESIGN.md/DESIGN-export.md/DESIGN-files.md/OPERATIONS.md updated to reference it (commit 9f203b0).
+Outcome [internal]: Validation run against fixtures matching the real digest-v4/files-v1/profiles-v1 schemas (no live matched digest/profile/sidecar or ChatGPT session was reachable headless) — 10/12 scenarios pass outright, 2 pass with a documented caveat; recorded in docs/llm-context/VALIDATION-RESULTS.md (commit 1d72f61).
+Outcome [user-facing]: scripts/nightly-backup-digest.sh and README.md updated to point at the new pack; CLAUDE.md gained the doc-authority note for the ingestion contract (commit e898686).
+Outcome [developer-facing]: Seven legacy files deleted outright (docs/slack-ingestion.md, docs/report-queries.md, docs/f3-culture.md, docs/newsletter-prompt.md, docs/fng-getting-started-prompt.md, and the 2026-06-30 f3-it-infrastructure augmentation .md/.json) — each had a complete canonical replacement in docs/llm-context/, so no archival copy was kept (commit 21187cc).
+Provenance: sessions a72a42ac-58fc-4e68-9bd3-a9fef441e919, fa6175a5-0f5b-4810-94ee-a1fca993df54, 48b5cfa3-a84a-4c5b-8ac0-1c89e1f158ac, 9117fc1e-52dc-4159-be7d-ec4b14d44739 (beads sat-ejk.2–.5).
+
+### Objective 2: Emit digest consistency metrics
+Rationale: The export pipeline lacked a way to detect drift between a digest and its files/profile sidecars at generation time; consistency metrics make schema/content mismatches visible instead of silent.
+Outcome [developer-facing]: src/slackbackup/export_logic.py extended (+109 lines) to compute and emit digest consistency metrics, with 149 lines of new coverage in tests/test_export_digest_logic.py; docs/DESIGN-export.md and docs/llm-context/ingestion-contract.md updated to document the metrics as part of the schema contract (commit 365b02c).
+Provenance: session 46e5f565-0962-4cb4-aa82-bd313b596d93 (bead sat-ejk.6).
+
+### Key Learnings:
+Unattended bd-run-beads execution of a 5-bead chain (sat-ejk.2–.6) completed end-to-end for $7.94 total across ~24.5 minutes of session time, with no human intervention required between beads.
