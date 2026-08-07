@@ -12,7 +12,7 @@ Use JSON for generated data or an automated consumer: the Slack digest, user-pro
 
 ## Intended upload set
 
-### Always upload for a shared project
+### Context files for a shared project
 
 Upload the completed versions of these context documents:
 
@@ -21,16 +21,18 @@ Upload the completed versions of these context documents:
 3. `f3-domain-context.md`
 4. Any applicable dated augmentation under `augmentations/`
 
-### Upload for each reporting run
+### Run artifacts in a shared project
 
-Upload the matching run-specific artifacts together:
+Project knowledge may hold the current run artifacts and augmentations. Refresh or replace them periodically, preserving their dates and indicating which file is current. The same artifacts may instead be attached to an individual chat when that is more appropriate.
+
+Provide the current available artifacts for a reporting run:
 
 1. The Slack digest export
 2. The Slack user-profile export
-3. The matching `files_out` sidecar, when supplied
+3. The current `slack-llm-files-v2` sidecar, when supplied
 4. Any relevant dated manual augmentation not represented in the exports
 
-Do not upload an unrelated profile roster or file sidecar. The digest and sidecar must refer to the same export run, and sidecar file records are joined using `workspace + channel_id + id`.
+Use the most current artifact for each source type and preserve its coverage, generated, or collected date. The sidecar is cumulative, so it does not need to share the digest's exact export window; sidecar records outside the digest window are expected. Join digest file references to sidecar records using `workspace + channel_id + id`. State material freshness mismatches rather than silently treating an older profile roster, augmentation, or sidecar as current.
 
 ## Source roles
 
@@ -55,11 +57,9 @@ Do not equate these roles:
 
 One role is not evidence of another. Current maintained Slack evidence outranks a dated manual augmentation when they conflict.
 
-## Recommended project instruction
+## Project instruction
 
-Add this instruction to the shared ChatGPT Project after the canonical files exist:
-
-> Read the ingestion contract and query policy before answering substantive questions. Use only the uploaded data unless outside research is requested. Treat Slack identities as workspace-local. Prefer current maintained Slack canvases/files and channel topic/purpose over profile titles or manually collected augmentations. State dates/times in Pacific time, preserve direct Slack links, and label profile-only or dated-manual conclusions as uncertain. Do not treat Slack administration, F3-Nation administration, regional SLT, and AO/Site Q authority as interchangeable.
+Use [project-instructions.md](project-instructions.md) verbatim in the ChatGPT Project instruction box. It defines the invariant handling of knowledge-file retrieval, freshness, supersession, evidence, and authority boundaries.
 
 ## Reusable prompts
 

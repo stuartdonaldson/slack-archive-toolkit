@@ -2,7 +2,7 @@
 
 ## Status
 
-**Phase 5 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added. The pack was validated ([sat-ejk.3](#migration-tracking); see `VALIDATION-RESULTS.md` — 10/12 scenarios pass, two remediation issues filed rather than editing the pack ad hoc) and integrated ([sat-ejk.4](#migration-tracking)): the nightly copy workflow (`scripts/nightly-backup-digest.sh`), `README.md`, and `docs/OPERATIONS.md` reference the canonical pack, and `CLAUDE.md` carries the schema placement rule below. Legacy sources have now been retired ([sat-ejk.5](#migration-tracking); see Phase 5 below) — each is removed from the working tree and recoverable only from git history.
+**Phase 5 complete; post-migration alignment in progress.** This plan adopts the 2026-08-06 review decisions. The canonical context files exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added. The pack was validated ([sat-ejk.3](#migration-tracking); see `VALIDATION-RESULTS.md` — 10/12 scenarios pass, two remediation issues filed rather than editing the pack ad hoc) and integrated ([sat-ejk.4](#migration-tracking)): the nightly copy workflow (`scripts/nightly-backup-digest.sh`), `README.md`, and `docs/OPERATIONS.md` reference the canonical pack, and `CLAUDE.md` carries the schema placement rule below. Legacy sources have now been retired ([sat-ejk.5](#migration-tracking); see Phase 5 below) — each is removed from the working tree and recoverable only from git history. [sat-ejk.7](#migration-tracking) aligns the guidance with periodically refreshed run artifacts held as Project knowledge.
 
 ## Decision
 
@@ -223,6 +223,7 @@ gaps remain the practical freshness signal, not a pack-wide policy.
 | `sat-ejk.4` | Integrate canonical pack into workflows | In progress; depends on `sat-ejk.3`; Phase 4 |
 | `sat-ejk.5` | Retire legacy context documents | Closed; depends on `sat-ejk.4`; Phase 5 |
 | `sat-ejk.6` | Emit deterministic digest consistency metrics | Open; related export-pipeline work, not a prerequisite for the planning revision |
+| `sat-ejk.7` | Align Project knowledge guidance for refreshed run artifacts | Closed; post-migration support adjustment |
 
 ## Validation checklist
 
