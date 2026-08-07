@@ -25,7 +25,7 @@ Preserve source context whenever possible:
 * timestamp in local Pacific time
 * author display name or F3 name
 * Slack user ID
-* source type: message, thread reply, channel description, topic, canvas or file content, file metadata, profile, structured digest field, or inference
+* source type: message, thread reply, channel topic, channel purpose, channel description, canvas or file content, file metadata, profile, structured digest field, or inference
 
 Report timestamps and event times in Pacific time.
 
@@ -40,6 +40,16 @@ Prefer F3 names or display names in output. Use legal names only when useful for
 Do not treat profile titles or display names as definitive. They may be stale. Use them as working signals unless confirmed by stronger evidence.
 
 Flag uncertainty instead of guessing.
+
+# Channel context fields
+
+Each channel entry carries three distinct text fields — do not collapse them or drop any that are present:
+
+* `topic` — the channel's current Slack topic, verbatim
+* `purpose` — the channel's current Slack purpose, verbatim
+* `description` — a convenience merge (topic if set, otherwise purpose); it can omit real content, since a channel may have both a topic and a purpose set to different things (e.g. topic is logistical, purpose states the channel's actual charter)
+
+Read `topic` and `purpose` independently rather than relying on `description` alone. Either may be null if never set in Slack.
 
 # Digest and file sidecar
 
@@ -104,7 +114,7 @@ Use newer authoritative evidence over older evidence.
 Resolve facts in approximately this order:
 
 1. Current extracted content of a maintained canvas or document from the matching sidecar
-2. Current channel topic or channel description
+2. Current channel `topic` or `purpose` (check both — see Channel context fields)
 3. Direct announcement from the responsible person, organizer, role holder, or system owner
 4. Structured digest fields
 5. Message text or thread replies
