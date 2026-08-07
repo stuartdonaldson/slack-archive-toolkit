@@ -777,6 +777,8 @@ unsupported type) can specify:
 | `files_out` | Companion `files_out` sidecar path (also `{as_of}`-templated; see §`files_out` sidecar) - cumulative, merged with whatever already sits at that path | none — no sidecar written, and each channel file's `content` simply never leaves the process |
 | `leadership_handler` | Handler name for tagging/leadership (see §Pluggable leadership handlers) | `none` (opt-in per job) |
 | `split_by_month` | Write one digest document per calendar month instead of one merged document (see §Monthly digest splitting) | `false` |
+| `spill_dir` | Directory for the month-sharded spill (see §Scalability — month-sharded spill); only applies when `split_by_month` is set | `--spill-dir`, else a fresh temporary directory removed on success |
+| `resume` | Skip re-converting/re-cleaning a channel whose `spill_dir` already holds its message shard from an interrupted prior run; only applies when `split_by_month` is set | `--resume` |
 
 Path handling: `expand_job_path` does `~`/`$VAR` expansion on any path read from a job file, and
 `resolve_job_out` applies `{as_of}` (and, when splitting by month, `{month}`) templating before
@@ -819,6 +821,75 @@ and `_digest` (direct path) both reject the run up front otherwise, rather than 
 overwriting one file every month. The direct path's default `--out`
 (`~/slack-exports/f3-digest-<as_of>.json`) gains a `-{month}` suffix automatically when
 `--split-by-month` is given without an explicit `--out`.
+
+### Scalability — month-sharded spill (sat-811 Phase 2 / sat-svu)
+
+`build_monthly_digests`/`build_digest`'s shared `_gather_digest_data` phase accumulates every
+matched channel's cleaned messages (and, when `files_out` is requested, every channel's raw file
+entries with extracted content) into one in-memory list/sink for the whole job before any assembly
+runs. That is fine at `f3-nation`'s scale (52 channels/1 workspace) but does not bound: measured
+against `f3-pugetsound` (383 channels/7 workspaces), it OOM-killed the process at ~2.3 GB RSS
+before the v4 `files_out` sidecar shipped, and **still OOM-killed it at ~4.5 GB RSS afterwards** —
+moving `content` out of the digest's own `channels[]` (ADR-0004) did not fix the underlying
+accumulation, since `files_out_sink` held the exact same per-file content resident for the whole
+job that `channels_meta` used to.
+
+For a `split_by_month` job, `export_logic.write_monthly_digests` (used automatically by
+`export.py:_run_digest` whenever `split_by_month` is set — replacing the old
+`build_monthly_digests` + write-to-file sequence for that path) fixes this structurally rather than
+by moving the content around again:
+
+- **Pass 1 — gather and shard** (`gather_and_shard_digest_data`): per channel, unchanged up to
+  message cleaning/range-filtering, then each channel's messages are partitioned by month
+  (`partition_messages_by_month`, applied per channel — equivalent to job-wide partitioning since
+  the bucketing rule is per root message) and appended to
+  `<spill_dir>/months/<YYYY-MM>/<workspace>__<channel_id>.ndjson`. Each channel's file entries
+  (with content) are streamed straight to `<spill_dir>/files.ndjson` instead of an in-memory sink.
+  Both are dropped from memory immediately after writing; only `channels_meta` (bounded by channel
+  count, content-stripped) and a `months_seen` set stay resident for the whole gather.
+- **Pass 2 — assemble and emit, one month at a time**: for each month, `_load_month_messages` reads
+  back just that month's shard files (glob + concatenate + re-sort by `ts` — cheap, since a single
+  month is a fraction of the whole job), then the existing unmodified `_assemble_digest` produces
+  that month's document exactly as `build_monthly_digests` would. The month's message slice and
+  document are discarded before moving to the next month.
+- **`files_out` sidecar**: `merge_files_out` (unchanged) is called with a generator that reads
+  `<spill_dir>/files.ndjson` back one line at a time instead of an in-memory list — it only ever
+  needed `entries` to be iterable, not resident all at once.
+- **Crash durability**: `--spill-dir <path>` (also job field `spill_dir`) points the spill at a
+  durable location instead of a temporary directory that is otherwise created fresh and removed on
+  success; `--resume` (also job field `resume`) then skips re-converting/re-cleaning a channel whose
+  `<spill_dir>/done/<workspace>__<channel_id>` marker already exists from an interrupted prior run.
+  A resumed (skipped) channel contributes no fresh `files_out` entries this run — `merge_files_out`'s
+  existing "absent from this run's scan → carried forward unchanged" behavior (ADR-0004) already
+  covers it, rather than re-deriving canvas modification history from a conversion `--resume` is
+  meant to avoid. `--resume` is an operator recovery tool, not a nightly default, and only applies to
+  `split_by_month` jobs.
+
+The spill alone did not clear the OOM: re-measured against the same job, it still died at the exact
+same channel (`f3cascades/ao-stray-balls`, 50/383) across three separate runs regardless of which
+whole-job accumulation was fixed around it - a single-channel spike, not cross-channel accumulation.
+Root cause: `_extract_file_content`'s fallback branch called `path.read_text()` on every file whose
+mimetype it has no dedicated extractor for (images, video, ...) before checking whether the mimetype
+was even text-shaped, discarding the result anyway for anything non-text - that channel's archive
+holds a 503 MB `.MOV`. Fixed by checking the mimetype up front (see ADR-0005); behaviorally identical
+(an unsupported mimetype already returned `None`), purely a memory fix.
+
+Verified against real production data: `export digest --jobs jobs/f3-pugetsound.json` (the job that
+OOM-killed on both the v3 baseline and the v4 sidecar - most recently at 4.5 GB RSS, then 2.9 GB RSS
+after the spill alone) completed cleanly under the streaming path plus the `_extract_file_content`
+fix, all 383 channels / 4,726 files / 6 monthly digests, peak RSS **164 MB** (`/usr/bin/time -v`,
+2026-08-07) — well under the 800 MB acceptance target. See ADR-0005 for the full before/after.
+`write_monthly_
+digests` produces byte-identical documents (aside from `generated_at`) to `build_monthly_digests` on
+a fixture spanning 3 channels × 3 months (`tests/test_export_digest_logic.py`'s
+`test_write_monthly_digests_matches_build_monthly_digests`), and a separate test proves the gather
+phase never holds more than one channel's messages resident at a time by spying on `convert_fn` and
+asserting each prior channel's shard files are already on disk before the next channel converts
+(`test_gather_and_shard_flushes_each_channel_before_converting_the_next`).
+
+The non-monthly `build_digest`/`_gather_digest_data` path is unchanged — single-merged-document jobs
+are not the scale this addresses, and every current job that spans enough channels to be at risk
+already uses `split_by_month`.
 
 ---
 

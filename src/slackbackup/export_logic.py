@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -576,6 +577,18 @@ def _extract_zip_xml_text(path: Path, member_glob: str, pattern: re.Pattern) -> 
 
 
 def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
+    """sat-svu: the fallback branch below used to call path.read_text() for
+    *every* mimetype this function doesn't have a dedicated extractor for -
+    including images and video - before checking whether it was even
+    text-shaped, and discarded the result anyway (falling through to
+    `return None`) for anything that wasn't text/*/HTML-like. Harmless for
+    small files, but a several-hundred-MB video blob (real archived data:
+    f3cascades/ao-stray-balls, a 503 MB .MOV) got fully decoded into one
+    Python string just to be thrown away - the actual cause of the
+    f3-pugetsound job's repeated OOM kill (sat-811), not the whole-job
+    accumulation the month-sharded spill (this same ticket) also fixes.
+    Checking the mimetype up front instead means an unsupported type never
+    touches the file's bytes at all."""
     if path is None or not path.exists():
         return None
     if mimetype == "application/pdf":
@@ -586,15 +599,15 @@ def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
         return _extract_zip_xml_text(path, "ppt/slides/slide*.xml", _TEXT_RUN_RE)
     if mimetype == _XLSX_MIMETYPE:
         return _extract_zip_xml_text(path, "xl/sharedStrings.xml", _SHARED_STRING_RE)
+    if mimetype not in _HTML_LIKE_MIMETYPES and not mimetype.startswith("text/"):
+        return None
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     if mimetype in _HTML_LIKE_MIMETYPES:
         return _html_to_text(raw)
-    if mimetype.startswith("text/"):
-        return raw
-    return None
+    return raw
 
 
 def _clean_file(data: dict) -> dict:
@@ -1436,6 +1449,217 @@ def _gather_digest_data(
     return channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to)
 
 
+# --- sat-811 Phase 2 / sat-svu: month-sharded spill, so a job spanning many
+# channels never holds more than one channel's messages/file content
+# resident at once. See docs/DESIGN-export.md "Scalability - month-sharded
+# spill" and ADR-0004. ---
+
+
+def _spill_channel_key(workspace: str, channel_id: str) -> str:
+    return f"{workspace}__{channel_id}"
+
+
+def _spill_month_path(spill_dir: Path, month: str, workspace: str, channel_id: str) -> Path:
+    return spill_dir / "months" / month / f"{_spill_channel_key(workspace, channel_id)}.ndjson"
+
+
+def _spill_done_marker(spill_dir: Path, workspace: str, channel_id: str) -> Path:
+    return spill_dir / "done" / _spill_channel_key(workspace, channel_id)
+
+
+def _spill_files_path(spill_dir: Path) -> Path:
+    return spill_dir / "files.ndjson"
+
+
+def _write_ndjson_line(fp, obj: dict) -> None:
+    fp.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    fp.write("\n")
+
+
+def _iter_ndjson(path: Path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def _channel_months_on_disk(spill_dir: Path, workspace: str, channel_id: str) -> set[str]:
+    """Months a resumed channel already has a shard file under - lets a
+    --resume run that skips re-converting/re-cleaning a done channel still
+    contribute its months to months_seen without re-deriving anything from
+    messages it never re-read."""
+    key = _spill_channel_key(workspace, channel_id)
+    months_root = spill_dir / "months"
+    if not months_root.exists():
+        return set()
+    return {p.parent.name for p in months_root.glob(f"*/{key}.ndjson")}
+
+
+def _load_month_messages(spill_dir: Path, month: str) -> list[dict]:
+    """Reads back one month's spilled shards (one file per channel that
+    contributed to this month), re-sorted by ts - each shard is already
+    ts-sorted internally (partition_messages_by_month preserves the
+    upstream sort), but shards interleave across channels."""
+    month_dir = spill_dir / "months" / month
+    messages: list[dict] = []
+    if month_dir.exists():
+        for shard in sorted(month_dir.glob("*.ndjson")):
+            messages.extend(_iter_ndjson(shard))
+    messages.sort(key=lambda m: float(m["ts"]))
+    return messages
+
+
+def gather_and_shard_digest_data(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    catalog_cache_dir: Path,
+    handler,
+    profiles_doc: dict | None,
+    spill_dir: Path,
+    resume: bool = False,
+) -> tuple[list[dict], set[str], dict[str, set[str]], dict, tuple[str | None, str]]:
+    """Streaming counterpart to _gather_digest_data: instead of accumulating
+    every channel's cleaned messages and every channel's file content into
+    one in-memory list/sink for the whole job, each channel's messages are
+    partitioned by month and appended to
+    <spill_dir>/months/<YYYY-MM>/<workspace>__<channel_id>.ndjson, and each
+    channel's file entries (with extracted content) are appended to
+    <spill_dir>/files.ndjson - both released from memory immediately after
+    writing. Only channels_meta (bounded by channel count, content-stripped
+    - the digest's own files[] view) stays resident for the whole job, same
+    as _gather_digest_data.
+
+    With resume=True, a channel whose <spill_dir>/done/<workspace>__
+    <channel_id> marker already exists is skipped entirely for this run
+    (no convert_fn, no message shard rewrite, no files_out entries) -
+    assumed complete from a prior interrupted run. Its months are recovered
+    by globbing which month directories already hold its shard file rather
+    than re-deriving them. Skipping its files_out entries too (rather than
+    re-deriving just those, which would need convert_fn output anyway for
+    canvas modification history) relies on merge_files_out's existing
+    carry-forward behavior for a file "absent from this run's scan" -
+    the same path already used when a channel falls outside a
+    --workspace/--channel selector.
+
+    A freshly processed (non-resumed) channel always gets fresh files_out
+    entries - _load_channel_files is a local sqlite read, not a convert_fn
+    shell-out, so resuming it buys nothing, and content_sha256 change-
+    detection depends on re-reading it - which is why <spill_dir>/
+    files.ndjson is truncated fresh at the start of every gather, never
+    appended across runs, regardless of resume.
+    """
+    date_from, date_to = trailing_days_range(days, as_of)
+    from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
+    to_epoch = _date_epoch(date_to, "23:59:59")
+
+    if profiles_doc is None:
+        profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
+    bot_ids_by_workspace: dict[str, set[str]] = {
+        ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+    profiles_by_workspace: dict[str, dict[str, dict]] = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+
+    channels_meta: list[dict] = []
+    months_seen: set[str] = set()
+    catalog_cache: dict[str, dict] = {}
+
+    (spill_dir / "months").mkdir(parents=True, exist_ok=True)
+    (spill_dir / "done").mkdir(parents=True, exist_ok=True)
+    files_path = _spill_files_path(spill_dir)
+
+    entries = select_channels(channels_file, workspace_glob)
+    with files_path.open("w", encoding="utf-8") as files_fp:
+        for i, entry in enumerate(entries, 1):
+            workspace, channel, channel_id = entry["workspace"], entry["name"], entry["id"]
+            print(f"export digest: converting {workspace}/{channel} [{i}/{len(entries)}]", file=sys.stderr, flush=True)
+            if workspace not in catalog_cache:
+                catalog_cache[workspace] = catalog_logic.load(catalog_cache_dir, workspace)
+            channel_info = _channel_context(catalog_cache[workspace], channel_id)
+
+            channel_dir = archive_root / workspace / channel
+            if not (channel_dir / "slackdump.sqlite").exists():
+                channels_meta.append(
+                    {
+                        "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                        "status": "missing_archive", "channel_url": digest_channel_url(workspace, channel_id),
+                        "files": [], **channel_info,
+                    }
+                )
+                continue
+
+            done_marker = _spill_done_marker(spill_dir, workspace, channel_id)
+            resumed = resume and done_marker.exists()
+
+            if resumed:
+                months_seen.update(_channel_months_on_disk(spill_dir, workspace, channel_id))
+            else:
+                with tempfile.TemporaryDirectory() as export_dir:
+                    export_dir_path = Path(export_dir)
+                    convert_fn(channel_dir, export_dir_path)
+                    all_messages = _load_all_messages(export_dir_path)
+                    users_map = _load_users_map(export_dir_path)
+
+                canvas_events_by_file = _extract_canvas_modification_events(all_messages, channel, channel_id)
+                all_messages = [m for m in all_messages if m.get("subtype") != "tabbed_canvas_updated"]
+
+                cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch, channel_dir=channel_dir)
+                for msg in cleaned:
+                    _enrich_for_digest(msg, workspace, channel, channel_id)
+                _assign_digest_seq(cleaned)
+
+                buckets = partition_messages_by_month(cleaned)
+                for month, month_messages in buckets.items():
+                    months_seen.add(month)
+                    shard_path = _spill_month_path(spill_dir, month, workspace, channel_id)
+                    shard_path.parent.mkdir(parents=True, exist_ok=True)
+                    with shard_path.open("w", encoding="utf-8") as shard_fp:
+                        for msg in month_messages:
+                            _write_ndjson_line(shard_fp, msg)
+
+                files_full = _load_channel_files(channel_dir)
+                profiles = profiles_by_workspace.get(workspace, {})
+                for f in files_full:
+                    file_entry = {**f, "workspace": workspace, "channel": channel, "channel_id": channel_id}
+                    events = canvas_events_by_file.get(f["id"], [])
+                    if events:
+                        file_entry["modification_history"] = [_resolve_canvas_event(e, profiles) for e in events]
+                    if _is_canvas_file(f):
+                        file_entry.setdefault("modification_history", [])
+                        file_entry["modification_history_completeness"] = "partial"
+                    _write_ndjson_line(files_fp, file_entry)
+
+                del cleaned, all_messages, users_map
+                done_marker.touch()
+
+            # channels_meta's own files[] view (has_content only, no content)
+            # is cheap (sqlite-only, no convert_fn) and always recomputed
+            # regardless of resume - files_full above is reused when this
+            # channel was freshly processed to avoid extracting twice.
+            files_full = files_full if not resumed else _load_channel_files(channel_dir)
+            channels_meta.append(
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
+                    "files": [_digest_file_view(f) for f in files_full], **channel_info,
+                }
+            )
+
+    return channels_meta, months_seen, bot_ids_by_workspace, profiles_doc, (date_from, date_to)
+
+
 def _channels_for_slice(
     channels_meta_base: list[dict], messages_slice: list[dict], bot_ids_by_workspace: dict[str, set[str]]
 ) -> tuple[list[dict], dict[tuple, dict]]:
@@ -1903,6 +2127,98 @@ def build_monthly_digests(
         )
         for month, month_messages in sorted(buckets.items())
     }
+
+
+def write_monthly_digests(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    out_template: str,
+    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    handler=_default_handler,
+    profiles_doc: dict | None = None,
+    files_out_path: Path | None = None,
+    spill_dir: Path | None = None,
+    resume: bool = False,
+) -> list[Path]:
+    """Streaming, file-writing counterpart to build_monthly_digests (sat-811
+    Phase 2 / sat-svu): shards every channel's messages/file content to disk
+    via gather_and_shard_digest_data instead of holding the whole job's
+    messages and file content in memory at once, then assembles and writes
+    each month's slack-llm-digest-v4 document one at a time (reusing
+    _assemble_digest unchanged - same document, only the memory shape of
+    getting there differs), discarding that month's message slice before
+    moving to the next.
+
+    spill_dir defaults to a fresh temporary directory, removed on success;
+    pass an explicit path (left in place afterwards, success or failure)
+    together with resume=True to recover from an interrupted prior run
+    without redoing already-sharded channels - see
+    gather_and_shard_digest_data. files_out_path, when given, is merged the
+    same way export.py's old _write_files_out did for the non-streaming
+    path, but reads this run's raw file entries back from the spill file
+    one line at a time (merge_files_out itself is unchanged; it only ever
+    needed `entries` to be iterable, not resident in memory) rather than
+    from an in-memory list.
+
+    Returns the list of digest file paths written, one per calendar month.
+    """
+    own_spill = spill_dir is None
+    if spill_dir is None:
+        spill_dir = Path(tempfile.mkdtemp(prefix="slackbackup-digest-spill-"))
+
+    try:
+        channels_meta, months_seen, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = (
+            gather_and_shard_digest_data(
+                channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
+                catalog_cache_dir, handler, profiles_doc, spill_dir, resume=resume,
+            )
+        )
+
+        if files_out_path is not None:
+            previous_sidecar = None
+            if files_out_path.exists():
+                try:
+                    previous_sidecar = json.loads(files_out_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    print(
+                        f"export digest: ignoring unreadable files_out {files_out_path}: {exc}",
+                        file=sys.stderr,
+                    )
+            generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            doc = merge_files_out(_iter_ndjson(_spill_files_path(spill_dir)), previous_sidecar, generated_at)
+            files_out_path.parent.mkdir(parents=True, exist_ok=True)
+            files_out_path.write_text(
+                json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
+            print(f"export digest: {len(doc['files'])} files -> {files_out_path}", file=sys.stderr)
+
+        written: list[Path] = []
+        for month in sorted(months_seen):
+            month_messages = _load_month_messages(spill_dir, month)
+            doc = _assemble_digest(
+                channels_meta, month_messages, profiles_doc, handler, date_from, date_to, days,
+                workspace_glob, bot_ids_by_workspace, month=month,
+            )
+            out_path = resolve_job_out(out_template, as_of, month=month)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            ok = sum(1 for c in doc["channels"] if c["status"] == "ok")
+            missing = sum(1 for c in doc["channels"] if c["status"] == "missing_archive")
+            print(
+                f"export digest: {month}: {len(doc['messages'])} messages from {ok} channels "
+                f"({missing} missing archive) -> {out_path}",
+                file=sys.stderr,
+            )
+            written.append(out_path)
+            del month_messages, doc
+        return written
+    finally:
+        if own_spill:
+            shutil.rmtree(spill_dir, ignore_errors=True)
 
 
 # --- user profiles: the full per-workspace roster (everyone slackdump has

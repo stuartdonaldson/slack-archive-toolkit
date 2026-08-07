@@ -690,6 +690,25 @@ def test_extract_file_content_none_when_no_local_path():
     assert export_logic._extract_file_content("text/plain", None) is None
 
 
+def test_extract_file_content_never_reads_bytes_of_an_unsupported_mimetype(tmp_path, monkeypatch):
+    """sat-svu regression: the real OOM cause behind sat-811's repeated kill
+    wasn't cross-channel accumulation, it was this function calling
+    path.read_text() on every unsupported mimetype (images, video) before
+    checking whether it was even text-shaped - harmless for a small file, but
+    a several-hundred-MB video blob got fully decoded into memory just to be
+    discarded. Proven here by making read_text unreachable rather than by
+    provisioning an actual huge fixture file."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"fake video bytes")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("read_text must not be called for an unsupported mimetype")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+
+    assert export_logic._extract_file_content("video/mp4", path) is None
+
+
 _MINIMAL_PDF = b"""%PDF-1.4
 1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
@@ -2287,3 +2306,175 @@ def test_build_digest_emits_consistency_block(tmp_path):
     assert result["consistency"]["channel_id_duplicate_count"] == 0
     assert result["consistency"]["in_scope_false_orphan_count"] == 0
     assert "consistency" in result["manifest"]["counting_rules"]
+
+
+# --- sat-811 Phase 2 / sat-svu: month-sharded spill ---
+
+
+def _multi_channel_digest_setup(tmp_path, workspaces=("f3aaa", "f3bbb", "f3ccc")):
+    """Three channels (one per workspace, alphabetically-ordered to match
+    both channels.json's declaration order and the spill's glob-sorted
+    read-back order - see the parity test below) all backed by the same
+    3-month "helpdesk" fixture via _fake_convert, giving >=3 channels x
+    >=2 months from existing fixture data."""
+    archive_root = tmp_path / "archive"
+    entries = []
+    for ws in workspaces:
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+        entries.append({"id": f"C-{ws}", "name": "helpdesk", "workspace": ws})
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps(entries))
+    return channels_file, archive_root
+
+
+_STUB_PROFILES_DOC = {"schema_version": "slack-user-profiles-v1", "workspaces": []}
+
+
+def test_gather_and_shard_flushes_each_channel_before_converting_the_next(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+    shard_counts_before_convert: list[int] = []
+
+    def spy_convert(channel_dir: Path, out_dir: Path) -> None:
+        months_root = spill_dir / "months"
+        shards = list(months_root.glob("*/*.ndjson")) if months_root.exists() else []
+        shard_counts_before_convert.append(len(shards))
+        _fake_convert(channel_dir, out_dir)
+
+    # A precomputed (stub) profiles_doc so build_user_profiles' own
+    # one-conversion-per-workspace call doesn't interleave with (and
+    # confuse counting of) the per-channel conversions under test.
+    export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", spy_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir,
+    )
+
+    # Channel 1 converts before anything is spilled; channel 2 converts
+    # only after channel 1's shards already sit on disk; channel 3 only
+    # after both prior channels' shards do - proves the gather phase
+    # never holds more than one channel's messages resident at a time
+    # (each is flushed to disk and released before the next is read).
+    assert shard_counts_before_convert[0] == 0
+    assert shard_counts_before_convert[1] >= 1
+    assert shard_counts_before_convert[2] >= shard_counts_before_convert[1]
+
+
+def test_gather_and_shard_spill_layout_matches_design(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+
+    channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        tmp_path / "empty-cache", None, None, spill_dir,
+    )
+
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}
+    assert len(channels_meta) == 3
+    for month in months_seen:
+        shards = list((spill_dir / "months" / month).glob("*.ndjson"))
+        assert len(shards) >= 1
+    for ws in ("f3aaa", "f3bbb", "f3ccc"):
+        assert (spill_dir / "done" / f"{ws}__C-{ws}").exists()
+    assert (spill_dir / "files.ndjson").exists()
+
+
+def test_write_monthly_digests_matches_build_monthly_digests(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+
+    expected = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache-a",
+    )
+
+    out_template = str(tmp_path / "streamed-{month}.json")
+    written = export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert, out_template,
+        catalog_cache_dir=tmp_path / "empty-cache-b",
+    )
+
+    assert sorted(p.name for p in written) == sorted(f"streamed-{month}.json" for month in expected)
+    assert sorted(expected) == ["2026-04", "2026-05", "2026-06"]
+    for month, expected_doc in expected.items():
+        streamed_doc = json.loads((tmp_path / f"streamed-{month}.json").read_text())
+        # generated_at is a live wall-clock timestamp on both sides -
+        # excluded from the comparison, everything else must match exactly.
+        assert {**streamed_doc, "generated_at": None} == {**expected_doc, "generated_at": None}
+
+
+def test_write_monthly_digests_uses_own_temporary_spill_dir_and_cleans_up(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    out_template = str(tmp_path / "streamed-{month}.json")
+
+    written = export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert, out_template,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert len(written) == 3
+    for path in written:
+        assert path.exists()
+    # No spill directory left behind in tmp_path itself (a fresh
+    # TemporaryDirectory elsewhere is used and removed on success).
+    assert not any(p.name == "spill" for p in tmp_path.iterdir())
+
+
+def test_write_monthly_digests_writes_files_out_sidecar_from_spill(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    files_out_path = tmp_path / "files-out.json"
+    export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        str(tmp_path / "streamed-{month}.json"), catalog_cache_dir=tmp_path / "empty-cache",
+        files_out_path=files_out_path,
+    )
+
+    doc = json.loads(files_out_path.read_text())
+    assert doc["schema_version"] == "slack-llm-files-v1"
+    entry = next(f for f in doc["files"] if f["id"] == CANVAS_FILE["id"])
+    assert entry["modification_history_completeness"] == "partial"
+    assert entry["modification_history"][0]["editor_name"] == "Daniel Hüsch"
+
+
+def test_gather_and_shard_resume_skips_done_channel_and_recovers_its_months(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path, workspaces=("f3aaa", "f3bbb"))
+    spill_dir = tmp_path / "spill"
+
+    convert_calls: list[Path] = []
+
+    def counting_convert(channel_dir: Path, out_dir: Path) -> None:
+        convert_calls.append(channel_dir)
+        _fake_convert(channel_dir, out_dir)
+
+    export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", counting_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir,
+    )
+    assert len(convert_calls) == 2
+
+    # Simulate the first run having been interrupted right after f3aaa
+    # finished: drop f3bbb's done marker (and its shards, as a real crash
+    # mid-write would leave them incomplete/absent) so only f3aaa looks done.
+    (spill_dir / "done" / "f3bbb__C-f3bbb").unlink()
+    for shard in spill_dir.glob("months/*/f3bbb__C-f3bbb.ndjson"):
+        shard.unlink()
+
+    convert_calls.clear()
+    channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", counting_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir, resume=True,
+    )
+
+    assert [c.parent.name for c in convert_calls] == ["f3bbb"]
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}
+    assert len(channels_meta) == 2
