@@ -185,9 +185,32 @@ The deterministic integrity and drift half should be emitted by `export digest` 
 
 ## Open operating decisions
 
-No fixed context-pack size budget, augmentation refresh cadence, or refresh owner has been selected. These remain operating decisions to make before a pack becomes broadly maintained. Until then, source dates and known gaps remain the minimum practical freshness signals.
+`docs/llm-context/augmentations/` is the general place and pattern for dated,
+hand-maintained facts relevant to regional F3 inquiries that come from
+sources outside the Slack export. It is expected to grow on an ongoing basis
+as more such material is identified — not a fixed set closed at migration
+time. Most augmentations are a single current snapshot, re-collected in
+place; a source that recurs (a periodic call, a periodic report) instead
+gets a cumulative file that appends a new dated entry per occurrence without
+overwriting earlier ones — see `augmentations/README.md` for both patterns.
+Some future augmentations may eventually be generated from an automated
+source rather than hand-compiled, but that is out of scope for now; every
+augmentation today is hand-maintained Markdown per the Decision above.
 
-The untracked State of the Nation transcript is in scope as a repository augmentation. Before inclusion, give it provenance, date, scope, and use guidance consistent with the augmentation recommendations.
+**Resolved:** the untracked State of the Nation transcript is now in the
+repository as a cumulative augmentation (`sat-oxl`): `augmentations/sotn-transcripts.md`
+holds the dated per-call summary and header block, `augmentations/sources/`
+holds the raw transcript. New SOTN calls get a new dated entry appended, per
+that file's own maintenance section — not a new open decision each time.
+
+**Still open:** no fixed context-pack size budget, augmentation refresh
+cadence, or refresh owner has been selected as a general policy. This needs
+more information before it can be decided — in particular, real experience
+with how large and how fast the augmentation set grows now that new
+augmentations (SOTN calls and others as they're discovered) are expected on
+an ongoing basis, rather than a one-time migration snapshot. Until decided,
+each augmentation's own `refresh_trigger:`/`refresh_owner:` fields and known
+gaps remain the practical freshness signal, not a pack-wide policy.
 
 ## Migration tracking
 

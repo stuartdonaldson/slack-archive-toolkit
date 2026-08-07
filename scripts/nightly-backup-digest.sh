@@ -30,25 +30,29 @@ mkdir -p "$HOME/slack-exports"
 # Canonical LLM context pack (docs/llm-context/, sat-ejk migration) is the
 # active upload/copy source as of Phase 4 integration. Refresh a curated
 # ~/slack-exports/llm-context/ runtime subtree each run so operator uploads
-# stay in sync with git — mirrors only the deployment files named in
-# docs/llm-context/README.md's "Intended upload set" (contract, policy,
-# domain context, deployment instructions, prompts, active augmentations),
-# deliberately excluding planning/review/validation records
-# (MIGRATION-PLAN.md, REVIEW-*.md, VALIDATION-RESULTS.md, validation-set.md,
-# augmentations/README.md, augmentations/archive/) per MIGRATION-PLAN.md
-# Phase 4's "must avoid copying planning records ... into the runtime upload
-# area".
-mkdir -p "$HOME/slack-exports/llm-context/prompts" "$HOME/slack-exports/llm-context/augmentations"
-cp "$REPO_ROOT/docs/llm-context/ingestion-contract.md" \
-   "$REPO_ROOT/docs/llm-context/query-policy.md" \
-   "$REPO_ROOT/docs/llm-context/f3-domain-context.md" \
-   "$REPO_ROOT/docs/llm-context/project-instructions.md" \
-   "$REPO_ROOT/docs/llm-context/session-preamble.md" \
-   "$HOME/slack-exports/llm-context/"
-cp "$REPO_ROOT/docs/llm-context/prompts/"*.md "$HOME/slack-exports/llm-context/prompts/"
-cp "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-operations.md" \
-   "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-admins.md" \
-   "$HOME/slack-exports/llm-context/augmentations/"
+# stay in sync with git. Mirror the whole tree EXCEPT planning/review/
+# maintenance material that must not reach the runtime upload area (per
+# MIGRATION-PLAN.md Phase 4's "must avoid copying planning records ... into
+# the runtime upload area") — a deny-list via rsync --exclude, not a per-file
+# allow-list, so a new prompt or augmentation file is picked up automatically
+# without editing this script.
+mkdir -p "$HOME/slack-exports/llm-context"
+rsync -a --delete \
+   --exclude 'README.md' \
+   --exclude 'MIGRATION-PLAN.md' \
+   --exclude 'REVIEW-*.md' \
+   --exclude 'VALIDATION-RESULTS.md' \
+   --exclude 'validation-set.md' \
+   --exclude 'augmentations/README.md' \
+   --exclude 'augmentations/archive/' \
+   --exclude 'augmentations/sources/' \
+   "$REPO_ROOT/docs/llm-context/" "$HOME/slack-exports/llm-context/"
+# Excluded: this dir's own operator-facing README (assembly/maintenance
+# guide, not upload content), planning/review/validation records, the
+# augmentations index (operator-facing, not upload content), archived
+# superseded augmentation snapshots, and raw source material backing a
+# cumulative augmentation (e.g. sotn-transcripts.md's transcripts) — citation
+# backup, not upload material.
 
 # The legacy per-file prompt/context docs (F3 culture notes, ingestion/
 # newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the
