@@ -1,6 +1,6 @@
 # Prompt: F3 Puget Sound regional newsletter
 
-Canonical home for the newsletter-generation prompt. Copied from `docs/newsletter-prompt.md`; that file is transitional — see its header.
+Canonical home for the newsletter-generation prompt. Formerly copied from `docs/newsletter-prompt.md`, which was retired in `sat-ejk.5` (see `../MIGRATION-PLAN.md` Phase 5); this file is now the only copy.
 
 ---
 

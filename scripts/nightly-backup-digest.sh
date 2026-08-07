@@ -50,17 +50,10 @@ cp "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-operations.md" \
    "$REPO_ROOT/docs/llm-context/augmentations/f3-nation-admins.md" \
    "$HOME/slack-exports/llm-context/augmentations/"
 
-# Legacy prompt/context docs (F3 culture notes, ingestion/newsletter/FNG/
-# report-query prompts) remain transitional sources until sat-ejk.5 retires
-# them (MIGRATION-PLAN.md Phase 5) — keep refreshing their working copies too
-# so neither the legacy nor the canonical operator uploads silently diverge
-# from git.
-cp "$REPO_ROOT/docs/f3-culture.md" \
-   "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
-   "$REPO_ROOT/docs/newsletter-prompt.md" \
-   "$REPO_ROOT/docs/slack-ingestion.md" \
-    "$REPO_ROOT/docs/report-queries.md" \
-   "$HOME/slack-exports/"
+# The legacy per-file prompt/context docs (F3 culture notes, ingestion/
+# newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the
+# canonical pack above was validated and integrated (MIGRATION-PLAN.md
+# Phase 5) — no longer copied here.
 
 {
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="

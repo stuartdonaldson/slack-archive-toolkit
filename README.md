@@ -131,18 +131,14 @@ Feed **both** the digest JSON and the user profile JSON, plus
 produce the actual newsletter. The prompt defines the regional structure, event/leadership
 handling, and sourcing rules — it expects the digest's `messages`/`channels`/
 `leadership.by_region` schema and the user profiles' per-workspace `profiles` list as-is, so
-don't reshape the JSON first. (The legacy [`docs/newsletter-prompt.md`](docs/newsletter-prompt.md)
-is the same prompt and remains available transitionally — see
-[docs/llm-context/MIGRATION-PLAN.md](docs/llm-context/MIGRATION-PLAN.md).)
+don't reshape the JSON first.
 
 ### 8. Generate a new-member "Start Here" guide (optional)
 
 Feed the digest JSON plus
 [`docs/llm-context/prompts/fng-getting-started.md`](docs/llm-context/prompts/fng-getting-started.md)
 to an LLM to produce a "Slack: Start Here / FAQ" guide for new members, sourced only from the
-digest's actual channels/roles/events — same pattern as the newsletter above. (The legacy
-[`docs/fng-getting-started-prompt.md`](docs/fng-getting-started-prompt.md) remains available
-transitionally.)
+digest's actual channels/roles/events — same pattern as the newsletter above.
 
 ### Browse the archive locally (optional)
 
@@ -178,7 +174,6 @@ Run `./slackbackup help` for the full command list.
 | [DESIGN-export.md](docs/DESIGN-export.md) | Export pipeline: monthly per-channel JSON, cross-workspace LLM digest, user-profile roster, report jobs, pluggable leadership handlers |
 | [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog + untracked-channel digest (implemented) + canvas/file harvesting (designed, not yet ported to Python) |
 | [llm-context/](docs/llm-context/README.md) | Canonical Markdown-first LLM context pack — upload set, source roles, and deployment instructions for both a one-off ChatGPT session (`session-preamble.md`) and a shared ChatGPT Project (`project-instructions.md`) |
-| [report-queries.md](docs/report-queries.md) | Legacy source-grounded guidance and table formats for regional leadership, AO/site, and authority reports — superseded by `docs/llm-context/query-policy.md`, kept transitionally (see `docs/llm-context/MIGRATION-PLAN.md`) |
 | [references/slackdump-cli-notes.md](docs/references/slackdump-cli-notes.md) | slackdump CLI behavior, costs, and gotchas learned the hard way — check before re-deriving |
 | [ADRs](docs/adr/) | Architecture decision records |
 

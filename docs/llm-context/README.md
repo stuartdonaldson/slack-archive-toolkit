@@ -2,7 +2,7 @@
 
 This folder is a Markdown-first context pack for a shared ChatGPT session or ChatGPT Project. It prepares an LLM to safely answer questions about Slack-derived F3 information without treating profile signals or manually collected facts as current proof.
 
-See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources to curate into the completed pack](#sources-to-curate-into-the-completed-pack), have been validated (Phase 3; see [VALIDATION-RESULTS.md](VALIDATION-RESULTS.md)), and are now the active upload/copy source (Phase 4) — `scripts/nightly-backup-digest.sh` refreshes a curated `~/slack-exports/llm-context/` subtree from this folder each run, and `README.md`/`docs/OPERATIONS.md` reference it. The legacy documents named above remain available transitionally and are still refreshed nightly too, until [Phase 5](MIGRATION-PLAN.md#phase-5--retire-legacy-documents) retires them. Do not delete a legacy document based on this folder alone.
+See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources curated into the completed pack](#sources-curated-into-the-completed-pack), have been validated (Phase 3; see [VALIDATION-RESULTS.md](VALIDATION-RESULTS.md)), and are the active upload/copy source (Phase 4) — `scripts/nightly-backup-digest.sh` refreshes a curated `~/slack-exports/llm-context/` subtree from this folder each run, and `README.md`/`docs/OPERATIONS.md` reference it. The legacy per-file documents named below have been retired (Phase 5, `sat-ejk.5`); their content lives only in this pack now and in git history.
 
 ## Why Markdown for manual supplements
 
@@ -83,11 +83,11 @@ Add this instruction to the shared ChatGPT Project after the canonical files exi
 
 > Answer this question from the uploaded data. First identify the scope and the strongest available evidence. Resolve material conflicts by source strength and recency. Preserve direct Slack links. Distinguish confirmed facts, profile-only working signals, dated-manual facts, former roles, and unresolved gaps.
 
-## Sources to curate into the completed pack
+## Sources curated into the completed pack
 
-Copied in Phase 2. Each legacy source below carries a transitional header naming its canonical replacement; the legacy file itself is unchanged otherwise and remains in active use until Phase 4 integration.
+Copied in Phase 2, then retired in Phase 5 (`sat-ejk.5`) once Phase 3 validation and Phase 4 integration were confirmed complete. Each legacy path below no longer exists in the working tree; retrieve it from git history (e.g. `git log --follow -- docs/slack-ingestion.md`) if needed.
 
-| Context file | Legacy source material |
+| Context file | Retired legacy source material |
 | --- | --- |
 | `ingestion-contract.md` | `docs/slack-ingestion.md` |
 | `query-policy.md` | `docs/report-queries.md` and the evidence/confidence sections of `docs/slack-ingestion.md` |
@@ -95,7 +95,7 @@ Copied in Phase 2. Each legacy source below carries a transitional header naming
 | `prompts/newsletter.md` | `docs/newsletter-prompt.md` |
 | `prompts/fng-getting-started.md` | `docs/fng-getting-started-prompt.md` |
 | `augmentations/f3-nation-operations.md` | The role distinctions, operations, and diagnostic guidance in `docs/f3-it-infrastructure-augmentation-2026-06-30.md` |
-| `augmentations/f3-nation-admins.md` | The dated roster and limitations from `docs/f3-it-infrastructure-augmentation-2026-06-30.md` and its companion JSON |
+| `augmentations/f3-nation-admins.md` | The dated roster and limitations from `docs/f3-it-infrastructure-augmentation-2026-06-30.md` and its companion JSON (`docs/f3-it-infrastructure-augmentation-2026-06-30.json`, removed — no automated consumer, Markdown roster is authoritative) |
 | `prompts/initial-intake.md`, `prompts/regional-slt.md`, `prompts/ao-directory.md`, `prompts/authority-routing.md` | New, distilled from this file's §Reusable prompts below |
 | `project-instructions.md`, `session-preamble.md` | New |
 | `validation-set.md` | New |
@@ -107,4 +107,3 @@ Copied in Phase 2. Each legacy source below carries a transitional header naming
 - Keep current operational facts in the supplied Slack exports whenever possible.
 - Update a dated roster by editing its Markdown table and limitations together.
 - Generate any later JSON derivative from the reviewed Markdown source; do not hand-edit both.
-- Remove legacy documents only at the retirement phase in [MIGRATION-PLAN.md](MIGRATION-PLAN.md).

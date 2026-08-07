@@ -2,7 +2,7 @@
 
 ## Status
 
-**Phase 4 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added. The pack was validated ([sat-ejk.3](#migration-tracking); see `VALIDATION-RESULTS.md` — 10/12 scenarios pass, two remediation issues filed rather than editing the pack ad hoc) and is now integrated ([sat-ejk.4](#migration-tracking)): the nightly copy workflow (`scripts/nightly-backup-digest.sh`), `README.md`, and `docs/OPERATIONS.md` reference the canonical pack, and `CLAUDE.md` carries the schema placement rule below. Legacy sources remain available; no legacy retirement has occurred ([sat-ejk.5](#migration-tracking)).
+**Phase 5 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added. The pack was validated ([sat-ejk.3](#migration-tracking); see `VALIDATION-RESULTS.md` — 10/12 scenarios pass, two remediation issues filed rather than editing the pack ad hoc) and integrated ([sat-ejk.4](#migration-tracking)): the nightly copy workflow (`scripts/nightly-backup-digest.sh`), `README.md`, and `docs/OPERATIONS.md` reference the canonical pack, and `CLAUDE.md` carries the schema placement rule below. Legacy sources have now been retired ([sat-ejk.5](#migration-tracking); see Phase 5 below) — each is removed from the working tree and recoverable only from git history.
 
 ## Decision
 
@@ -161,15 +161,17 @@ Update the documentation index, nightly context-copy workflow, and operator guid
 
 Only after Phase 3 validation and Phase 4 integration are complete, redirect, archive, or remove legacy files. Do not retire a file while it is referenced by automation or contains material not present in the canonical pack.
 
-| Legacy item | Planned disposition | Condition before removal |
+**Complete (`sat-ejk.5`, 2026-08-07).** Each condition below was re-verified before removal: every legacy file still carried its Phase 2 transitional header claiming completeness; `scripts/nightly-backup-digest.sh` was the only automation reference (it copied the legacy files into `~/slack-exports/` alongside the canonical pack) and has been updated to drop that copy step; `README.md` (newsletter/FNG sections and the documentation table) and `docs/OPERATIONS.md` (nightly step 0) referenced the legacy paths directly and have been repointed at the canonical pack only; `docs/llm-context/README.md`'s source-curation table now records the retirement instead of describing an in-progress copy. `docs/f3-it-infrastructure-augmentation-2026-06-30.json` had no automated consumer (`grep` across `*.py`/`*.sh` found none) and the Markdown roster (`augmentations/f3-nation-admins.md`) is authoritative, so it was removed outright rather than redirected. Historical mentions of the legacy paths in ADRs, `CHANGELOG.md`, and `work-log.md` were left as-is — those are immutable historical records of past sessions, not live references, and per `doc-standard.md` an ADR is not edited after acceptance. All seven legacy files were deleted (not archived): each is fully superseded by a canonical file with no content gap, and git history preserves the pre-retirement text if it is ever needed (`git log --follow -- <path>`).
+
+| Legacy item | Disposition | Condition verified before removal |
 | --- | --- | --- |
-| `docs/slack-ingestion.md` | Replace with `ingestion-contract.md` | Schema and initial-ingestion guidance fully migrated; all references redirected. |
-| `docs/report-queries.md` | Replace with `query-policy.md` | Reporting rules and table templates fully migrated; all references redirected. |
-| `docs/f3-culture.md` | Replace with `f3-domain-context.md` | Cultural framing, terminology, attributed source notes, and style guidance fully migrated. |
-| `docs/newsletter-prompt.md` | Replace with `prompts/newsletter.md` | Prompt fully migrated and runtime copy workflow redirected. |
-| `docs/fng-getting-started-prompt.md` | Replace with `prompts/fng-getting-started.md` | Prompt fully migrated and runtime copy workflow redirected. |
-| `docs/f3-it-infrastructure-augmentation-2026-06-30.md` | Split into stable-name augmentation files | Operations guidance and roster metadata/table fully migrated and reviewed. |
-| `docs/f3-it-infrastructure-augmentation-2026-06-30.json` | Remove as a hand-maintained source after verification | Verify it has no automated consumer; Markdown roster is authoritative. |
+| `docs/slack-ingestion.md` | Removed; replaced by `ingestion-contract.md` | Schema and initial-ingestion guidance fully migrated; all references redirected. |
+| `docs/report-queries.md` | Removed; replaced by `query-policy.md` | Reporting rules and table templates fully migrated; all references redirected. |
+| `docs/f3-culture.md` | Removed; replaced by `f3-domain-context.md` | Cultural framing, terminology, attributed source notes, and style guidance fully migrated. |
+| `docs/newsletter-prompt.md` | Removed; replaced by `prompts/newsletter.md` | Prompt fully migrated and runtime copy workflow redirected. |
+| `docs/fng-getting-started-prompt.md` | Removed; replaced by `prompts/fng-getting-started.md` | Prompt fully migrated and runtime copy workflow redirected. |
+| `docs/f3-it-infrastructure-augmentation-2026-06-30.md` | Removed; split into `augmentations/f3-nation-operations.md` and `augmentations/f3-nation-admins.md` | Operations guidance and roster metadata/table fully migrated and reviewed. |
+| `docs/f3-it-infrastructure-augmentation-2026-06-30.json` | Removed as a hand-maintained source | Verified no automated consumer; Markdown roster is authoritative. |
 
 ## Consistency and drift follow-up
 
@@ -196,7 +198,7 @@ The untracked State of the Nation transcript is in scope as a repository augment
 | `sat-ejk.2` | Create canonical context files | Closed; Phase 2 |
 | `sat-ejk.3` | Validate the context pack | Closed; depends on `sat-ejk.2` |
 | `sat-ejk.4` | Integrate canonical pack into workflows | In progress; depends on `sat-ejk.3`; Phase 4 |
-| `sat-ejk.5` | Retire legacy context documents | Open; depends on `sat-ejk.4` |
+| `sat-ejk.5` | Retire legacy context documents | Closed; depends on `sat-ejk.4`; Phase 5 |
 | `sat-ejk.6` | Emit deterministic digest consistency metrics | Open; related export-pipeline work, not a prerequisite for the planning revision |
 
 ## Validation checklist
