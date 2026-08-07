@@ -51,6 +51,8 @@ Each channel entry carries three distinct text fields — do not collapse them o
 
 Read `topic` and `purpose` independently rather than relying on `description` alone. Either may be null if never set in Slack.
 
+When `topic` and `purpose` say conflicting things, treat `topic` as the higher-priority signal (it matches `description`'s own fallback order) but still report the `purpose` content rather than discarding it — a channel may deliberately carry a short operational `topic` alongside a longer standing `purpose` that states its actual charter, and both are legitimate evidence.
+
 # Digest and file sidecar
 
 Every `slack-llm-digest-v4` file must be used with its companion `slack-llm-files-v1` sidecar when one is provided.
