@@ -860,6 +860,7 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
     catalog = catalog_logic.load(cache_dir, "f3pugetsound")
     catalog["channels"]["C1"] = {
         "member": True, "name": "helpdesk", "description": "Ask anything here",
+        "topic": "Read the pinned FAQ first", "purpose": "Ask anything here",
         "is_private": False, "is_archived": False, "creator": "U999", "created": 1700000000,
     }
     catalog_logic.save(cache_dir, "f3pugetsound", catalog)
@@ -871,6 +872,10 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
 
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
     assert meta["description"] == "Ask anything here"
+    # topic and purpose are kept distinct even when description's
+    # topic-falls-back-to-purpose merge would have collapsed them
+    assert meta["topic"] == "Read the pinned FAQ first"
+    assert meta["purpose"] == "Ask anything here"
     assert meta["creator"] == "U999"
     assert meta["created_at"] == "2023-11-14T22:13:20Z"
 
@@ -895,7 +900,7 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
     assert meta == {
         "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok",
         "channel_url": "https://f3pugetsound.slack.com/archives/C1", "files": [],
-        "description": None, "creator": None, "created_at": None,
+        "description": None, "topic": None, "purpose": None, "creator": None, "created_at": None,
         "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
         "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
         "activity_status": "active", "activity_status_basis": "has messages during export_scope",
@@ -1069,7 +1074,7 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
         {
             "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
             "channel_url": "https://f3pugetsound.slack.com/archives/C1",
-            "files": [], "description": None, "creator": None, "created_at": None,
+            "files": [], "description": None, "topic": None, "purpose": None, "creator": None, "created_at": None,
         }
     ]
     assert result["messages"] == []

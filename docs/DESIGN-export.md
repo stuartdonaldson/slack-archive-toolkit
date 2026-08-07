@@ -277,11 +277,18 @@ un-archived channel in a 100-channel workspace glob must not block the whole dig
 
 ### Channel context — catalog, not a live call
 
-Each channel's entry under `channels` is enriched with `description`/`creator`/`created_at`,
-read **read-only from the already-cached catalog** (`catalog_logic.load`, never `refresh_*`) —
-the digest stays purely local and never triggers a Slack API call of its own; if the cache was
-never warmed for a channel (e.g. a fresh checkout with no `~/.cache/slackbackup/`), those fields
-are simply `null` rather than blocking on a live fetch.
+Each channel's entry under `channels` is enriched with
+`description`/`topic`/`purpose`/`creator`/`created_at`, read **read-only from the already-cached
+catalog** (`catalog_logic.load`, never `refresh_*`) — the digest stays purely local and never
+triggers a Slack API call of its own; if the cache was never warmed for a channel (e.g. a fresh
+checkout with no `~/.cache/slackbackup/`), those fields are simply `null` rather than blocking on
+a live fetch.
+
+`description` is `catalog_logic.description_of()`'s merge — topic if set, else purpose, so it can
+silently drop one or the other. `topic` and `purpose` are the raw Slack values kept alongside it
+(additive, sat-hkd) so a query over the digest can use either signal independently — e.g. a
+channel whose topic is logistical ("read the pinned FAQ") but whose purpose states its actual
+charter (a site-Q channel, a leadership channel's remit).
 
 ### Files & Canvases (all types, including images) — read from the archive's own `FILE` table, not `convert`
 
@@ -520,7 +527,7 @@ edit events they carried now live in the sidecar's per-file `modification_histor
   "channels": [
     { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
       "status": "ok", "channel_url": "https://f3pugetsound.slack.com/archives/C...",
-      "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
+      "description": "...", "topic": "...", "purpose": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
       "files": [ { "id": "F...", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q Schedule",
                    "filetype": "canvas", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
                    "creator": "U...", "created_at": "2026-01-05T00:00:00Z", "size": 4096,
@@ -799,7 +806,7 @@ overwriting one file every month. The direct path's default `--out`
 | Document | Location | Covers |
 |----------|----------|--------|
 | Backup system design | `docs/DESIGN.md` | Archive layout, `slackdump.sqlite` state, dedupe/archive footguns |
-| Channel catalog | `docs/DESIGN-files.md` | `catalog_logic.py` schema — `description`/`creator`/`created`/`registered_at`/`last_posted` consumed read-only by `export digest` |
+| Channel catalog | `docs/DESIGN-files.md` | `catalog_logic.py` schema — `description`/`topic`/`purpose`/`creator`/`created`/`registered_at`/`last_posted` consumed read-only by `export digest` |
 | slackdump convert | `slackdump help convert` | Export-format conversion from an archive |
 | Slack export format | `slackdump help chunk`, Slack docs | Day-file layout and thread fields |
 | Original digest feature request | `docs/llm-export-suggestion.md` | External feedback that motivated `export digest`'s one-document, embedded-metadata, no-merged-identity design |

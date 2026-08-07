@@ -26,12 +26,12 @@ def test_description_empty_when_both_empty():
 def test_fast_merge_into_empty_catalog_produces_member_rows():
     data = catalog_logic.merge_fast(_fresh(), [CH1, CH2])
     assert data["channels"]["C1"] == {
-        "member": True, "name": "general", "description": "T1", "topic": "T1", "is_private": False, "is_archived": False,
-        "creator": None, "created": None,
+        "member": True, "name": "general", "description": "T1", "topic": "T1", "purpose": None,
+        "is_private": False, "is_archived": False, "creator": None, "created": None,
     }
     assert data["channels"]["C2"] == {
-        "member": True, "name": "helpdesk", "description": "P2", "topic": None, "is_private": False, "is_archived": False,
-        "creator": None, "created": None,
+        "member": True, "name": "helpdesk", "description": "P2", "topic": None, "purpose": "P2",
+        "is_private": False, "is_archived": False, "creator": None, "created": None,
     }
 
 
@@ -64,7 +64,7 @@ def test_full_merge_refreshes_description_without_clobbering_member_flag():
     updated_ch1 = {"id": "C1", "name": "general", "topic": {"value": "T1-updated"}, "purpose": {"value": ""}}
     data = catalog_logic.merge_full(data, [updated_ch1])
     assert data["channels"]["C1"] == {
-        "member": True, "name": "general", "description": "T1-updated", "topic": "T1-updated",
+        "member": True, "name": "general", "description": "T1-updated", "topic": "T1-updated", "purpose": None,
         "is_private": False, "is_archived": False, "creator": None, "created": None,
     }
 
@@ -126,7 +126,7 @@ def test_lookup_falls_back_to_full_tier_on_fast_miss(tmp_path, monkeypatch):
     matches = catalog_logic.lookup("f3test", "new-public", cache_dir=tmp_path)
     assert matches == [
         ("C3", {
-            "member": False, "name": "new-public", "description": "P3", "topic": None,
+            "member": False, "name": "new-public", "description": "P3", "topic": None, "purpose": "P3",
             "is_private": False, "is_archived": False, "creator": None, "created": None,
         })
     ]

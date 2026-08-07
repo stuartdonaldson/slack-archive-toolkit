@@ -62,6 +62,7 @@ def _channel_fields(ch: dict, member: bool) -> dict:
         "name": ch["name"],
         "description": description_of(ch),
         "topic": (ch.get("topic") or {}).get("value") or None,
+        "purpose": (ch.get("purpose") or {}).get("value") or None,
         "is_private": ch.get("is_private", False),
         "is_archived": ch.get("is_archived", False),
         "creator": ch.get("creator") or None,

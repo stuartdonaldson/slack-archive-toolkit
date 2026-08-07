@@ -469,16 +469,28 @@ def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
 
 
 def _channel_context(catalog: dict, channel_id: str) -> dict:
-    """description/creator/created_at for one channel, read-only from an
-    already-loaded catalog cache (no API call, no refresh - the digest
-    stays local-only; if the cache was never warmed for this channel, e.g.
-    a fresh checkout, these are just None rather than triggering a live
-    fetch). created_at is an ISO8601 string, not the raw epoch, matching
-    this module's posted_at_local convention elsewhere."""
+    """description/topic/purpose/creator/created_at for one channel,
+    read-only from an already-loaded catalog cache (no API call, no
+    refresh - the digest stays local-only; if the cache was never warmed
+    for this channel, e.g. a fresh checkout, these are just None rather
+    than triggering a live fetch). created_at is an ISO8601 string, not
+    the raw epoch, matching this module's posted_at_local convention
+    elsewhere.
+
+    `description` is catalog_logic.description_of()'s topic-falls-back-to-
+    purpose merge, kept as-is for existing consumers. `topic`/`purpose` are
+    added alongside it (additive, no schema_version bump - see ADR-0001)
+    because that merge silently drops the purpose text whenever a topic is
+    also set; a channel can use one for status/logistics and the other for
+    its actual charter (e.g. a site-Q or leadership channel's purpose),
+    and losing either one is a real signal loss for a query over the
+    digest."""
     channel = catalog["channels"].get(channel_id, {})
     created = channel.get("created")
     return {
         "description": channel.get("description") or None,
+        "topic": channel.get("topic") or None,
+        "purpose": channel.get("purpose") or None,
         "creator": channel.get("creator") or None,
         "created_at": (
             datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
