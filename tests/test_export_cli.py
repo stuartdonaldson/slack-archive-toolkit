@@ -85,7 +85,7 @@ def _stub_profiles(monkeypatch, raise_for_glob=None):
         if files_out_path is not None:
             files_out_path.parent.mkdir(parents=True, exist_ok=True)
             files_out_path.write_text(json.dumps({
-                "schema_version": "slack-llm-files-v1", "generated_at": f"{as_of}T00:00:00Z",
+                "schema_version": "slack-llm-files-v2", "generated_at": f"{as_of}T00:00:00Z",
                 "files": [{**_SAMPLE_FILES_OUT_ENTRY, "first_seen_at": f"{as_of}T00:00:00Z", "content_changed_at": None}],
             }))
         return written
@@ -293,7 +293,7 @@ def test_run_job_writes_files_out_sidecar_when_job_sets_files_out(tmp_path, monk
     files_out_path = tmp_path / "job-files-2026-07-01.json"
     assert files_out_path.exists()
     doc = json.loads(files_out_path.read_text())
-    assert doc["schema_version"] == "slack-llm-files-v1"
+    assert doc["schema_version"] == "slack-llm-files-v2"
     assert doc["files"][0]["id"] == "F1"
     assert doc["files"][0]["first_seen_at"] == doc["generated_at"]
 

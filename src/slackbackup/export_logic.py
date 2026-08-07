@@ -646,6 +646,43 @@ def _file_archive_status(data: dict, blob_exists: bool, content: str | None) -> 
     return "unsupported_type"
 
 
+_ORDINARY_UNSUPPORTED_MIME_PREFIXES = ("image/", "video/", "audio/")
+_ORDINARY_UNSUPPORTED_FILETYPES = {
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "bmp", "tiff", "tif",
+    "mp4", "mov", "avi", "mkv", "webm", "m4v",
+    "mp3", "wav", "m4a", "ogg", "aac", "flac",
+}
+
+
+def _is_ordinary_unsupported_media(mimetype: str | None, filetype: str | None) -> bool:
+    """True for the routine image/video/audio types the files_out sidecar
+    deliberately omits when there's no extracted content (sat-4uf) - a
+    no_blob/unsupported_type outcome is the expected, not exceptional,
+    result for these (thousands of them in a real archive), so a sidecar
+    record adds no diagnostic value. Falls back to `filetype` when
+    `mimetype` is missing/empty, since Slack doesn't always set one."""
+    if mimetype and mimetype.startswith(_ORDINARY_UNSUPPORTED_MIME_PREFIXES):
+        return True
+    return bool(filetype) and filetype.lower() in _ORDINARY_UNSUPPORTED_FILETYPES
+
+
+def _sidecar_worth_keeping(entry: dict) -> bool:
+    """files_out sidecar inclusion rule (schema v2, sat-4uf). content_extracted
+    is kept unconditionally - it's the sidecar's whole reason to exist.
+    tombstone is kept unconditionally too - deletion evidence a later run
+    can no longer recover, and it's cheap (Slack file deletions are rare).
+    no_blob/unsupported_type is dropped only when the file is ordinary
+    unsupported media (see _is_ordinary_unsupported_media) - the same
+    outcome for a PDF that never downloaded, or a mimetype we don't
+    recognize at all, is genuinely exceptional and stays. An entry with no
+    archive_status at all (a synthetic/older caller) is kept - unknown is
+    treated conservatively, not as routine."""
+    status = entry.get("archive_status")
+    if status not in ("no_blob", "unsupported_type"):
+        return True
+    return not _is_ordinary_unsupported_media(entry.get("mimetype"), entry.get("filetype"))
+
+
 def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str | None) -> str | None:
     """Path (relative to the archive root - two levels above channel_dir,
     i.e. <workspace>/<channel>/...) to the downloaded blob for a file, if
@@ -717,16 +754,19 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
     return files
 
 
-_DIGEST_ONLY_FILE_KEYS = ("content", "content_sha256", "archive_status", "blob_captured_at")
+_SIDECAR_ONLY_FILE_KEYS = ("content", "content_sha256", "blob_captured_at")
 
 
 def _digest_file_view(file_entry: dict) -> dict:
-    """The digest's channels[].files[] entry (schema v4, sat-811 §3):
+    """The digest's channels[].files[] entry (schema v5, sat-811 §3 / sat-4uf):
     everything _load_channel_files produces except the extracted `content`
-    itself (and the sidecar-only fields that travel with it) - content
-    lives in the files_out sidecar now, joined by (workspace, channel_id,
-    id). `has_content` tells a consumer whether it's worth the join."""
-    out = {k: v for k, v in file_entry.items() if k not in _DIGEST_ONLY_FILE_KEYS}
+    itself and its sidecar-only provenance fields (content_sha256,
+    blob_captured_at) - the text lives in the files_out sidecar now,
+    joined by (workspace, channel_id, id). `archive_status` stays in the
+    digest (sat-4uf) so `has_content: false` is self-explanatory - a
+    consumer never needs the sidecar join just to learn *why* a file has
+    no content, only to read the content of one that has it."""
+    out = {k: v for k, v in file_entry.items() if k not in _SIDECAR_ONLY_FILE_KEYS}
     out["has_content"] = file_entry.get("content") is not None
     return out
 
@@ -1765,6 +1805,17 @@ def merge_files_out(
     unchanged rather than dropped - Slack's own 90-day free-tier retention
     already destroys the source; the sidecar must not additionally destroy
     its own record of a file we saw when it was still there.
+
+    Schema v2 (sat-4uf): both the previously-carried entries and this run's
+    fresh entries are filtered through `_sidecar_worth_keeping` before
+    anything else - routine unsupported-media (image/video/audio)
+    no_blob/unsupported_type records are dropped, including ones carried
+    over from a pre-v2 sidecar (self-cleaning: an old sidecar's accumulated
+    JPG/PNG/MP4 cruft shrinks away over successive merges, not just stops
+    growing). content_extracted and tombstone records, and no_blob/
+    unsupported_type for anything that isn't ordinary media, are
+    unaffected - the "additive, never drop a live record" guarantee above
+    still holds for those.
     """
     if not isinstance(previous_sidecar, dict):
         previous_sidecar = None  # non-dict JSON (truncated/corrupt sidecar) - treat as absent, not fatal
@@ -1772,6 +1823,8 @@ def merge_files_out(
     previous_by_key: dict[tuple, dict] = {}
     for f in (previous_sidecar or {}).get("files", []):
         if not isinstance(f, dict):
+            continue
+        if not _sidecar_worth_keeping(f):
             continue
         try:
             key = (f["workspace"], f["channel_id"], f["id"])
@@ -1781,6 +1834,8 @@ def merge_files_out(
 
     files_by_key: dict[tuple, dict] = dict(previous_by_key)
     for entry in entries:
+        if not _sidecar_worth_keeping(entry):
+            continue
         key = (entry["workspace"], entry["channel_id"], entry["id"])
         prev = previous_by_key.get(key)
         first_seen_at = prev.get("first_seen_at", generated_at) if prev is not None else generated_at
@@ -1796,7 +1851,7 @@ def merge_files_out(
     files_out = list(files_by_key.values())
     files_out.sort(key=lambda f: (f["workspace"], f["channel_id"], f["id"]))
     return {
-        "schema_version": "slack-llm-files-v1",
+        "schema_version": "slack-llm-files-v2",
         "generated_at": generated_at,
         "files": files_out,
     }
@@ -1831,6 +1886,7 @@ def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], u
     file_reference_count = 0
     has_content_true = 0
     has_content_false = 0
+    archive_status_counts: dict[str, int] = {}
     file_ts_present = 0
     file_ts_matched = 0
 
@@ -1847,6 +1903,9 @@ def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], u
                 has_content_true += 1
             else:
                 has_content_false += 1
+            status = f.get("archive_status")
+            if status is not None:
+                archive_status_counts[status] = archive_status_counts.get(status, 0) + 1
             message_ts = f.get("message_ts")
             if message_ts is not None:
                 file_ts_present += 1
@@ -1869,6 +1928,7 @@ def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], u
         "file_reference_count": file_reference_count,
         "file_has_content_true_count": has_content_true,
         "file_has_content_false_count": has_content_false,
+        "file_archive_status_counts": archive_status_counts,
         "file_message_ts_present_count": file_ts_present,
         "file_message_ts_matched_count": file_ts_matched,
         "file_message_ts_unmatched_count": file_ts_present - file_ts_matched,
@@ -1879,6 +1939,14 @@ def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], u
                 "Referential integrity within this document only (ingestion-contract.md's "
                 "'within the upload' checks). Cross-source consistency against an augmentation "
                 "document, and drift versus a prior upload, still need to be done by the consumer."
+            ),
+            "file_archive_status_counts": (
+                "Breaks the has_content: false count down by reason (schema v5, sat-4uf) - "
+                "content_extracted/tombstone/no_blob/unsupported_type and any other archive_status "
+                "value present, keyed directly by that value. A files_out sidecar record is only "
+                "expected for content_extracted (and any exceptional no_blob/unsupported_type on a "
+                "non-media file) - routine unsupported-media no_blob/unsupported_type counts here "
+                "are expected to have no sidecar record at all, not a gap."
             ),
             "file_message_ts_unmatched_count": (
                 "A split-by-month digest attaches every channel file to every month it appears "
@@ -1940,7 +2008,7 @@ def _assemble_digest(
         export_scope["month"] = month
 
     return {
-        "schema_version": "slack-llm-digest-v4",
+        "schema_version": "slack-llm-digest-v5",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": export_scope,
         "manifest": {
@@ -1949,8 +2017,13 @@ def _assemble_digest(
                 "has_content": (
                     "v4: a channel file's extracted text moved out of this document into a "
                     "companion files_out sidecar (same job, same as_of) - join on (workspace, "
-                    "channel_id, id). has_content: false means no text was ever extractable for "
-                    "this file (see the sidecar's archive_status), not that the sidecar is missing. "
+                    "channel_id, id). v5: this file's own archive_status field (content_extracted / "
+                    "no_blob / unsupported_type / tombstone) explains has_content: false directly - "
+                    "no sidecar lookup needed to learn why. A sidecar record is only guaranteed for "
+                    "has_content: true; for has_content: false it exists only when archive_status is "
+                    "an exceptional failure (tombstone, or no_blob/unsupported_type on a file that "
+                    "isn't ordinary image/video/audio media) - a missing sidecar record for routine "
+                    "unsupported media (JPG/PNG/MP4/...) is expected, not a gap. "
                     "tabbed_canvas_updated system messages (Slack's 'X made updates to a canvas "
                     "tab' notices) are also stripped from messages[] in v4 and no longer inflate "
                     "root_message_count/participant_count for the USLACKBOT account; see the "
@@ -2051,7 +2124,7 @@ def build_digest(
     """Merges messages from the trailing `days` days (or everything ever
     archived, when `days` is None) across every (workspace, channel) in
     `channels_file` matching `workspace_glob` into one chronologically-
-    sorted slack-llm-digest-v4 document. See _gather_digest_data and
+    sorted slack-llm-digest-v5 document. See _gather_digest_data and
     _assemble_digest for the two phases this composes; see
     build_monthly_digests for the equivalent split into one document per
     calendar month.
@@ -2104,7 +2177,7 @@ def build_monthly_digests(
     profiles_doc: dict | None = None,
     files_out_sink: list[dict] | None = None,
 ) -> dict[str, dict]:
-    """Same data and same slack-llm-digest-v4 schema as build_digest, but
+    """Same data and same slack-llm-digest-v5 schema as build_digest, but
     split into one document per calendar month (keyed "YYYY-MM") instead of
     one merged document. A thread's replies stay with their parent's
     month even when a reply itself lands in a later month - see
@@ -2148,7 +2221,7 @@ def write_monthly_digests(
     Phase 2 / sat-svu): shards every channel's messages/file content to disk
     via gather_and_shard_digest_data instead of holding the whole job's
     messages and file content in memory at once, then assembles and writes
-    each month's slack-llm-digest-v4 document one at a time (reusing
+    each month's slack-llm-digest-v5 document one at a time (reusing
     _assemble_digest unchanged - same document, only the memory shape of
     getting there differs), discarding that month's message slice before
     moving to the next.

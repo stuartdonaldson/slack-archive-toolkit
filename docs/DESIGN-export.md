@@ -340,18 +340,47 @@ contributing cause of an OOM kill (sat-811).
 
 v4's fix: `channels[].files[]` in the digest keeps every v3 field **except** `content` (and the
 three change-detection fields above), and gains `has_content: true|false`. The extracted text
-itself moves to a companion **`files_out`** sidecar document (`schema_version:
-"slack-llm-files-v1"`), written per job alongside the digest (see §Report jobs). Join key is
-`(workspace, channel_id, id)`.
+itself moves to a companion **`files_out`** sidecar document, written per job alongside the digest
+(see §Report jobs). Join key is `(workspace, channel_id, id)`.
 
 The sidecar is written **only on the `--jobs` path**, and only for a job that sets `files_out` —
 there is no `--files-out` command-line flag. A plain `export digest` run still extracts file
 content (the digest's `has_content` depends on it) but simply discards it when the process exits.
 A job that wants the text must declare `files_out`.
 
+##### Digest `archive_status` and the sidecar's routine-media exclusion (schema v5, sat-4uf)
+
+A live sidecar accumulates thousands of `no_blob`/`unsupported_type` records for ordinary image
+and video attachments — JPG/PNG/GIF/HEIC/MP4/MOV and the like — that never had extractable text
+and never will. None of that carries diagnostic value: v4 already told a consumer `has_content:
+false`, but explaining *why* required opening the sidecar and reading `archive_status` there
+regardless, and the record existed forever once written (the merge is additive).
+
+v5 makes two changes:
+
+- **`archive_status` moves into the digest itself** — `channels[].files[]` now carries
+  `archive_status` (`content_extracted` / `no_blob` / `unsupported_type` / `tombstone`) alongside
+  `has_content`, so `has_content: false` is self-explanatory from the digest alone. The sidecar
+  join is only ever needed to *read* extracted text, never to learn why there isn't any.
+- **The sidecar drops routine unsupported-media records.** `export_logic.merge_files_out` (schema
+  `slack-llm-files-v2`) keeps every `content_extracted` record (its whole reason to exist) and
+  every `tombstone` record (deletion evidence a later run can't recover) unconditionally. A
+  `no_blob`/`unsupported_type` record is kept only when the file **isn't** ordinary image/video/audio
+  media (`export_logic._is_ordinary_unsupported_media`, by mimetype prefix with a `filetype`
+  fallback) — e.g. a PDF whose blob never downloaded, or a mimetype nothing recognizes at all,
+  stays as a genuine diagnostic record. The rule applies to **both** this run's fresh entries and
+  the previously-carried sidecar contents, so a pre-v5 sidecar's accumulated media cruft prunes
+  itself away over successive merges rather than merely stopping its growth.
+
+This changes the sidecar-asymmetry rule from v4's "any `has_content: false` file may lack a
+sidecar record" to a precise one: **a missing sidecar record is only a gap when
+`has_content: true`.** For `has_content: false`, a sidecar record now exists only for the
+exceptional cases above — its absence for routine unsupported media is expected, not a defect. See
+`docs/llm-context/ingestion-contract.md` for the consumer-facing restatement.
+
 ```jsonc
 {
-  "schema_version": "slack-llm-files-v1",
+  "schema_version": "slack-llm-files-v2",
   "generated_at": "2026-08-06T09:00:00Z",
   "files": [
     { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
@@ -367,10 +396,20 @@ A job that wants the text must declare `files_out`.
           "editor_match_confidence": "high", "channel": "ao-active-book-club", "channel_id": "C...",
           "message_ts": "1783...53" }
       ],
-      "modification_history_completeness": "partial", "last_modified_at": "2026-07-26T09:00:00Z" }
+      "modification_history_completeness": "partial", "last_modified_at": "2026-07-26T09:00:00Z" },
+    { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
+      "id": "F09ZZZ111AA", "name": "region-charter.pdf", "filetype": "pdf", "mimetype": "application/pdf",
+      "pretty_type": "PDF", "creator": "U...", "created_at": "2024-02-01T00:00:00Z", "size": 190442,
+      "permalink": "https://...", "local_path": null, "content": null, "content_sha256": null,
+      "archive_status": "no_blob", "blob_captured_at": null,
+      "first_seen_at": "2026-05-01T09:00:00Z", "content_changed_at": null }
   ]
 }
 ```
+
+The second entry above illustrates the exception: a PDF (an extractable type) whose blob was never
+downloaded is a genuine diagnostic gap, so it stays in the sidecar even with `content: null` — an
+ordinary JPG in the same state would not appear here at all.
 
 Unlike the digest, `files_out` is **cumulative across runs, not `days`-window-relative** — the
 same as `_load_channel_files` itself, which already reads the whole archive's `FILE` table every
@@ -386,12 +425,14 @@ id)`:
 - `last_modified_at`, present only when `modification_history` is non-empty, is the max of that
   history's `at` values.
 
-The merge is **additive, not a rebuild from this run's scan alone**: a file recorded in a prior
-run's `files_out` but absent from this run's freshly-read entries — its channel fell outside a
-`--workspace`/`--channel` selector, its 90-day Slack retention window expired, or its archive is
-transiently missing — is carried forward into the merged sidecar unchanged rather than dropped.
-Slack's own retention already destroys the source; `files_out` must not additionally destroy its
-own record of a file it saw while that file still existed on Slack.
+The merge is **additive, not a rebuild from this run's scan alone**, for every record that passes
+the v5 retention rule above: a kept file recorded in a prior run's `files_out` but absent from this
+run's freshly-read entries — its channel fell outside a `--workspace`/`--channel` selector, its
+90-day Slack retention window expired, or its archive is transiently missing — is carried forward
+into the merged sidecar unchanged rather than dropped. Slack's own retention already destroys the
+source; `files_out` must not additionally destroy its own record of a file it saw while that file
+still existed on Slack. A routine-media record is the one exception to "additive": it is pruned on
+sight regardless of whether this run's scan reproduced it, per the self-cleaning behavior above.
 
 ##### Canvas edit history from `tabbed_canvas_updated` (sat-811 §9 / sat-2s9)
 
@@ -480,7 +521,7 @@ export engine. Handler selection:
 
 ### Output shape
 
-`schema_version: "slack-llm-digest-v4"`. v2 evolved v1 **additively** — every v1 field/shape
+`schema_version: "slack-llm-digest-v5"`. v2 evolved v1 **additively** — every v1 field/shape
 still held; v2 only added fields (see `docs/adr/0001-digest-v2-additive-evidence.md` for that
 decision). v3 makes three changes:
 
@@ -507,15 +548,20 @@ document into a companion `files_out` sidecar, replaced by `has_content: true|fa
 bug where they inflated `root_message_count`/`participant_count` for the `USLACKBOT` account; the
 edit events they carried now live in the sidecar's per-file `modification_history` instead.
 
+v5 (sat-4uf, `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) adds `archive_status`
+(`content_extracted`/`no_blob`/`unsupported_type`/`tombstone`) alongside `has_content` on every
+`files[]` entry, so `has_content: false` is self-explanatory without a sidecar lookup — see
+§`files_out` sidecar → "Digest `archive_status` and the sidecar's routine-media exclusion" above.
+
 ```jsonc
 {
-  "schema_version": "slack-llm-digest-v4",
+  "schema_version": "slack-llm-digest-v5",
   "generated_at": "2026-06-23T18:00:00Z",
   "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
     "workspaces_included": 7,
     "counting_rules": {
-      "has_content": "v4: a channel file's extracted text moved to a companion files_out sidecar (same job, same as_of) - join on (workspace, channel_id, id); has_content: false means no text was ever extractable, not that the sidecar is missing.",
+      "has_content": "v4: a channel file's extracted text moved to a companion files_out sidecar (same job, same as_of) - join on (workspace, channel_id, id). v5: this file's own archive_status field explains has_content: false directly, no sidecar lookup needed. A sidecar record is only guaranteed for has_content: true; for has_content: false it exists only for an exceptional archive_status (tombstone, or no_blob/unsupported_type on a non-media file) - its absence for routine unsupported media (JPG/PNG/MP4/...) is expected, not a gap.",
       "root_message_count": "top-level messages only",
       "reply_count": "nested replies under root messages",
       "total_message_count": "root_message_count plus reply_count",
@@ -541,7 +587,7 @@ edit events they carried now live in the sidecar's per-file `modification_histor
                    "filetype": "canvas", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
                    "creator": "U...", "created_at": "2026-01-05T00:00:00Z", "size": 4096,
                    "permalink": "https://...", "message_ts": "1718...", "local_path": "f3pugetsound/ao-active-book-club/__uploads/F.../Upcoming_Q_Schedule",
-                   "has_content": true } ],
+                   "has_content": true, "archive_status": "content_extracted" } ],
       "root_message_count": 12, "reply_count": 28, "total_message_count": 40, "participant_count": 8,
       "first_message_utc": "2026-04-01T12:00:00Z", "last_message_utc": "2026-06-20T08:00:00Z",
       "activity_status": "active", "activity_status_basis": "has messages during export_scope" },
@@ -605,10 +651,11 @@ edit events they carried now live in the sidecar's per-file `modification_histor
   "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] },
   "consistency": {
     "channel_id_duplicate_count": 0, "file_reference_count": 1, "file_has_content_true_count": 1,
-    "file_has_content_false_count": 0, "file_message_ts_present_count": 1, "file_message_ts_matched_count": 1,
+    "file_has_content_false_count": 0, "file_archive_status_counts": { "content_extracted": 1 },
+    "file_message_ts_present_count": 1, "file_message_ts_matched_count": 1,
     "file_message_ts_unmatched_count": 0, "mention_unresolved_count": 0, "in_scope_false_orphan_count": 0,
-    "notes": { "scope": "...", "file_message_ts_unmatched_count": "...", "mention_unresolved_count": "...",
-               "in_scope_false_orphan_count": "..." }
+    "notes": { "scope": "...", "file_archive_status_counts": "...", "file_message_ts_unmatched_count": "...",
+               "mention_unresolved_count": "...", "in_scope_false_orphan_count": "..." }
   }
 }
 ```
@@ -693,9 +740,10 @@ document's own `channels`/`messages`/`user_index`, computed by `_compute_consist
 `_assemble_digest` from data already gathered for this same document — no extra pass over the
 archive. It replaces the interim manual checklist that `docs/llm-context/ingestion-contract.md`
 used to carry as a "run this by hand" section (§Consistency and drift checks): `channel_id`
-duplicates per workspace, the digest's own file-reference/`has_content` split, how many
-`message_ts`-carrying files resolve to a real message in the same workspace/channel within this
-document, mentioned ids absent from `user_index`, and `in_scope: false` parents with no replies
+duplicates per workspace, the digest's own file-reference/`has_content` split (and, since v5, that
+split's `archive_status` breakdown — `file_archive_status_counts`), how many `message_ts`-carrying
+files resolve to a real message in the same workspace/channel within this document, mentioned ids
+absent from `user_index`, and `in_scope: false` parents with no replies
 (an invariant that should always read `0`). Each count's `notes` entry restates how to interpret
 it, so the LLM ingestion side doesn't need this design doc to read the block correctly.
 
@@ -798,7 +846,7 @@ and the blanket run duplicated their work at full cost. Both remain available as
 
 ### Monthly digest splitting (`split_by_month` / `--split-by-month`)
 
-`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v4` schema as
+`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v5` schema as
 `build_digest`, but as a `{month: document}` mapping instead of one merged document — one file per
 calendar month (`export_scope.month` is stamped on each). It shares `build_digest`'s first phase
 (`_gather_digest_data`: converts every matched channel's archive once, range-bounds, and
@@ -907,6 +955,7 @@ already uses `split_by_month`.
 | Bot-posted Block Kit backblasts lost their PAX list — `mentions[]` extraction read only `msg.text`, but the *PAX*: line with its `<@U...>` mentions lives in `blocks[].text.text` while `text` is a narrative-only fallback | Confirmed on f3kirkland/ao-heritage-park ts=1783887179.871339: 14 PAX mentions existed only in blocks. Most backblasts in this deployment are bot-posted, so structured PAX data was silently missing digest-wide (SlackBackup-rie). | **Resolved** in v3 — `_clean`'s evidence path extracts mentions/links from top-level `text` plus every Block Kit block's `text.text`, deduped in first-appearance order across both sources. |
 | Cross-workspace mention tracking left wholly to the LLM — "where is this PAX mentioned" required a full-digest scan plus ad-hoc identity merging in every prompt | ADR-0001 deliberately deferred all identity merging, including the deterministic subset (same email, same F3 name + real name). | **Resolved** in v3 by the top-level `mentions` index (`docs/adr/0003-mentions-index-deterministic-identity.md`) — deterministic unification with confidence flags; ambiguous collisions flagged, never merged; ts-only locations, everything else derived downstream. |
 | `f3-pugetsound`'s digest job (383 channels/7 workspaces) OOM-killed mid-run (sat-811) — `_gather_digest_data` accumulates every channel's messages **and** every channel file's extracted `content` into one in-memory `channels_meta`/`messages` for the whole job before anything is written to disk | Measured: `channels_meta`'s file content was 55% of a real digest and month-invariant (duplicated into every monthly file); scaled to 383 channels this plausibly accounts for the bulk of the ~2.3 GB RSS observed at the OOM kill. | **Phase 1 resolved** (this change) — `content` moved out of the digest into the `files_out` sidecar (§`files_out` sidecar above), so it's no longer held for the job's full duration nor duplicated per month. Re-run `f3-pugetsound` under `/usr/bin/time -v` to confirm this alone clears the OOM before committing to **Phase 2** (deferred, sat-811 design doc §4): a month-sharded spill-to-disk rewrite of `_gather_digest_data`/`build_monthly_digests` so no phase ever holds more than one channel's messages, plus `--spill-dir`/`--resume` crash durability. |
+| `files_out` sidecar accumulated a permanent, ever-growing record for every ordinary image/video attachment (JPG/PNG/GIF/HEIC/MP4/MOV, ...) with no extracted text and never any prospect of some — the additive merge kept every one forever (sat-4uf) | Thousands of such files in a real archive; `has_content: false` in v4 already told a consumer this, but explaining *why* still required opening the sidecar for `archive_status`, and the record persisted regardless of diagnostic value. | **Resolved** by `slack-llm-digest-v5`/`slack-llm-files-v2` (see `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) — `archive_status` moves into the digest so `has_content: false` is self-explanatory without the sidecar; the sidecar keeps `content_extracted`/`tombstone` unconditionally and `no_blob`/`unsupported_type` only for non-media files, pruning routine-media records from a pre-v5 sidecar on merge rather than just halting their growth. |
 
 ---
 

@@ -386,7 +386,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v4"
+    assert result["schema_version"] == "slack-llm-digest-v5"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
@@ -1755,7 +1755,7 @@ def test_build_digest_emits_top_level_mentions_index(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v4"
+    assert result["schema_version"] == "slack-llm-digest-v5"
     assert isinstance(result["mentions"], dict)
     assert "mentions_index" in result["manifest"]["counting_rules"]
 
@@ -1818,7 +1818,7 @@ def test_build_monthly_digests_stamps_month_on_export_scope(tmp_path):
 
     for month, doc in results.items():
         assert doc["export_scope"]["month"] == month
-        assert doc["schema_version"] == "slack-llm-digest-v4"
+        assert doc["schema_version"] == "slack-llm-digest-v5"
 
 
 def test_build_monthly_digests_recomputes_channel_activity_per_month(tmp_path):
@@ -1861,7 +1861,10 @@ def test_build_monthly_digests_matches_build_digest_totals(tmp_path):
 # --- sat-811 Phase 1: files_out sidecar (schema v4) ---
 
 
-def test_digest_file_view_strips_content_and_derived_fields_adds_has_content():
+def test_digest_file_view_strips_content_and_blob_fields_keeps_archive_status():
+    """archive_status moves INTO the digest (sat-4uf) so has_content: false
+    is self-explanatory without a sidecar lookup - only the extracted text
+    itself and its sidecar-only provenance fields stay sidecar-only."""
     full = {
         "id": "F1", "name": "notes.txt", "content": "hello", "content_sha256": "abc",
         "archive_status": "content_extracted", "blob_captured_at": "2026-01-01T00:00:00Z",
@@ -1869,8 +1872,8 @@ def test_digest_file_view_strips_content_and_derived_fields_adds_has_content():
     view = export_logic._digest_file_view(full)
     assert "content" not in view
     assert "content_sha256" not in view
-    assert "archive_status" not in view
     assert "blob_captured_at" not in view
+    assert view["archive_status"] == "content_extracted"
     assert view["has_content"] is True
     assert view["id"] == "F1"
 
@@ -1904,7 +1907,11 @@ def test_build_digest_channel_files_lose_content_but_gain_has_content(tmp_path):
     image = next(f for f in meta["files"] if f["id"] == "F0BBJTND1KR")
     assert "content" not in canvas
     assert canvas["has_content"] is True
+    assert canvas["archive_status"] == "content_extracted"
     assert image["has_content"] is False
+    # sat-4uf: has_content: false is self-explanatory from the digest alone -
+    # no sidecar lookup needed to learn why (blob never downloaded here).
+    assert image["archive_status"] == "no_blob"
 
 
 def test_load_channel_files_sets_content_sha256_and_archive_status(tmp_path):
@@ -1933,6 +1940,61 @@ def test_load_channel_files_archive_status_tombstone_when_mode_is_tombstone(tmp_
     files = export_logic._load_channel_files(channel_dir)
 
     assert files[0]["archive_status"] == "tombstone"
+
+
+# --- sat-4uf: routine unsupported-media classification and the files_out
+# sidecar inclusion rule (slack-llm-files-v2) ---
+
+
+def test_is_ordinary_unsupported_media_true_for_image_video_audio_mimetypes():
+    assert export_logic._is_ordinary_unsupported_media("image/jpeg", "jpg") is True
+    assert export_logic._is_ordinary_unsupported_media("video/quicktime", "mov") is True
+    assert export_logic._is_ordinary_unsupported_media("audio/mpeg", "mp3") is True
+
+
+def test_is_ordinary_unsupported_media_false_for_pdf_and_unrecognized_mimetypes():
+    assert export_logic._is_ordinary_unsupported_media("application/pdf", "pdf") is False
+    assert export_logic._is_ordinary_unsupported_media("application/octet-stream", "bin") is False
+
+
+def test_is_ordinary_unsupported_media_falls_back_to_filetype_when_mimetype_missing():
+    assert export_logic._is_ordinary_unsupported_media(None, "heic") is True
+    assert export_logic._is_ordinary_unsupported_media("", "mp4") is True
+    assert export_logic._is_ordinary_unsupported_media(None, "pdf") is False
+    assert export_logic._is_ordinary_unsupported_media(None, None) is False
+
+
+def test_sidecar_worth_keeping_true_for_content_extracted_regardless_of_mimetype():
+    entry = {"archive_status": "content_extracted", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_true_for_tombstone_regardless_of_mimetype():
+    entry = {"archive_status": "tombstone", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_false_for_no_blob_ordinary_media():
+    entry = {"archive_status": "no_blob", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is False
+
+
+def test_sidecar_worth_keeping_false_for_unsupported_type_ordinary_media():
+    entry = {"archive_status": "unsupported_type", "mimetype": "video/quicktime", "filetype": "mov"}
+    assert export_logic._sidecar_worth_keeping(entry) is False
+
+
+def test_sidecar_worth_keeping_true_for_no_blob_non_media_mimetype():
+    """A PDF that never downloaded is exceptional - it should have had
+    extractable text - unlike an ordinary image with no blob."""
+    entry = {"archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_true_when_archive_status_missing():
+    """Conservative default for entries with no archive_status set at all
+    (e.g. synthetic/older callers) - unknown is kept, not treated as routine."""
+    assert export_logic._sidecar_worth_keeping({"id": "F1"}) is True
 
 
 def _canvas_update_message(ts: str, editor_text: str, file_id: str) -> dict:
@@ -2077,7 +2139,7 @@ def test_merge_files_out_first_run_stamps_first_seen_at_no_content_changed(tmp_p
     entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
     doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
 
-    assert doc["schema_version"] == "slack-llm-files-v1"
+    assert doc["schema_version"] == "slack-llm-files-v2"
     assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
     assert doc["files"][0]["content_changed_at"] is None
 
@@ -2159,6 +2221,56 @@ def test_merge_files_out_ignores_non_dict_previous_sidecar():
     assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
 
 
+def test_merge_files_out_drops_routine_media_entry_from_this_runs_entries():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "unsupported_type", "mimetype": "image/jpeg", "filetype": "jpg",
+    }]
+
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == []
+
+
+def test_merge_files_out_keeps_non_media_no_blob_entry_from_this_runs_entries():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf",
+    }]
+
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert [f["id"] for f in doc["files"]] == ["F1"]
+
+
+def test_merge_files_out_prunes_routine_media_entry_carried_from_previous_sidecar():
+    """sat-4uf: the sidecar self-cleans on merge - a legacy image/video/audio
+    no_blob/unsupported_type record from before this change drops out the
+    next time the sidecar is written, even though nothing this run touches
+    that file (it's out of this run's --workspace/--channel scope)."""
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "unsupported_type", "mimetype": "image/jpeg", "filetype": "jpg",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out([], previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == []
+
+
+def test_merge_files_out_still_carries_forward_non_media_entry_out_of_scope():
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out([], previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == previous["files"]
+
+
 # --- consistency metrics (sat-ejk.6: deterministic referential-integrity
 # counts over the digest's own channels/messages/user_index) ---
 
@@ -2190,6 +2302,28 @@ def test_compute_consistency_file_reference_and_has_content_split():
     assert result["file_reference_count"] == 3
     assert result["file_has_content_true_count"] == 1
     assert result["file_has_content_false_count"] == 2
+
+
+def test_compute_consistency_file_archive_status_counts():
+    """sat-4uf: has_content's true/false split doesn't say *why* a file has
+    no content - archive_status_counts breaks that out so a consumer can
+    tell routine unsupported media apart from an exceptional failure
+    without re-deriving it from individual file entries."""
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "archive_status": "content_extracted"},
+            {"id": "F2", "has_content": False, "archive_status": "unsupported_type"},
+            {"id": "F3", "has_content": False, "archive_status": "unsupported_type"},
+            {"id": "F4", "has_content": False, "archive_status": "no_blob"},
+            {"id": "F5", "has_content": False, "archive_status": "tombstone"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["file_archive_status_counts"] == {
+        "content_extracted": 1, "unsupported_type": 2, "no_blob": 1, "tombstone": 1,
+    }
 
 
 def test_compute_consistency_file_message_ts_matched_against_digest_messages():
@@ -2440,7 +2574,7 @@ def test_write_monthly_digests_writes_files_out_sidecar_from_spill(tmp_path):
     )
 
     doc = json.loads(files_out_path.read_text())
-    assert doc["schema_version"] == "slack-llm-files-v1"
+    assert doc["schema_version"] == "slack-llm-files-v2"
     entry = next(f for f in doc["files"] if f["id"] == CANVAS_FILE["id"])
     assert entry["modification_history_completeness"] == "partial"
     assert entry["modification_history"][0]["editor_name"] == "Daniel Hüsch"

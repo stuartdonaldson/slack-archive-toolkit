@@ -2,7 +2,7 @@
 
 Canonical home for: upload validation, schema versions, sidecar pairing, timestamps, channel context fields, identity scope, and Canvas/file currency. This is a consumer-facing restatement of the export schemas — it never decides a schema fact. [docs/DESIGN-export.md](../DESIGN-export.md) is the schema authority; if this document and the design doc disagree, the design doc wins and this file needs a fix.
 
-**Schema versions covered:** `slack-llm-digest-v4`, `slack-llm-files-v1`, `slack-user-profiles-v1`.
+**Schema versions covered:** `slack-llm-digest-v5`, `slack-llm-files-v2`, `slack-user-profiles-v1`.
 
 You have been given Slack digest/export data, Slack user profile data, a companion file-content sidecar, and optional regional or cultural context documents for F3 Puget Sound and related regional workspaces.
 
@@ -12,8 +12,8 @@ Ingest and organize the data for later analysis. Do not generate a newsletter, l
 
 The uploaded data may include:
 
-* `slack-llm-digest-v4` files containing channel metadata, messages, threads, links, mentions, activity counts, and lightweight file references
-* a `slack-llm-files-v1` sidecar containing extracted canvas and document content
+* `slack-llm-digest-v5` files containing channel metadata, messages, threads, links, mentions, activity counts, and lightweight file references (each carrying `has_content` and `archive_status`)
+* a `slack-llm-files-v2` sidecar containing extracted canvas and document content, plus records for exceptional extraction failures
 * a `slack-user-profiles-v1` file containing workspace-local user profiles
 * regional, organizational, or cultural reference documents
 
@@ -61,9 +61,9 @@ When `topic` and `purpose` say conflicting things, treat `topic` as the higher-p
 
 ## Digest and file sidecar
 
-Every `slack-llm-digest-v4` file must be used with its companion `slack-llm-files-v1` sidecar when one is provided.
+Use the `slack-llm-files-v2` sidecar alongside its digest whenever one is provided, to read extracted canvas/document text. Unlike earlier versions, a missing sidecar is **not** always a gap — see the asymmetry rule below before flagging one.
 
-The digest contains file metadata under each channel's `files` array. Extracted canvas and document text is stored only in the sidecar.
+The digest contains file metadata under each channel's `files` array, including `has_content` and `archive_status` directly on every file reference. Extracted canvas and document text itself is stored only in the sidecar.
 
 Join a digest file reference to the sidecar using the complete composite key:
 
@@ -73,12 +73,12 @@ Do not join on file ID alone. The same Slack file or canvas may appear in more t
 
 Interpret file fields as follows:
 
-* `has_content: true` — retrieve and use the matching sidecar record's `content`
-* `has_content: false` — no text was ever extractable for this file, not that the sidecar is missing; inspect `archive_status` for why
-* `content_sha256` — identifies the extracted-content version when present
-* `archive_status` — explains why content is or is not available
-* `modification_history` — records observed edit notices, but does not establish exactly what changed or who originally authored the document
-* `modification_history_completeness` — consider this before describing an edit history as complete
+* `has_content: true` (digest) — retrieve and use the matching sidecar record's `content`
+* `has_content: false` (digest) — no text was ever extractable for this file; read `archive_status` on the **digest file reference itself** for why — no sidecar lookup is needed just to answer that question
+* `archive_status` (digest, and mirrored on the sidecar record when one exists) — explains why content is or is not available
+* `content_sha256` (sidecar only) — identifies the extracted-content version when present
+* `modification_history` (sidecar only) — records observed edit notices, but does not establish exactly what changed or who originally authored the document
+* `modification_history_completeness` (sidecar only) — consider this before describing an edit history as complete
 
 `archive_status` is exactly one of:
 
@@ -89,14 +89,15 @@ Interpret file fields as follows:
 
 To connect a file to its source message, match the file's `message_ts` to the digest message's `ts` within the same workspace and channel — both are Slack's native `seconds.microseconds` timestamp string; no format conversion is needed.
 
-### Sidecar asymmetry — cumulative, not run-matched
+### Sidecar asymmetry — cumulative, not run-matched, and no longer a full mirror
 
-The `slack-llm-files-v1` sidecar is **cumulative across runs, not window-relative** to the accompanying digest. Each run merges into whatever already sits at the sidecar's path; entries from channels outside the current digest's window are deliberately retained rather than pruned. This produces an asymmetry in what counts as a gap:
+The `slack-llm-files-v2` sidecar is **cumulative across runs, not window-relative** to the accompanying digest. Each run merges into whatever already sits at the sidecar's path; entries from channels outside the current digest's window are deliberately retained rather than pruned. Since v2, the sidecar also **deliberately omits routine unsupported-media records** — a `no_blob`/`unsupported_type` file reference whose type is ordinary image/video/audio (JPG/PNG/GIF/HEIC/MP4/MOV, and similar) never gets a sidecar record at all, because there is nothing exceptional to record. This produces a precise, not loose, rule for what counts as a gap:
 
-* A digest file reference with `has_content: true` and **no matching sidecar record** is a gap. Report it explicitly.
+* A digest file reference with `has_content: true` and **no matching sidecar record** is a gap. Report it explicitly. This is the *only* case that's a gap.
+* A digest file reference with `has_content: false` and **no matching sidecar record** is the expected steady state for routine unsupported media — do not report it as a gap. It may still have a sidecar record when `archive_status` is `tombstone`, or `no_blob`/`unsupported_type` on a file that isn't ordinary image/video/audio (e.g. a PDF whose blob never downloaded) — treat that record, when present, as a diagnostic note, not something required for every `has_content: false` file.
 * A sidecar record with **no matching current digest reference** is the expected steady state, not a problem. Report it as a count when useful, not as a warning.
 
-Do not describe `has_content: false` as meaning that no content ever existed. It means text extraction was never able to capture content for this file — check `archive_status` for why.
+Do not describe `has_content: false` as meaning that no content ever existed. It means text extraction was never able to capture content for this file — the digest's own `archive_status` says why.
 
 ## Identity rules
 
@@ -199,6 +200,7 @@ Prepare to answer questions about:
 
 * `channel_id_duplicate_count` — `channel_id` values repeated within one workspace. Should be `0`.
 * `file_reference_count`, `file_has_content_true_count`, `file_has_content_false_count` — the digest's own `channels[].files[]` tally, split by `has_content`.
+* `file_archive_status_counts` — that same tally broken down by `archive_status` value (`content_extracted`, `unsupported_type`, `no_blob`, `tombstone`, ...). Use this instead of re-deriving the routine-vs-exceptional split from individual file entries.
 * `file_message_ts_present_count`, `file_message_ts_matched_count`, `file_message_ts_unmatched_count` — of the files carrying a `message_ts`, how many resolve to a real message `ts` (root or reply) in the same workspace/channel within *this document*. On a `--split-by-month` digest a nonzero unmatched count is expected — a channel's files are attached to every month it appears in, not just the month containing the file's own `message_ts` — and is only a meaningful signal on the unsplit (merged) digest.
 * `mention_unresolved_count` — mentioned user ids with no matching profile in `user_index` for that workspace (a deleted or external account, not necessarily an error).
 * `in_scope_false_orphan_count` — `in_scope: false` parents with no replies. Should always be `0`; a nonzero value is a genuine referential-integrity bug in the export itself, not something to reason about.
@@ -226,8 +228,8 @@ Confirm:
 * digest file-reference count
 * matching sidecar record count
 * records with extracted content
-* records without extracted content
-* unmatched digest references (gaps — see sidecar asymmetry above)
+* records without extracted content, broken down by `archive_status` (`file_archive_status_counts`)
+* unmatched digest references where `has_content: true` (gaps — see sidecar asymmetry above)
 * unmatched sidecar records (expected steady state — report as a count, not a warning)
 * obvious schema, timestamp, or pairing problems
 * the consistency and drift findings above

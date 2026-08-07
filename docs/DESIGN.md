@@ -59,9 +59,10 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
   ~90-day retention. `-full` bypasses the filter entirely.
 - **Export pipeline** (`export_logic.py`) — read-only products built from the archive + catalog,
   detailed in `docs/DESIGN-export.md`: bounded per-channel-month JSON, a cross-workspace digest
-  (`slack-llm-digest-v4`, with per-channel context and file/Canvas metadata — see §Files &
+  (`slack-llm-digest-v5`, with per-channel context and file/Canvas metadata — see §Files &
   Canvases in `docs/DESIGN-export.md`), a companion **`files_out` sidecar** carrying the extracted
-  file text the digest itself no longer embeds (v4, cumulative across runs — see ADR-0004), a full
+  file text the digest itself no longer embeds (v2, cumulative across runs, slimmed to omit
+  routine unsupported-media records — see ADR-0004/ADR-0006), a full
   user-profile roster, and operator-owned report jobs (`--jobs`). F3-specific leadership tagging is
   delegated to a pluggable handler (`handlers/`), keeping the engine general-purpose.
 - **Untracked-channel digest** (`channel_digest_logic.py`) — an on-demand tool that archives
