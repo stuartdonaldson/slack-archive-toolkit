@@ -171,6 +171,7 @@ Run `./slackbackup help` for the full command list.
 | [DESIGN.md](docs/DESIGN.md) | Per-channel backup architecture, modules, key decisions |
 | [DESIGN-export.md](docs/DESIGN-export.md) | Export pipeline: monthly per-channel JSON, cross-workspace LLM digest, user-profile roster, report jobs, pluggable leadership handlers |
 | [DESIGN-files.md](docs/DESIGN-files.md) | Channel catalog + untracked-channel digest (implemented) + canvas/file harvesting (designed, not yet ported to Python) |
+| [report-queries.md](docs/report-queries.md) | Source-grounded guidance and table formats for regional leadership, AO/site, and authority reports |
 | [references/slackdump-cli-notes.md](docs/references/slackdump-cli-notes.md) | slackdump CLI behavior, costs, and gotchas learned the hard way — check before re-deriving |
 | [ADRs](docs/adr/) | Architecture decision records |
 

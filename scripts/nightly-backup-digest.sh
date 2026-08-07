@@ -27,15 +27,15 @@ export PYTHONUNBUFFERED=1
 mkdir -p "$ARCHIVE_ROOT"
 mkdir -p "$HOME/slack-exports"
 
-# Prompt/context templates for the LLM newsletter workflow (F3 culture notes,
-# ingestion/newsletter/FNG prompts) are canonical in docs/ and git-tracked
-# there; refresh the ~/slack-exports working copies from them each run so
-# manual edits to the operator's copies don't silently diverge from git.
+# Prompt/context templates for the LLM reporting workflow (F3 culture notes,
+# ingestion/newsletter/FNG/report-query prompts) are canonical in docs/ and
+# git-tracked there; refresh the ~/slack-exports working copies from them each
+# run so manual edits to the operator's copies don't silently diverge from git.
 cp "$REPO_ROOT/docs/f3-culture.md" \
    "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
    "$REPO_ROOT/docs/newsletter-prompt.md" \
    "$REPO_ROOT/docs/slack-ingestion.md" \
-   "$REPO_ROOT/docs/slt-report.md" \
+    "$REPO_ROOT/docs/report-queries.md" \
    "$HOME/slack-exports/"
 
 {
