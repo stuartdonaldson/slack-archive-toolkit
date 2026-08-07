@@ -1,3 +1,5 @@
+> **Transitional.** Canonical home: split across [`docs/llm-context/augmentations/f3-nation-operations.md`](llm-context/augmentations/f3-nation-operations.md) (role distinctions, operations, diagnostic guidance) and [`docs/llm-context/augmentations/f3-nation-admins.md`](llm-context/augmentations/f3-nation-admins.md) (admin roster). This file remains complete and in active use by the current nightly workflow; do not edit this copy — edit the canonical files instead. See [`docs/llm-context/MIGRATION-PLAN.md`](llm-context/MIGRATION-PLAN.md).
+
 # F3 IT Infrastructure Augmentation
 
 _Source date: manual extraction as of 2026-06-30_

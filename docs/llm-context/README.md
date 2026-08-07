@@ -1,8 +1,8 @@
-# Draft LLM context pack
+# LLM context pack
 
-This folder is a proposed, Markdown-first context pack for a shared ChatGPT session or ChatGPT Project. It prepares an LLM to safely answer questions about Slack-derived F3 information without treating profile signals or manually collected facts as current proof.
+This folder is a Markdown-first context pack for a shared ChatGPT session or ChatGPT Project. It prepares an LLM to safely answer questions about Slack-derived F3 information without treating profile signals or manually collected facts as current proof.
 
-See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. At this stage, the documents listed below are planned; the existing project documents remain the active sources.
+See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources to curate into the completed pack](#sources-to-curate-into-the-completed-pack). **The pack is not yet validated or integrated** — the legacy documents remain the active sources for the nightly workflow and any deployed session/Project until Phase 3 (validation) and Phase 4 (integration) complete. Do not redirect automation or delete a legacy document based on this folder alone.
 
 ## Why Markdown for manual supplements
 
@@ -85,13 +85,20 @@ Add this instruction to the shared ChatGPT Project after the canonical files exi
 
 ## Sources to curate into the completed pack
 
-| Planned context file | Existing source material |
+Copied in Phase 2. Each legacy source below carries a transitional header naming its canonical replacement; the legacy file itself is unchanged otherwise and remains in active use until Phase 4 integration.
+
+| Context file | Legacy source material |
 | --- | --- |
 | `ingestion-contract.md` | `docs/slack-ingestion.md` |
 | `query-policy.md` | `docs/report-queries.md` and the evidence/confidence sections of `docs/slack-ingestion.md` |
-| `f3-domain-context.md` | `docs/f3-culture.md` |
-| `augmentations/f3-nation-operations-2026-06-30.md` | The role distinctions, operations, and diagnostic guidance in `docs/f3-it-infrastructure-augmentation-2026-06-30.md` |
-| `augmentations/f3-nation-admins-2026-06-30.md` | The dated roster and limitations from the infrastructure companion Markdown/JSON files |
+| `f3-domain-context.md` | `docs/f3-culture.md` (culture-framing claims de-attributed from a specific person; sourced quotes moved to a `Source notes` section) |
+| `prompts/newsletter.md` | `docs/newsletter-prompt.md` |
+| `prompts/fng-getting-started.md` | `docs/fng-getting-started-prompt.md` |
+| `augmentations/f3-nation-operations.md` | The role distinctions, operations, and diagnostic guidance in `docs/f3-it-infrastructure-augmentation-2026-06-30.md` |
+| `augmentations/f3-nation-admins.md` | The dated roster and limitations from `docs/f3-it-infrastructure-augmentation-2026-06-30.md` and its companion JSON |
+| `prompts/initial-intake.md`, `prompts/regional-slt.md`, `prompts/ao-directory.md`, `prompts/authority-routing.md` | New, distilled from this file's §Reusable prompts below |
+| `project-instructions.md`, `session-preamble.md` | New |
+| `validation-set.md` | New |
 
 ## Maintenance rules
 

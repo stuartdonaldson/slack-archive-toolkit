@@ -1,3 +1,5 @@
+> **Transitional.** Canonical home: [`docs/llm-context/query-policy.md`](llm-context/query-policy.md). This file remains complete and in active use by the current nightly workflow; do not edit this copy — edit the canonical file instead. See [`docs/llm-context/MIGRATION-PLAN.md`](llm-context/MIGRATION-PLAN.md).
+
 # Source-grounded report queries
 
 Use this guide when answering questions from uploaded Slack digest exports, profile rosters, and file-content sidecars. It defines where to look for common F3 leadership and AO/site questions, how to resolve conflicting signals, and how to present results.

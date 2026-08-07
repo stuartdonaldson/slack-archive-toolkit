@@ -1,3 +1,5 @@
+> **Transitional.** Canonical home: [`docs/llm-context/ingestion-contract.md`](llm-context/ingestion-contract.md). This file remains complete and in active use by the current nightly workflow; do not edit this copy — edit the canonical file instead. See [`docs/llm-context/MIGRATION-PLAN.md`](llm-context/MIGRATION-PLAN.md).
+
 You have been given Slack digest/export data, Slack user profile data, a companion file-content sidecar, and optional regional or cultural context documents for F3 Puget Sound and related regional workspaces.
 
 Ingest and organize the data for later analysis. Do not generate a newsletter, leadership report, event digest, or other substantive analysis until asked.

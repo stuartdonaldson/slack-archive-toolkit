@@ -1,4 +1,8 @@
-> **Transitional.** Canonical home: [`docs/llm-context/prompts/fng-getting-started.md`](llm-context/prompts/fng-getting-started.md). This file remains complete and in active use by the current nightly workflow; do not edit this copy — edit the canonical file instead. See [`docs/llm-context/MIGRATION-PLAN.md`](llm-context/MIGRATION-PLAN.md).
+# Prompt: F3 Slack start-here guide for a new PAX
+
+Canonical home for the FNG-getting-started prompt. Copied from `docs/fng-getting-started-prompt.md`; that file is transitional — see its header.
+
+---
 
 Generate an up-to-date **F3 Slack: Start Here / FAQ** for a new guy using the attached latest Slack digest/export.
 
@@ -54,7 +58,7 @@ Cover, briefly:
    * Explain that F3 Puget Sound Slack is useful for broader regional announcements, cross-region events, service opportunities, CSAUPs, and connections outside the home AO.
    * Include a one-line reminder to update the profile there too.
    * Do not overstate formal governance or parent/child structure unless the digest explicitly supports that.
-6. Keep it simple: start with the AO channel, the local region’s main/all channel, and F3 Puget Sound. Add more channels only when useful.
+6. Keep it simple: start with the AO channel, the local region's main/all channel, and F3 Puget Sound. Add more channels only when useful.
 
 # Slack FAQ
 

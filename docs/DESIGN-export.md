@@ -12,6 +12,10 @@ modifies the archive or makes a Slack API call; all three are implemented in
 | `export digest` | §Digest Export | Many workspaces, trailing 180 days by default (or a different N), one merged chronological document |
 | `export users` | §User Profiles Export | Full per-workspace user roster, not just digest posters |
 
+A digest run driven by a report job (`--jobs`) can additionally emit two companion documents
+alongside its digest: a user roster (`users_out`) and the **`files_out` sidecar** that, since
+schema v4, carries the extracted file/Canvas text the digest itself no longer embeds.
+
 ---
 
 ## Monthly Export (`export monthly`)
@@ -19,9 +23,9 @@ modifies the archive or makes a Slack API call; all three are implemented in
 ### Solution Strategy
 
 The backup system already commits one `slackdump.sqlite` per channel at
-`<archive-root>/<workspace>/<channel-slug>/slackdump.sqlite` (see `docs/DESIGN.md` §State
-Management). That database is the single source of truth — the exporter is a **read-only
-consumer** of it and writes a separate output tree. It never calls the Slack API.
+`<archive-root>/<workspace>/<channel-slug>/slackdump.sqlite` (see `docs/DESIGN.md` §Building
+Block View, Level 2 — Local storage). That database is the single source of truth — the exporter
+is a **read-only consumer** of it and writes a separate output tree. It never calls the Slack API.
 
 slackdump's own `convert` command already renders an archive to the **Slack Export** format —
 a documented, version-stable structure of per-day JSON files (`YYYY-MM-DD.json`) carrying thread
@@ -340,6 +344,11 @@ itself moves to a companion **`files_out`** sidecar document (`schema_version:
 "slack-llm-files-v1"`), written per job alongside the digest (see §Report jobs). Join key is
 `(workspace, channel_id, id)`.
 
+The sidecar is written **only on the `--jobs` path**, and only for a job that sets `files_out` —
+there is no `--files-out` command-line flag. A plain `export digest` run still extracts file
+content (the digest's `has_content` depends on it) but simply discards it when the process exits.
+A job that wants the text must declare `files_out`.
+
 ```jsonc
 {
   "schema_version": "slack-llm-files-v1",
@@ -491,7 +500,7 @@ decision). v3 makes three changes:
   *PAX*: line lives in a section block while `text` is a narrative-only fallback) no longer lose
   their PAX list (SlackBackup-rie).
 
-v4 (sat-811) makes one further change: each channel file's extracted `content` moves out of this
+v4 (sat-811, `docs/adr/0004-digest-v4-files-sidecar.md`) makes one further change: each channel file's extracted `content` moves out of this
 document into a companion `files_out` sidecar, replaced by `has_content: true|false` — see
 §`files_out` sidecar above for why and its schema. `tabbed_canvas_updated` system messages
 (Slack's Canvas-edit notices) are also stripped from `messages[]` in v4, fixing a real counting
@@ -753,12 +762,14 @@ a second pass over every channel's archive. `export._write_files_out` then reads
 `files_out` document already exists at that path (if any), merges via `merge_files_out`, and
 rewrites it - a corrupt or unreadable previous sidecar is treated as absent rather than aborting
 the job. All job-file parsing lives in Python, not bash/jq. The nightly script
-(`scripts/nightly-backup-digest.sh`) forwards `--jobs "$REPO_ROOT/jobs/*.json"` after its blanket
-digest/users export.
+(`scripts/nightly-backup-digest.sh`) runs **only** the job path — `export digest --archive-root
+"$ARCHIVE_ROOT" --jobs "$REPO_ROOT/jobs/*.json"`. The blanket (non-`--jobs`) digest and `export
+users` runs it used to do first were dropped: every real recipient is now described by a job file,
+and the blanket run duplicated their work at full cost. Both remain available as manual commands.
 
 ### Monthly digest splitting (`split_by_month` / `--split-by-month`)
 
-`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v3` schema as
+`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v4` schema as
 `build_digest`, but as a `{month: document}` mapping instead of one merged document — one file per
 calendar month (`export_scope.month` is stamped on each). It shares `build_digest`'s first phase
 (`_gather_digest_data`: converts every matched channel's archive once, range-bounds, and

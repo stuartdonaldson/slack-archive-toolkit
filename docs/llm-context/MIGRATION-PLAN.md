@@ -2,7 +2,7 @@
 
 ## Status
 
-**Planning only.** This plan adopts the 2026-08-06 review decisions but does not create canonical context files, alter legacy documents, redirect automation, or retire files. Those actions are tracked by the epic and child issues in [Migration tracking](#migration-tracking).
+**Phase 2 complete.** This plan adopts the 2026-08-06 review decisions. The canonical context files now exist under `docs/llm-context/` ([sat-ejk.2](#migration-tracking)), copied from the legacy sources with transitional headers added; the pack is not yet validated ([sat-ejk.3](#migration-tracking)) or integrated ([sat-ejk.4](#migration-tracking)), and no automation redirect or legacy retirement has occurred. Those actions are tracked by the epic and child issues in [Migration tracking](#migration-tracking).
 
 ## Decision
 

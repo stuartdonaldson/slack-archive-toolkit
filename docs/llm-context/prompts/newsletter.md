@@ -1,4 +1,8 @@
-> **Transitional.** Canonical home: [`docs/llm-context/prompts/newsletter.md`](llm-context/prompts/newsletter.md). This file remains complete and in active use by the current nightly workflow; do not edit this copy — edit the canonical file instead. See [`docs/llm-context/MIGRATION-PLAN.md`](llm-context/MIGRATION-PLAN.md).
+# Prompt: F3 Puget Sound regional newsletter
+
+Canonical home for the newsletter-generation prompt. Copied from `docs/newsletter-prompt.md`; that file is transitional — see its header.
+
+---
 
 Generate an F3 Puget Sound regional newsletter from the Slack digest export.
 
@@ -47,7 +51,7 @@ Output a concise Markdown newsletter.
 
 * Start with `## F3 Puget Sound`.
 * Then create a separate `## F3 [Region]` section for every regional workspace that has meaningful newsletter-worthy content.
-* Do not collapse Redmond, Tundra, or other regions into “Other regional notes” when they have enough content for their own section.
+* Do not collapse Redmond, Tundra, or other regions into "Other regional notes" when they have enough content for their own section.
 * A region deserves its own section if it has leadership data, event channels, cross-region events, major announcements, or multiple newsletter-worthy posts.
 * Order regions by relevance to Puget Sound PAX, not alphabetically.
 * Use an `## Other regional notes` section only for small one-off items that do not justify a full region section.
@@ -56,14 +60,14 @@ Output a concise Markdown newsletter.
 
 * Infer event title, date, time, location, signup/contact link, and relevant channel from the Slack post text when available.
 * Do not require structured event fields; they may not exist.
-* If an event’s date, time, location, or contact is not clear, say what is missing rather than guessing.
+* If an event's date, time, location, or contact is not clear, say what is missing rather than guessing.
 * For every event, include date, time, location, and signup/contact link when available.
 * Convert timestamps to Pacific time if needed for readable newsletter copy.
-* Be careful with relative dates like “tomorrow,” “next week,” or “this Friday.” Resolve them using the post date when possible. If not possible, leave the detail uncertain.
+* Be careful with relative dates like "tomorrow," "next week," or "this Friday." Resolve them using the post date when possible. If not possible, leave the detail uncertain.
 * For cross-region events, identify the canonical/original event post when possible.
 * If other regions reference the same event, merge those references into one event item and cite the canonical source first.
-* Include the event under the host/canonical region. Also mention it in a short “Cross-region events to know” section if it is broadly relevant to Puget Sound PAX.
-* Do not lose event details from the canonical source just because another region’s repost or reference is less complete.
+* Include the event under the host/canonical region. Also mention it in a short "Cross-region events to know" section if it is broadly relevant to Puget Sound PAX.
+* Do not lose event details from the canonical source just because another region's repost or reference is less complete.
 * When merging multiple posts about the same event, preserve meaningful event variants such as ruck option, 2.0/family option, pre-ruck/pre-run, coffeeteria, alternate start time, or separate track. Include these as brief notes under the event rather than treating them as duplicates.
 
 For each region, provide a leadership team snapshot:
@@ -74,7 +78,7 @@ For each region, include a **Leadership Team Snapshot** with separate tables for
 
 * **Current Regional leadership**
 
-Use this table format:  List positions that are identified in order of Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, IT Q, Comz Q, F3 Nation Admin, ...
+Use this table format: List positions that are identified in order of Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, IT Q, Comz Q, F3 Nation Admin, ...
 
 | Position | F3 Name | Source / confidence |
 | -------- | ------- | ------------------- |

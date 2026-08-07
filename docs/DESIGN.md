@@ -6,7 +6,9 @@ This is a local-only Python CLI (`./slackbackup`, package `src/slackbackup/`). T
 server, no scheduled cloud job, and no GitHub Actions workflow — those were an earlier design
 (see `git log` before the Python rewrite) and have been fully superseded. The only scheduling
 that exists is operator-controlled: an optional nightly Windows Task Scheduler job
-(`scripts/nightly-backup-digest.sh`) that just invokes the same CLI a human would type.
+(`scripts/nightly-backup-digest.sh`) that just invokes the same CLI a human would type — auth
+keep-alive, auth pre-flight, one workspace's channel re-registration scan, `backup run`, then the
+report-job digests (see `docs/OPERATIONS.md` §Nightly Backup for the exact sequence).
 
 **This app never talks to the Slack API directly.** Confirmed by inspection — there is no
 `requests`/`urllib`/`httpx` import anywhere in `src/slackbackup/`, and every Slack-facing
@@ -35,13 +37,20 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
   (`register_matching`), filtering out private/archived/`shuttered*`-named channels.
 - **Catalog** (`catalog_logic.py`) — a persistent, refreshable cache over `slackdump list
   channels`, two-tier (cheap member-only vs. expensive full), storing both Slack-mirrored fields
-  (description, creator, created, is_private, is_archived) and two fields this app derives and
-  owns outright: `registered_at` (when *we* started tracking a channel) and `last_posted` (the
-  real last-message timestamp, only ever set once a backup actually finds message data).
+  (description — topic-else-purpose — plus raw `topic`/`purpose`, creator, created, is_private,
+  is_archived) and fields this app derives and owns outright: `registered_at` (when *we* started
+  tracking a channel), `last_posted` (the real last-message timestamp, only ever set once a backup
+  actually finds message data), and `last_checked`/`last_action` (the cadence filter's own
+  bookkeeping).
 - **Backup orchestration** (`backup_logic.py`) — decides `archive` vs. `resume` per channel from
   *local* state (does a non-empty local archive already exist), auto-heals a channel stuck on an
   unresumable empty archive (wipe + fresh `archive`, never `archive`-over-existing per the
-  documented footgun above), and processes a multi-channel run most-recently-active-first. A
+  documented footgun above), and processes a multi-channel run most-recently-active-first *within*
+  each workspace but **interleaved across** workspaces (`_interleave_by_workspace`), because
+  Slack's rate limit is per-workspace — spreading calls lets one workspace's bucket refill while
+  another is being worked. A workspace whose catalog warm-up fails (expired session) is dropped
+  from the run rather than aborting it. An optional `--workspace`/`--channel` comma-separated glob
+  selector pair narrows a run to a subset of `channels.json` before any of this. A
   **tiered cadence filter** (`should_check_tonight`, table `BACKUP_CADENCE_TIERS`) then skips
   dormant/empty channels on non-due nights: cadence is keyed off `last_posted` age (active nightly,
   older tiers every 2–10 days), staggered by a stable hash of the channel id so a tier never all
@@ -50,10 +59,11 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
   ~90-day retention. `-full` bypasses the filter entirely.
 - **Export pipeline** (`export_logic.py`) — read-only products built from the archive + catalog,
   detailed in `docs/DESIGN-export.md`: bounded per-channel-month JSON, a cross-workspace digest
-  (with per-channel context and file/Canvas metadata plus extracted content pulled in — see
-  §Files & Canvases in `docs/DESIGN-export.md`), a full user-profile
-  roster, and operator-owned report jobs (`--jobs`). F3-specific leadership tagging is delegated
-  to a pluggable handler (`handlers/`), keeping the engine general-purpose.
+  (`slack-llm-digest-v4`, with per-channel context and file/Canvas metadata — see §Files &
+  Canvases in `docs/DESIGN-export.md`), a companion **`files_out` sidecar** carrying the extracted
+  file text the digest itself no longer embeds (v4, cumulative across runs — see ADR-0004), a full
+  user-profile roster, and operator-owned report jobs (`--jobs`). F3-specific leadership tagging is
+  delegated to a pluggable handler (`handlers/`), keeping the engine general-purpose.
 - **Untracked-channel digest** (`channel_digest_logic.py`) — an on-demand tool that archives
   channels by glob and writes a merge-aware JSON digest of surviving messages/files/orphaned
   Canvases, for content outside `channels.json` — see `docs/DESIGN-files.md`. Not in the nightly
@@ -94,7 +104,7 @@ flowchart LR
         CHJSON["channels.json\n(repo root — tracked-channel list)"]
         CACHE["~/.cache/slackbackup/\n&lt;workspace&gt;.catalog.json"]
         ARCH["~/slack-backups/&lt;workspace&gt;/&lt;channel&gt;/\nslackdump.sqlite + __uploads/"]
-        OUT["~/slack-exports/*.json\nsearch-results.html"]
+        OUT["~/slack-exports/*.json\n(digest · files_out sidecar · user roster)\nsearch-results.html"]
     end
 
     API <-->|HTTPS, browser session cookie| SD
@@ -140,8 +150,8 @@ every other `slackdump.*` function).
 | `workspace_logic.py` | Registers a workspace session: looks up its `xoxc-` token in `~/.slackdump-tokens.json`, combines with a freshly-pasted `xoxd-` cookie, hands both to `slackdump workspace import`. | Yes |
 | `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob- or comma-list-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked. | No (via `catalog_logic`) |
 | `catalog_logic.py` | Owns the only call site for `slackdump.list_channels()`. Two-tier cache (fast member-only / expensive full) persisted to `~/.cache/slackbackup/<workspace>.catalog.json`. Also owns `registered_at`/`last_posted`/`effective_recency` — fields with no Slack-API source at all, purely this app's own bookkeeping. | Yes |
-| `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` after a successful backup that found data; orders a multi-channel run by `effective_recency`; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; timestamped logging + run summary. | Yes |
-| `export_logic.py` | Read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster, and report-job (`--jobs`) loading/path-templating. General-purpose: all F3-specific leadership logic is delegated to a pluggable handler (`handlers/`), not inline. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. | Yes (`convert_export` only) |
+| `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` and writes the `.last_backup` seal stamp after a successful backup; optional `--workspace`/`--channel` subset selectors; orders a multi-channel run by `effective_recency` within a workspace and interleaves across workspaces (`_interleave_by_workspace`) to spread per-workspace rate-limit pressure; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; `sync_catalog_from_local` (CLI `backup sync-catalog`) backfills `last_posted`/`registered_at` from local archives only, no API calls, for use after an interrupted run; timestamped logging + per-workspace progress + run summary. | Yes |
+| `export_logic.py` | Read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster, and report-job (`--jobs`) loading/path-templating. General-purpose: all F3-specific leadership logic is delegated to a pluggable handler (`handlers/`), not inline. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. Also owns the `files_out` sidecar's build/merge (`merge_files_out`), which keeps extracted file text out of the digest document itself. | Yes (`convert_export` only) |
 | `handlers/` (`__init__.py`, `f3.py`) | Region/workspace-specific digest processing pulled out of `export_logic.py`. `f3.py` holds every F3 title/role regex + leadership rollup behind a two-function protocol (`annotate_profile`, `build_leadership`); `__init__.py` is the registry (`get`/`NAMES`). Selected via `export digest --leadership-handler` or a job's `leadership_handler` field — see `docs/DESIGN-export.md`. | No |
 | `channel_digest_logic.py` | On-demand `channel-digest run`: archives channels matching an fnmatch glob (e.g. `shuttered-*`, untracked) and writes/merges a schema-versioned (`slack-channel-digest-v2`) JSON of surviving messages/files/orphaned Canvases — for recovering content outside `channels.json`. Not in the nightly cadence — see `docs/DESIGN-files.md`. | Yes (`archive` + `convert_export`) |
 | `search_logic.py` | Cross-workspace live message search → one HTML report. The only capability that makes a real API call on every invocation, no caching. | Yes |
@@ -155,9 +165,9 @@ every other `slackdump.*` function).
 |----------|-------|----------|-------------|
 | `~/.slackdump-tokens.json` | Operator (manual) | `{workspace: xoxc-token}` — gitignored, lives outside the repo | No — re-acquiring a token is a manual browser step |
 | `channels.json` (repo root) | `channel_logic.py` | `[{id, name, workspace}, ...]` — the tracked-channel list, intentionally minimal | No — this *is* the configuration |
-| `~/.cache/slackbackup/<workspace>.catalog.json` | `catalog_logic.py` | Per-channel: member/name/description/is_private/is_archived/creator/created (Slack-mirrored) + registered_at/last_posted/last_checked/last_action (this app's own) | **Yes** — deleting it just forces a rebuild via `list channels` on next use; `registered_at`/`last_posted`/`last_checked` history is lost (cadence resets to "check everything once"), not catastrophic |
+| `~/.cache/slackbackup/<workspace>.catalog.json` | `catalog_logic.py` | Per-channel: member/name/description/topic/purpose/is_private/is_archived/creator/created (Slack-mirrored; `description` is topic-else-purpose, `topic`/`purpose` are also kept raw) + registered_at/last_posted/last_checked/last_action (this app's own) | **Yes** — deleting it just forces a rebuild via `list channels` on next use; `registered_at`/`last_posted`/`last_checked` history is lost (cadence resets to "check everything once"), not catastrophic |
 | `~/slack-backups/<workspace>/<channel>/slackdump.sqlite` (+`__uploads/`) | `slackdump` binary, orchestrated by `backup_logic.py` | The durable source of truth — full message history + downloaded file blobs | **No** — this is the actual backup; nothing else replaces it |
-| `~/slack-exports/*.json`, `search-results.html` | `export_logic.py` / `search_logic.py` | Fully derived, regenerable any time from the archive + catalog | Yes — pure output, never read back as input |
+| `~/slack-exports/*.json`, `search-results.html` | `export_logic.py` / `search_logic.py` | Digests, the `files_out` sidecar, user rosters, monthly exports, search reports — all derived from the archive + catalog | Mostly — the digest/roster/search outputs are pure output. The **`files_out` sidecar is the one exception**: each run merges into the existing document and carries forward files whose source has since aged out of Slack's retention, so deleting it loses history the archive can no longer reproduce (see `docs/DESIGN-export.md` §`files_out` sidecar) |
 
 ---
 
@@ -176,7 +186,9 @@ every other `slackdump.*` function).
 | Document | Covers |
 |----------|--------|
 | `docs/CONTEXT.md` | Purpose, capabilities, use cases, non-goals |
-| `docs/DESIGN-export.md` | `export monthly`/`export digest`/`export users` — schemas, sealing, leadership inference, file content extraction |
+| `docs/DESIGN-export.md` | `export monthly`/`export digest`/`export users` — schemas, sealing, leadership inference, file content extraction, the `files_out` sidecar, report jobs |
+| `docs/OPERATIONS.md` | Auth/session lifecycle, the nightly job's exact step sequence, cadence and catalog recovery |
+| `docs/adr/` | Digest schema decisions — v2 additive evidence (0001), v3 condensation (0002), deterministic mentions identity (0003), v4 files sidecar (0004) |
 | `docs/DESIGN-files.md` | Channel catalog (implemented) + Canvas/file harvesting (designed, not yet ported) |
 | `docs/references/slackdump-cli-notes.md` | slackdump CLI behavior/cost/gotchas confirmed empirically — read before re-deriving anything about how slackdump itself behaves |
 | slackdump | https://github.com/rusq/slackdump — CLI flags, auth, output formats |

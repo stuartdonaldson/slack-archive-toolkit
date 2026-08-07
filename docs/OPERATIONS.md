@@ -125,11 +125,46 @@ window (nightly is comfortably inside the observed ~2–3 week expiry).
 ## Nightly Backup
 
 `scripts/nightly-backup-digest.sh` is invoked by a Windows Scheduled Task
-(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am. It runs the
-headless auth keep-alive (§4), then the auth pre-flight (§2), then `backup run`, then the
-digest / users / job-digest exports, appending everything to `~/slack-backups/nightly.log`.
-It deliberately does **not** `set -e`: a single workspace or channel failure — or the
-keep-alive itself — must not stop the rest of the run.
+(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am,
+appending everything to `~/slack-backups/nightly.log`. In order, each run:
+
+| # | Step | Notes |
+|---|------|-------|
+| 0 | Copy the LLM prompt/context docs (`f3-culture.md`, `fng-getting-started-prompt.md`, `newsletter-prompt.md`, `slack-ingestion.md`, `report-queries.md`) from `docs/` into `~/slack-exports/` | `docs/` is canonical and git-tracked; this stops the operator's working copies from silently diverging. Local edits made under `~/slack-exports/` **are overwritten every night** — edit the copy in `docs/` and commit it |
+| 1 | `scripts/auth-refresh/keepalive.sh` — headless credential keep-alive (§4) | Non-fatal; a hard logout still needs interactive `npm run refresh` |
+| 2 | `scripts/preflight-auth.sh channels.json` — stale-session banner (§2) | Informational, always exits 0 |
+| 3 | `./slackbackup channel register <one workspace> '*'` — pick up newly-created public channels | **One workspace per night**, rotating — see below |
+| 4 | `./slackbackup backup run channels.json ~/slack-backups` | Subject to the tiered cadence filter, below |
+| 5 | `./slackbackup export digest --jobs jobs/*.json` — one digest (plus optional user roster and `files_out` sidecar) per report job | Job files are gitignored; see `docs/DESIGN-export.md` §Report jobs |
+
+There is deliberately **no blanket `export digest` / `export users` step** any more: every real
+recipient is described by a job file in `jobs/`, and the blanket run duplicated that work at full
+cost. Both remain available as manual commands when needed.
+
+The script deliberately does **not** `set -e`: a single workspace or channel failure — or the
+keep-alive itself — must not stop the rest of the run. Each step's exit code is echoed into the
+log (`----- <step> exited N -----`) rather than acted on.
+
+### Nightly channel registration (one workspace per night)
+
+Step 3 exists because a newly-created public channel is otherwise invisible to the backup until a
+human notices and registers it by hand (the motivating case: `disc-it` went un-backed-up for weeks
+in `f3pugetsound`). `channel_logic.register_matching` already skips private, archived,
+`shuttered*`-named, and already-registered channels, so it only ever *adds*.
+
+The cost is the **full** (non-`-member-only`) catalog listing it must do per workspace to know
+what exists — minutes per workspace and rate-limit-prone, with no cheaper "just the new ones" API
+(see `docs/references/slackdump-cli-notes.md`). Scanning all workspaces nightly would meaningfully
+lengthen an already-long run, so the script rotates: `day-of-year mod <workspace count>` picks one
+workspace per night, re-scanning each roughly weekly — plenty responsive for "a new channel was
+created." The log line names which workspace was scanned and its position in the rotation.
+Already-registered lines are filtered out of the log to keep it readable.
+
+To force a scan of a specific workspace immediately:
+
+```bash
+./slackbackup channel register <workspace> '*' --channels-file channels.json
+```
 
 ### Tiered cadence (why most channels are "skipped" nightly)
 
@@ -143,3 +178,24 @@ is far inside Slack's ~90-day retention, so a skipped channel that suddenly gets
 still re-checked while every post is live. To force a full sweep regardless of cadence, run
 `backup run` with `-f/--full`. To retune, edit the single `BACKUP_CADENCE_TIERS` constant.
 Deleting a workspace's catalog resets `last_checked`, so the next run checks everything once.
+
+### Recovering catalog recency after an interrupted run
+
+`backup run` stamps `last_posted`/`registered_at`/`last_checked` per channel as it goes, so an
+interrupted run leaves the catalog partially stale. `backup sync-catalog` rebuilds those recency
+fields from **local archives only** — no Slack API calls, safe to run any time:
+
+```bash
+./slackbackup backup sync-catalog channels.json ~/slack-backups
+```
+
+### The `files_out` sidecar is not disposable output
+
+Everything under `~/slack-exports/` is regenerable from the archive **except** a job's `files_out`
+sidecar. It is cumulative across runs: each run merges into the existing document and carries
+forward files whose source has since aged out of Slack's ~90-day retention or whose channel fell
+outside that run's selectors. Deleting it discards records the archive can no longer reproduce.
+A corrupt/unreadable sidecar is logged and treated as absent (the job still completes), which
+means a truncated file silently restarts the history — back it up with the digests, and check the
+`N files -> <path>` log line for an unexpected drop. See `docs/DESIGN-export.md` §`files_out`
+sidecar.

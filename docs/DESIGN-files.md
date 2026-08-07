@@ -191,10 +191,12 @@ carries:
 |-------|--------|---------|
 | `is_private`, `is_archived` | Mirrored from Slack's own `list channels -format JSON` (same call, no extra cost) | Lets `register_matching` (below) exclude private/archived channels from bulk discovery |
 | `creator`, `created` | Same call | Channel context surfaced in `export digest` (see `docs/DESIGN-export.md`) |
+| `topic`, `purpose` | Same call — the two raw Slack values, stored separately in addition to the merged `description` (`description_of()` = topic-else-purpose, which necessarily drops one of them) | Both are surfaced verbatim in `export digest`'s channel entries, so a query can use either signal independently — a channel's topic is often logistical while its purpose states its actual charter |
 | `registered_at` | **This app's own bookkeeping** — stamped once, idempotently, by `channel_logic.register`/`register_matching` the moment a channel is first tracked | Fallback recency signal for backup ordering (see `last_posted` below) |
 | `last_posted` | **This app's own bookkeeping** — set by `backup_logic.backup_channel` after a backup that actually found message data; left unset if the archive stayed empty | Real recency signal once available; `catalog_logic.effective_recency` prefers this over `registered_at` |
+| `last_checked`, `last_action` | **This app's own bookkeeping** — stamped by `catalog_logic.record_check` on every `backup run` decision (`archive`/`resume`/`failed`/`skip`) | Drives the tiered cadence filter (`backup_logic.should_check_tonight`): `last_checked` is the downtime backstop that stops a long outage from leaving a channel unchecked indefinitely. See `docs/DESIGN.md` §Solution Strategy |
 
-`registered_at`/`last_posted` have no Slack-API source at all — they exist purely so
+`registered_at`/`last_posted`/`last_checked`/`last_action` have no Slack-API source at all — they exist purely so
 `backup_logic.run()` can process a multi-channel run most-recently-active-first (real data) or
 most-recently-discovered-first (no data yet), rather than in arbitrary `channels.json` order.
 
@@ -204,7 +206,11 @@ Generalizes the original single-channel `register()` to glob-based discovery: e.
 `register_matching("f3*", "*", ...)` registers every new, public, non-archived channel across
 every registered `f3*` workspace — intended to run nightly so newly-created public channels
 (the original motivating case: `disc-it` going unnoticed in `f3pugetsound`) get picked up
-automatically instead of requiring a human to notice and run `channel register` by name.
+automatically instead of requiring a human to notice and run `channel register` by name. This is
+now wired into `scripts/nightly-backup-digest.sh`, but **one workspace per night** rather than all
+of them: the full (non-`-member-only`) listing it needs costs minutes per workspace and is
+rate-limit-prone, so the script rotates through the known workspaces by day-of-year, re-scanning
+each roughly weekly — see `docs/OPERATIONS.md` §Nightly Backup.
 
 Three real bugs were found and fixed while building this, all in the shared `list_channels()`
 call both registration and the catalog depend on — fixed centrally in
@@ -243,4 +249,6 @@ workspace produced the expected ~380 legitimate public channels.
   <fresh-cookie>` as the remedy — not scripted around, per the original constraint.
 - Channel `description` (not in the original design) was added to the catalog: both
   tiers call `list channels -format JSON` instead of the default Text format, so
-  `topic`/`purpose` come from the same single API call already being made.
+  `topic`/`purpose` come from the same single API call already being made. Both raw values
+  are now also stored (and exported) alongside the merged `description` — see the schema
+  table above.
