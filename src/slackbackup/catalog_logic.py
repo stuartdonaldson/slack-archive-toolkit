@@ -216,7 +216,17 @@ def lookup(
 ) -> list[tuple[str, dict]]:
     """Checks the fast tier first; on a miss, triggers a (cached) full-tier
     refresh and retries - the expensive call becomes an explicit, cached
-    fallback instead of an inline call on every lookup."""
+    fallback instead of an inline call on every lookup.
+
+    Deliberate policy (sat-il0): the only caller is channel_logic.register(),
+    which uses this purely for id/name resolution - "does a channel matching
+    this name/id exist, and what's its canonical id" - not for metadata
+    freshness. A fast-tier HIT is trusted as-is and never cross-checked
+    against the full tier, so a member channel's topic/purpose/creator/
+    created can go stale here for up to FULL_TTL_SECONDS even though its
+    id/name (the only fields register() reads) are current. If a future
+    caller needs fresh metadata rather than just existence/id resolution,
+    it should call refresh_full() directly instead of relying on lookup()."""
     data = refresh_fast(workspace, cache_dir)
     member_channels = {cid: ch for cid, ch in data["channels"].items() if ch["member"]}
     matches = match_channels(member_channels, query)

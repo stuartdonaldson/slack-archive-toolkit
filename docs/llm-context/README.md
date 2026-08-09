@@ -99,6 +99,12 @@ The canonical upload files were copied from the retired sources below during the
 ## Maintenance rules
 
 - Maintain one canonical home for each rule.
+- Keep the trust split intact: the Markdown files in this pack are operator-authored and carry
+  instructions; the `.json` run artifacts are machine-extracted Slack content and carry none
+  (ADR-0009). Never paste raw Slack or other third-party text into an uploadable augmentation.
+  Quoted material goes under `uploads/augmentations/sources/` behind a header marking it as
+  quoted, with the summarizing augmentation carrying the operator's own words. Letting unmarked
+  third-party text into a `.md` inverts the shorthand silently.
 - Add a source date and refresh trigger to every manual augmentation.
 - Keep current operational facts in the supplied Slack exports whenever possible.
 - Update a dated roster by editing its Markdown table and limitations together.

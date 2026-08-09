@@ -22,6 +22,9 @@ def register(groups: argparse._SubParsersAction) -> None:
             "Example:\n  ./slackbackup catalog show f3pugetsound --full --archive-root ~/slack-backups\n"
             "Output: printed to stdout (tab-separated); also refreshes the cache file at\n"
             "        ~/.cache/slackbackup/<workspace>.catalog.json as a side effect.\n"
+            "Without --full: fast-tier only - member=yes rows only, cheap, but blind to\n"
+            "        channels the archiving account isn't currently a member of. Use --full\n"
+            "        for the general-purpose 'every public channel' view.\n"
             "last_posted_live is recomputed now from --archive-root (needs a local archive).\n"
             "last_posted_cached/registered_at are persisted by `backup run`/`channel register`\n"
             "over time - cached stays unset until a backup actually finds message data; until\n"
@@ -30,7 +33,15 @@ def register(groups: argparse._SubParsersAction) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_show.add_argument("workspace")
-    p_show.add_argument("--full", action="store_true", help="also refresh/include the expensive full channel listing")
+    p_show.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "also refresh/include the expensive full channel listing (every public channel, "
+            "not just ones we're a member of); without this flag, only the cheap member-only "
+            "fast tier is shown"
+        ),
+    )
     p_show.add_argument("--channels-file", default="./channels.json")
     p_show.add_argument(
         "--archive-root", default=None, help="enables last_posted_live for tracked channels (local-only)"
