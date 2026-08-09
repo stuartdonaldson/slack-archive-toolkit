@@ -124,6 +124,13 @@ against this vision, not an accepted shortcut.
 - **Canvas/file catalog** — designed (`docs/DESIGN-files.md`) but **not yet ported to Python**;
   the shell implementation (`scripts/fetch-files.sh`, `scripts/build-file-index.sh`) is the only
   one that exists today.
+- **Bot-image backfill & gallery viewer** (`files gallery generate`) — F3 Nation's backblast/
+  preblast bot posts photos as Block Kit image blocks, not native Slack file uploads, so
+  `archive`/`resume` never captures them; `backup_channel` now backfills each not-yet-present
+  image into `<channel_dir>/__bot-images/` as a non-fatal post-step on every archive/resume.
+  `files gallery generate <workspace_dir>` scans those folders across a workspace and writes a
+  single self-contained `image-gallery.html`, thumbnails grouped by channel and sorted by
+  backblast date — see `docs/DESIGN-files.md`.
 
 ---
 
