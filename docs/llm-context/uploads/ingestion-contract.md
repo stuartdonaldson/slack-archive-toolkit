@@ -1,8 +1,8 @@
 # Ingestion contract
 
-Canonical home for: upload validation, schema versions, sidecar pairing, timestamps, channel context fields, identity scope, and Canvas/file currency. This is a consumer-facing restatement of the export schemas — it never decides a schema fact. [docs/DESIGN-export.md](../DESIGN-export.md) is the schema authority; if this document and the design doc disagree, the design doc wins and this file needs a fix.
+Canonical home for: upload validation, schema versions, sidecar pairing, timestamps, channel context fields, identity scope, and Canvas/file currency. This is a consumer-facing restatement of the export schemas — it never decides a schema fact. [docs/DESIGN-export.md](../../DESIGN-export.md) is the schema authority; if this document and the design doc disagree, the design doc wins and this file needs a fix.
 
-**Schema versions covered:** `slack-llm-digest-v5`, `slack-llm-files-v2`, `slack-user-profiles-v1`.
+**Schema versions covered:** `slack-llm-digest-v6`, `slack-llm-files-v2`, `slack-user-profiles-v1`.
 
 You have been given Slack digest/export data, Slack user profile data, a companion file-content sidecar, and optional regional or cultural context documents for F3 Puget Sound and related regional workspaces. They may be chat attachments or periodically refreshed Project knowledge files.
 
@@ -12,7 +12,7 @@ Ingest and organize the data for later analysis. Do not generate a newsletter, l
 
 The uploaded data may include:
 
-* `slack-llm-digest-v5` files containing channel metadata, messages, threads, links, mentions, activity counts, and lightweight file references (each carrying `has_content` and `archive_status`)
+* `slack-llm-digest-v6` files containing channel metadata, messages, threads, links, mentions, activity counts, and lightweight file references (each carrying `has_content` and `archive_status`)
 * a `slack-llm-files-v2` sidecar containing extracted canvas and document content, plus records for exceptional extraction failures
 * a `slack-user-profiles-v1` file containing workspace-local user profiles
 * regional, organizational, or cultural reference documents
@@ -55,15 +55,16 @@ Flag uncertainty instead of guessing.
 
 ## Channel context fields
 
-Each channel entry carries three distinct text fields — do not collapse them or drop any that are present:
+Each channel entry carries two distinct text fields — do not collapse them or drop either:
 
-* `topic` — the channel's current Slack topic, verbatim
-* `purpose` — the channel's current Slack purpose, verbatim
-* `description` — a convenience merge (topic if set, otherwise purpose); it can omit real content, since a channel may have both a topic and a purpose set to different things (e.g. topic is logistical, purpose states the channel's actual charter)
+* `topic` — the channel's current Slack topic, verbatim (the pinned text at the top of the channel in Slack's UI)
+* `description` — the channel's current Slack purpose, verbatim, named to match Slack's own UI (its channel-details panel labels this field "Description"; Slack's API name for it is `purpose`)
 
-Read `topic` and `purpose` independently rather than relying on `description` alone. Either may be null if never set in Slack.
+Both may be null if never set in Slack. Read them independently — never assume one implies the other, or that one is a fallback for the other.
 
-When `topic` and `purpose` say conflicting things, treat `topic` as the higher-priority signal (it matches `description`'s own fallback order) but still report the `purpose` content rather than discarding it — a channel may deliberately carry a short operational `topic` alongside a longer standing `purpose` that states its actual charter, and both are legitimate evidence.
+When `topic` and `description` say conflicting things, both are legitimate evidence — a channel may deliberately carry a short operational `topic` alongside a longer standing `description` that states its actual charter (e.g. a site-Q or leadership channel). Report both rather than discarding either.
+
+Prior to `slack-llm-digest-v6`, a synthesized `description` field (topic-falls-back-to-purpose) existed alongside separate `topic`/`purpose` fields. v6 dropped that merge and renamed `purpose` to `description` — if you see all three of `topic`/`purpose`/`description` together, you are looking at a pre-v6 digest; treat its `description` as unreliable (it can silently omit either underlying value) and read `topic`/`purpose` directly instead.
 
 ## Digest and file sidecar
 
@@ -216,7 +217,7 @@ Prepare to answer questions about:
 This block covers referential integrity **within the upload only**. Two checks it does not cover still need doing at ingestion time:
 
 1. **Cross-source consistency:** a manual augmentation's roster names resolve to a profile in that workspace where expected; a region present in an augmentation but absent from the digest, or the reverse; a role an augmentation asserts that newer dated Slack evidence contradicts (apply the `Contested`/`Unresolved` handling in [query-policy.md](query-policy.md)); an augmentation's `collected:` date older than the digest's own date range.
-2. **Drift versus a prior upload, when one is available for comparison:** sidecar match rate, extracted-content coverage, unresolved-mention count, and channels with neither `topic` nor `purpose`. A declining match rate across uploads means an input needs fixing, not that one answer needs hedging. `consistency`'s counts are per-document snapshots, not deltas — compute drift yourself by comparing two uploads' blocks.
+2. **Drift versus a prior upload, when one is available for comparison:** sidecar match rate, extracted-content coverage, unresolved-mention count, and channels with neither `topic` nor `description`. A declining match rate across uploads means an input needs fixing, not that one answer needs hedging. `consistency`'s counts are per-document snapshots, not deltas — compute drift yourself by comparing two uploads' blocks.
 
 Report material findings from this check as part of [Initial ingestion validation](#initial-ingestion-validation), not buried inside a later substantive answer.
 

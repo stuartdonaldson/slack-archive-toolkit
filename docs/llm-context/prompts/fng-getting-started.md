@@ -1,6 +1,6 @@
 # Prompt: F3 Slack start-here guide for a new PAX
 
-Canonical home for the FNG-getting-started prompt. Formerly copied from `docs/fng-getting-started-prompt.md`, which was retired in `sat-ejk.5` (see `../MIGRATION-PLAN.md` Phase 5); this file is now the only copy.
+Canonical home for the FNG-getting-started prompt. Formerly copied from `docs/fng-getting-started-prompt.md`, which was retired in `sat-ejk.5` (see `../../adr/0008-llm-context-pack-decomposition.md`); this file is now the only copy.
 
 ---
 

@@ -16,6 +16,17 @@ Use only the supplied data. Prefer F3 names. Include a direct clickable Slack li
 
 Current maintained references and explicit announcements take priority over profile-derived signals. Profile titles and display names may be stale: label a conclusion that relies only on either as `Working signal — profile/display name; may be stale`.
 
+## Pre-response check
+
+Before drafting a substantive answer:
+
+1. Identify the question's scope and type, then select the applicable routing guidance and report format in this policy. Use the user's requested format when it does not conflict with these rules; otherwise use the relevant canonical table or a concise source-grounded answer.
+2. Retrieve the current uploaded Slack-data artifacts relevant to that question. For a material claim, compare the strongest available evidence, its date or currency, and any applicable dated augmentation before choosing a conclusion.
+3. Verify that each material factual claim has the strongest available provenance link, or explicitly state when no direct link is available. Apply the required confidence or conflict treatment before writing the claim.
+4. If the available evidence cannot support the requested conclusion or format, say what is missing rather than filling the gap by inference.
+
+The methodology note and source links belong in the final response, not as a separate planning response. Do not expose this checklist unless the user asks how the answer was prepared.
+
 ## Evidence order
 
 Use the newest, strongest evidence that establishes the fact, in this order:
@@ -97,6 +108,14 @@ Before reporting, identify the requested authority and scope: regional leadershi
 | What does a channel exist for? | Its current topic and purpose, considered independently, then an explicit channel-maintainer explanation | Channel name alone or activity patterns |
 
 Regional roles such as Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, Comz Q, and IT Q apply to a region. Site Q, AO Q, and OIC are AO-scoped: associate them with the specific AO/channel, not the whole region.
+
+## Common request forms
+
+Ask these directly after intake validation; no separate report prompt is needed:
+
+* **Regional leadership:** “Produce the current regional SLT report using the current uploaded artifacts.”
+* **AO directory:** “Produce an AO/site directory for [region or workspace].”
+* **Authority routing:** “Who has authority to [action] for [region, workspace, or AO]?” State the supporting source and date, identify the authority type, and explain any evidence gap rather than inferring a role.
 
 ## Current regional SLT report
 

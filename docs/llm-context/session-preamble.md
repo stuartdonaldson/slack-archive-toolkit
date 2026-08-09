@@ -4,7 +4,7 @@ Send this as the first message in a one-off ChatGPT session, together with the u
 
 ---
 
-Before answering anything substantive, read the attached `ingestion-contract.md` and `query-policy.md` in full. Follow their rules for schema handling, sidecar joins and asymmetry, identity merging, evidence order, confidence labels, and authority boundaries.
+Before answering anything substantive, read the attached `ingestion-contract.md` and `query-policy.md` in full. Follow their rules for schema handling, sidecar joins and asymmetry, identity merging, evidence order, confidence labels, authority boundaries, and the query policy's pre-response check for each later substantive request.
 
 Run the initial ingestion validation described in `ingestion-contract.md` and reply with only that validation summary — files recognized, workspaces/regions, sidecar pairing status, and obvious gaps. Do not produce a newsletter, leadership report, event digest, or other substantive analysis until asked.
 

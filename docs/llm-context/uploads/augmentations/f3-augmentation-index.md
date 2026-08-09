@@ -1,6 +1,6 @@
 # Augmentations index
 
-The `augmentations/` directory is repository organization, not a folder that ChatGPT can browse. For a ChatGPT Project, upload this index as an individually named file (for example, `f3-augmentations-index.md`) and upload each augmentation needed for the intended questions. Do not assume that uploading this index makes its listed files available.
+The `augmentations/` directory is repository organization, not a folder that ChatGPT can browse. For a ChatGPT Project, upload this index as an individually named file (for example, `f3-augmentation-index.md`) and upload each augmentation needed for the intended questions. Do not assume that uploading this index makes its listed files available.
 
 This is the place for dated, hand-maintained facts relevant to regional F3
 questions that come from sources **outside** the Slack export — a call
@@ -26,12 +26,27 @@ See [query-policy.md §Dated augmentation evidence](../query-policy.md#dated-aug
 | File | Covers | Collected |
 | --- | --- | --- |
 | [f3-nation-operations.md](f3-nation-operations.md) | F3-Nation Slack bot features, role/ownership distinctions, diagnostic routing | 2026-06-30 |
-| [f3-nation-admins.md](f3-nation-admins.md) | F3-Nation app admin roster by region | 2026-06-30 |
 | [sotn-transcripts.md](sotn-transcripts.md) | SLT State of the Nation call transcripts (cumulative — one entry per call) | 2026-07-30 (latest entry) |
+| [f3nation-pugetsound.md](f3nation-pugetsound.md) | F3-Nation Admin, Regional SLT, AO Locations Description and Time and Site-Q — live-pulled from `api.f3nation.com`, superseded the earlier manually-extracted `f3-nation-admins.md` (retired: narrower scope - admin only, no Redmond - and staler by five weeks) | 2026-08-07 |
 
 ## Archive
 
-Superseded snapshots, when history is useful, live under `archive/<name>-<date>.md`. None yet.
+Superseded snapshots, when history is useful, live under `archive/<name>-<date>.md`. None yet. (`f3-nation-admins.md`, retired 2026-08-08, was deleted outright rather than archived — no content gap, git history retains it if needed.)
+
+## Deliberate dual-sourcing: F3-Nation app data vs. Slack
+
+`f3nation-pugetsound.md`'s per-AO facts (Site Q in particular) will often restate
+something also visible in a Slack channel's `topic`/`purpose` — that overlap is
+not redundancy to collapse. One objective of holding both is surfacing
+**consistency gaps**: F3-Nation app data is admin/database-maintained and
+requires someone to deliberately go update `admin.f3nation.com` or
+`/f3-nation-settings`, which regional PAX rarely do since they seldom see that
+surface day to day; Slack channel text is community-maintained and changes
+whenever a Site Q or PAX edits the channel directly. The two sources drift
+independently, so where they *disagree* is itself a signal — a likely-stale
+F3-Nation record, a likely-stale Slack channel description, or both. Don't
+silently prefer one; see [query-policy.md](../query-policy.md#dated-augmentation-evidence)
+for how to rank and report a disagreement rather than resolve it.
 
 ## Maintenance
 

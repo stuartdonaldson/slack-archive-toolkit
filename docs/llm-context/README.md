@@ -1,40 +1,49 @@
 # LLM context pack
 
-This folder is a Markdown-first context pack for a shared ChatGPT session or ChatGPT Project. It prepares an LLM to safely answer questions about Slack-derived F3 information without treating profile signals or manually collected facts as current proof.
+This folder contains the reusable guidance, prompt templates, and validation material for answering questions from Slack-derived F3 data. The documents under [uploads](uploads) are individually uploadable Project-knowledge files. The remaining root-level documents explain how to use or maintain them.
 
-See [MIGRATION-PLAN.md](MIGRATION-PLAN.md) for the staged migration. The canonical context files below now exist (Phase 2), copied from the legacy documents named in [Sources curated into the completed pack](#sources-curated-into-the-completed-pack), have been validated (Phase 3; see [VALIDATION-RESULTS.md](VALIDATION-RESULTS.md)), and are the active upload/copy source (Phase 4) — `scripts/nightly-backup-digest.sh` refreshes a curated `~/slack-exports/llm-context/` subtree from this folder each run, and `README.md`/`docs/OPERATIONS.md` reference it. The legacy per-file documents named below have been retired (Phase 5, `sat-ejk.5`); their content lives only in this pack now and in git history.
+## How to use this pack
 
-## Why Markdown for manual supplements
+### ChatGPT Project
 
-Use Markdown for human-maintained context such as a regional F3-Nation administrator roster. It is easy to review in pull requests, edit as a table, cite in an answer, and upload with the other guidance files. It also permits the source date, scope, limitations, and refresh instructions to sit beside the facts.
+1. Paste [project-instructions.md](project-instructions.md) into the ChatGPT Project instruction box. Do not upload it as a knowledge file.
+2. Upload these files individually as Project knowledge:
+   - [ingestion-contract.md](uploads/ingestion-contract.md)
+   - [query-policy.md](uploads/query-policy.md)
+   - [f3-domain-context.md](uploads/f3-domain-context.md)
+   - [F3 augmentations index](uploads/augmentations/f3-augmentation-index.md)
+   - each augmentation needed for the questions the Project will answer
+   - all current exported Slack-data artifacts for the intended coverage
+3. Start a chat by requesting the initial intake validation. It reads each uploaded artifact and reports its coverage, freshness, pairing status, and material gaps.
+4. Refresh or replace each artifact independently when newer data is available. A later explicitly uploaded file or chat instruction supersedes an earlier artifact only for the facts it covers.
+5. Ask the required question directly. The uploaded query policy contains routing and report formats for common leadership, AO, and authority questions. Use a template from [prompts](prompts) only for specialized outputs such as a newsletter or FNG guide.
 
-Use JSON for generated data or an automated consumer: the Slack digest, user-profile export, and file-content sidecar are already structured exports. If automation later requires a supplemental roster as JSON, generate it from the reviewed Markdown source instead of editing both formats by hand.
+**Example — Project intake:** “Using the current Project knowledge files, run the initial intake validation only. State each artifact's date or coverage, workspaces, sidecar pairing status, and material gaps.”
 
-## Intended upload set
+**Example — Project report:** “Produce the current regional SLT report using the current uploaded artifacts.”
 
-### Context files for a shared project
+### Standalone ChatGPT session
 
-Upload the completed versions of these context documents:
+1. Upload the same individual context files, selected augmentations, and current digest/profile/sidecar artifacts to a new chat.
+2. Paste [session-preamble.md](session-preamble.md) as the first message.
+3. Wait for its intake-validation response.
+4. Ask the required question directly. Use a template from [prompts](prompts) only for a specialized output such as a newsletter or FNG guide.
 
-1. `ingestion-contract.md`
-2. `query-policy.md`
-3. `f3-domain-context.md`
-4. An explicitly uploaded augmentation index, plus each selected dated augmentation
+**Example — standalone AO directory:** Upload the context and current artifacts, paste the session preamble, then ask: “Produce an AO/site directory for F3 Cascades.”
 
-The repository uses folders to organize files; ChatGPT Project knowledge does not reliably browse those folders. Upload the augmentation index as a separately named file (for example, `f3-augmentations-index.md`) and upload the specific augmentation files it identifies. Do not upload the prompt library by default: `prompts/` is an operator-facing set of templates. Select and paste the matching prompt into a chat, or upload that individual prompt when it must be available as Project knowledge.
+### Folders are repository organization only
 
-### Run artifacts in a shared project
+ChatGPT Project knowledge does not reliably browse repository folders. Upload the individual files listed above. In particular, uploading the augmentation index does not upload its listed augmentations, and the prompt library contains specialized operator templates—not a group of files to upload by default.
 
-Project knowledge may hold the current run artifacts and augmentations. Refresh or replace them periodically, preserving their dates and indicating which file is current. The same artifacts may instead be attached to an individual chat when that is more appropriate.
+## Validation workflow
 
-Provide the current available artifacts for a reporting run:
+Use [validation-set.md](validation-set.md) when changing the context pack, export schema, query policy, or Project instructions.
 
-1. The Slack digest export
-2. The Slack user-profile export
-3. The current `slack-llm-files-v2` sidecar, when supplied
-4. Any relevant dated manual augmentation not represented in the exports
-
-Use the most current artifact for each source type and preserve its coverage, generated, or collected date. The sidecar is cumulative, so it does not need to share the digest's exact export window; sidecar records outside the digest window are expected. Join digest file references to sidecar records using `workspace + channel_id + id`. State material freshness mismatches rather than silently treating an older profile roster, augmentation, or sidecar as current.
+1. Prepare a real digest, profile export, sidecar, and any augmentations needed by the scenarios.
+2. Test both modes: a one-off ChatGPT session using the session preamble, and a ChatGPT Project using the pasted Project instructions and individually uploaded knowledge files.
+3. Run each applicable scenario with real names, channels, or files substituted.
+4. Evaluate whether the answer follows the expected evidence and confidence behavior, not whether a time-sensitive factual answer happens to be unchanged.
+5. Record the live ChatGPT test separately from the earlier static document review in [VALIDATION-RESULTS.md](VALIDATION-RESULTS.md). File remediation work for failures before declaring a mode validated.
 
 ## Source roles
 
@@ -42,11 +51,11 @@ Use the most current artifact for each source type and preserve its coverage, ge
 | --- | --- | --- |
 | Slack digest | Messages, replies, channel metadata, structured activity/leadership fields, links, and file references | Primary evidence for visible Slack facts in the covered period. |
 | User-profile export | Workspace-local display names, titles, and Slack roles | Resolves identities and Slack administration; titles are supporting signals and may be stale. |
-| File-content sidecar | Extracted Canvas/document text matched to digest file references | Primary evidence when a maintained document answers the question. |
-| Ingestion contract | Schema, pairing, identity, timestamp, and initial-upload rules | Read before analysis. |
-| Query policy | Evidence priority, confidence, authority boundaries, and output formats | Read before answering substantive questions. |
+| File-content sidecar | Extracted Canvas/document text matched to digest file references | Primary evidence when a maintained document answers the question. The sidecar is cumulative, not digest-window-matched. |
+| Ingestion contract | Schema, pairing, identity, timestamp, and initial-upload rules | Consult before analysis. |
+| Query policy | Evidence priority, confidence, authority boundaries, and output formats | Consult before answering substantive questions. |
 | F3 domain context | Culture, vocabulary, and writing posture | Background only; not proof of a current role or event. |
-| Dated augmentation | Facts unavailable in standard Slack exports | Use only for its stated scope; state its collection date and limitations. |
+| Dated augmentation | Facts unavailable in standard Slack exports | Upload the relevant file explicitly; state its collection date and limitations. |
 
 ## Authority boundaries
 
@@ -59,48 +68,33 @@ Do not equate these roles:
 
 One role is not evidence of another. Current maintained Slack evidence outranks a dated manual augmentation when they conflict.
 
-## Project instruction
+## Pack organization
 
-Use [project-instructions.md](project-instructions.md) verbatim in the ChatGPT Project instruction box. It defines the invariant handling of knowledge-file retrieval, freshness, supersession, evidence, and authority boundaries.
+| Location | Purpose | Upload by default? |
+| --- | --- | --- |
+| [uploads](uploads) | Individually uploadable knowledge documents and augmentations. | Yes, select individual files. |
+| [prompts](prompts) | Specialized operator templates for a newsletter or FNG guide. | No; paste or attach one only when needed. |
+| [project-instructions.md](project-instructions.md) | Paste-ready ChatGPT Project instructions. | No; paste into the instruction box. |
+| [session-preamble.md](session-preamble.md) | First message for a one-off chat. | No; paste as the first message. |
+| [validation-set.md](validation-set.md) | Maintainer test specification. | No; use during validation. |
 
-## Reusable prompts
+The pack's decomposition and evidence-precedence decisions are recorded in
+[ADR-0008](../adr/0008-llm-context-pack-decomposition.md). The migration plan, review, and
+validation-results documents that preceded it are retired now that the migration is complete
+(`sat-ejk`, closed) — retrieve them from git history if the reasoning trail is needed.
 
-### Initial data intake
+## Sources curated into the pack
 
-> Review the uploaded digest, user-profile export, file-content sidecar, and context pack. Do not produce a substantive report yet. Confirm the recognized schemas, exact data date range, workspaces/regions, sidecar pairing status, extracted-content coverage, and material gaps.
+The canonical upload files were copied from the retired sources below during the migration. Retrieve a retired source from git history if necessary.
 
-### Current regional leadership
-
-> Using the uploaded Slack data and context pack, produce a current regional SLT report for every represented region. State the exact Slack-data date range. Use the source hierarchy in the query policy, provide the required SLT roles first, link the strongest available provenance for every named role, and include only a short Qualifications section for conflicts, vacancies, transitions, and profile-only assignments.
-
-### AO and site directory
-
-> Using the uploaded Slack data and context pack, produce an AO/site directory for the requested region. For each identifiable AO, report its Slack channel, Site Q when supported, topic, purpose, schedule, location, and source/confidence. Keep topic and purpose separate. Do not infer missing operating details from activity patterns or administrator roles.
-
-### F3-Nation or Slack authority
-
-> Using the uploaded Slack data and any applicable dated augmentation, identify the likely authority for this question: Slack workspace administration, F3-Nation regional configuration, regional leadership, AO/Site Q ownership, or F3-Nation dev/ops. State the supporting source and its date. Do not infer one authority from another. If the supplied data cannot establish the answer, explain the gap and the next evidence to seek.
-
-### Evidence review
-
-> Answer this question from the uploaded data. First identify the scope and the strongest available evidence. Resolve material conflicts by source strength and recency. Preserve direct Slack links. Distinguish confirmed facts, profile-only working signals, dated-manual facts, former roles, and unresolved gaps.
-
-## Sources curated into the completed pack
-
-Copied in Phase 2, then retired in Phase 5 (`sat-ejk.5`) once Phase 3 validation and Phase 4 integration were confirmed complete. Each legacy path below no longer exists in the working tree; retrieve it from git history (e.g. `git log --follow -- docs/slack-ingestion.md`) if needed.
-
-| Context file | Retired legacy source material |
+| Current file | Retired source material |
 | --- | --- |
-| `ingestion-contract.md` | `docs/slack-ingestion.md` |
-| `query-policy.md` | `docs/report-queries.md` and the evidence/confidence sections of `docs/slack-ingestion.md` |
-| `f3-domain-context.md` | `docs/f3-culture.md` (culture-framing claims de-attributed from a specific person; sourced quotes moved to a `Source notes` section) |
-| `prompts/newsletter.md` | `docs/newsletter-prompt.md` |
-| `prompts/fng-getting-started.md` | `docs/fng-getting-started-prompt.md` |
-| `augmentations/f3-nation-operations.md` | The role distinctions, operations, and diagnostic guidance in `docs/f3-it-infrastructure-augmentation-2026-06-30.md` |
-| `augmentations/f3-nation-admins.md` | The dated roster and limitations from `docs/f3-it-infrastructure-augmentation-2026-06-30.md` and its companion JSON (`docs/f3-it-infrastructure-augmentation-2026-06-30.json`, removed — no automated consumer, Markdown roster is authoritative) |
-| `prompts/initial-intake.md`, `prompts/regional-slt.md`, `prompts/ao-directory.md`, `prompts/authority-routing.md` | New, distilled from this file's §Reusable prompts below |
-| `project-instructions.md`, `session-preamble.md` | New |
-| `validation-set.md` | New |
+| [uploads/ingestion-contract.md](uploads/ingestion-contract.md) | `docs/slack-ingestion.md` |
+| [uploads/query-policy.md](uploads/query-policy.md) | `docs/report-queries.md` and the evidence/confidence sections of `docs/slack-ingestion.md` |
+| [uploads/f3-domain-context.md](uploads/f3-domain-context.md) | `docs/f3-culture.md` |
+| [prompts/newsletter.md](prompts/newsletter.md) | `docs/newsletter-prompt.md` |
+| [prompts/fng-getting-started.md](prompts/fng-getting-started.md) | `docs/fng-getting-started-prompt.md` |
+| [uploads/augmentations/f3-nation-operations.md](uploads/augmentations/f3-nation-operations.md) | F3-Nation role distinctions, operations, and diagnostic guidance. |
 
 ## Maintenance rules
 
@@ -109,3 +103,4 @@ Copied in Phase 2, then retired in Phase 5 (`sat-ejk.5`) once Phase 3 validation
 - Keep current operational facts in the supplied Slack exports whenever possible.
 - Update a dated roster by editing its Markdown table and limitations together.
 - Generate any later JSON derivative from the reviewed Markdown source; do not hand-edit both.
+- Do not treat a static document review as live ChatGPT validation.

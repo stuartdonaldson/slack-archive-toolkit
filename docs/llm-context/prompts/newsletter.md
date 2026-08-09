@@ -1,9 +1,5 @@
 # Prompt: F3 Puget Sound regional newsletter
 
-Canonical home for the newsletter-generation prompt. Formerly copied from `docs/newsletter-prompt.md`, which was retired in `sat-ejk.5` (see `../MIGRATION-PLAN.md` Phase 5); this file is now the only copy.
-
----
-
 Generate an F3 Puget Sound regional newsletter from the Slack digest export.
 
 Use only information present in the export. Do not invent details. The digest may include messages, channels, direct Slack message URLs, and leadership information inferred from visible Slack display names.
@@ -32,6 +28,7 @@ Output a concise Markdown newsletter.
 * Avoid duplicate reports. Merge repeated posts, reminders, replies, and follow-ups into one coherent update per event/topic.
 * Include only items likely to matter beyond the immediate channel: regional events, AO changes, CSAUPs, 2.0/family events, service opportunities, major announcements, useful outcomes, and broadly relevant words of wisdom. Omit routine backblasts unless they confirm an event outcome or include broadly useful information.
 * If a fact comes from a channel description, topic, canvas/file, or structured digest field rather than a message, cite the channel/source.
+* If a fact comes from a backblast, it is probably a secondary announcement, prefer an original channel post in #all* #1st-F #2nd-F or #3rd-F channels
 
 ## Verifying outcomes
 
@@ -106,25 +103,6 @@ Use concise confidence language:
 If no leadership info is found, write:
 
 `No leadership info found. Need a maintained regional leadership reference.`
-
-## Site Overview
-
-For each region, include a **Site Overview**.
-* Sort Site Overview rows by site/channel name unless the source provides an intentional regional order.
-
-List only AOs/sites with both a Site Q and location in the digest/profile data.
-
-| Site / Channel | Site Q | Time | Location |
-| -------------- | ------ | ---- | -------- |
-
-Rules:
-
-* Scope each AO to the region/workspace where its channel appears.
-* Prefer channel description, topic, canvas/file, and structured digest fields over profile-title inference.
-* Omit sites missing either Site Q or location.
-* Do not infer missing time/location/Site Q.
-
-After the table, add:
 
 **Notable regional announcements / words of wisdom**
 

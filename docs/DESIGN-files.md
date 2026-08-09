@@ -137,6 +137,47 @@ standalone Canvas — `FILE.MESSAGE_ID IS NULL` — never migrated with the mess
   `src/slackbackup/channel_digest.py` + `channel_digest_logic.py`. Tracked as `SlackBackup-ie2`
   (closed).
 
+## Bot-embedded image backfill (`bot_images_logic.py`) — implemented
+
+A third file-capture gap, distinct from both the shell design above and the channel digest: F3
+Nation's own backblast/preblast bot ("Crazy Ivan") posts photos as Block Kit `image` blocks
+(`blocks[].image_url` on the bot's message), not as native Slack file uploads. `archive`/`resume`
+only downloads real `files[]` attachments into the `FILE` table / `__uploads/` — it has no code
+path that walks `blocks[]`, so these images never land locally even for a fully tracked, resumed
+channel, regardless of the harvesting design above (which is scoped to real `FILE` rows).
+Discovered and characterized in a real `f3kirkland`/`ao-urban-ruck` investigation (`SlackBackup
+sat-lul`): 17 of 57 distinct messages carried an image block, vs. only 4 real Slack file uploads
+in the same channel over the same period.
+
+Two URL flavors, different retrieval cost:
+- Most are on F3 Nation's own public bucket (`storage.googleapis.com/f3-public-images/...`) — no
+  auth needed.
+- A few are on Slack's private CDN (`files.slack.com/files-pri/...`) — even when the block also
+  carries a real `slack_file.id`, this project never persists the raw session cookie (by design,
+  see `slackdump-cli-notes.md`), so these are reported and skipped, not fetched.
+
+**Implemented, unlike the file-harvesting design above:**
+- `src/slackbackup/bot_images_logic.py` — `iter_image_blocks()` reads `MESSAGE.DATA` directly out
+  of the channel's local `slackdump.sqlite` (no API call); `backfill_channel()` downloads each
+  not-yet-present image into `<channel_dir>/__bot-images/`, named `<backblast-date>_<original
+  filename>` (idempotent — an existing target filename is skipped, not re-fetched).
+- Wired into `backup_logic.backup_channel()` as a non-fatal post-step after every archive/resume
+  (same contract as `_dedupe_quietly` — a download hiccup never fails the backup), so newly-posted
+  bot images are picked up automatically going forward. Tracked as `SlackBackup-i2j` (closed).
+- One-time catch-up across every already-archived channel:
+  `scripts/backfill-bot-images-existing-archives.py [--channels-file] [--archive-root] [--only
+  workspace/channel,...]`. Tracked as `SlackBackup-lqp`/`SlackBackup-q9s` (closed).
+
+### Gallery viewer (`gallery_logic.py`) — implemented
+
+`./slackbackup files gallery generate <workspace_dir> [--out <path>]` scans every channel's
+`__bot-images/` folder under a workspace archive dir and writes a single self-contained
+`image-gallery.html` (default: `<workspace_dir>/image-gallery.html`) — thumbnails grouped by
+channel, sorted by backblast date within each group, grid layout, inline CSS/JS small/medium/large
+size toggle, relative `img src` to the already-downloaded local files (no external assets, no
+network calls at render time). Implemented in `src/slackbackup/gallery_logic.py`. Tracked as
+`SlackBackup-es4` (closed).
+
 ## Channel catalog design
 
 Generalizes the original shell `register-channel.sh`'s `get_channel_list()` /
@@ -191,7 +232,7 @@ carries:
 |-------|--------|---------|
 | `is_private`, `is_archived` | Mirrored from Slack's own `list channels -format JSON` (same call, no extra cost) | Lets `register_matching` (below) exclude private/archived channels from bulk discovery |
 | `creator`, `created` | Same call | Channel context surfaced in `export digest` (see `docs/DESIGN-export.md`) |
-| `topic`, `purpose` | Same call — the two raw Slack values, stored separately in addition to the merged `description` (`description_of()` = topic-else-purpose, which necessarily drops one of them) | Both are surfaced verbatim in `export digest`'s channel entries, so a query can use either signal independently — a channel's topic is often logistical while its purpose states its actual charter |
+| `topic`, `purpose` | Same call — the two raw Slack values, stored separately in addition to the merged `description` (`description_of()` = topic-else-purpose, which necessarily drops one of them) | Both are surfaced in `export digest`'s channel entries (`topic` verbatim; `purpose` renamed to `description` there to match Slack's own UI label — see `docs/DESIGN-export.md` §Output shape, v6), so a query can use either signal independently — a channel's topic is often logistical while its purpose states its actual charter. The catalog's own merged `description` field is not surfaced in the digest (dropped in digest v6, `docs/adr/0007-digest-v6-drop-merged-description.md`); it remains here for other consumers (`catalog.py`'s CLI listing, `channel_digest_logic.py`'s separate schema). |
 | `registered_at` | **This app's own bookkeeping** — stamped once, idempotently, by `channel_logic.register`/`register_matching` the moment a channel is first tracked | Fallback recency signal for backup ordering (see `last_posted` below) |
 | `last_posted` | **This app's own bookkeeping** — set by `backup_logic.backup_channel` after a backup that actually found message data; left unset if the archive stayed empty | Real recency signal once available; `catalog_logic.effective_recency` prefers this over `registered_at` |
 | `last_checked`, `last_action` | **This app's own bookkeeping** — stamped by `catalog_logic.record_check` on every `backup run` decision (`archive`/`resume`/`failed`/`skip`) | Drives the tiered cadence filter (`backup_logic.should_check_tonight`): `last_checked` is the downtime backstop that stops a long outage from leaving a channel unchecked indefinitely. See `docs/DESIGN.md` §Solution Strategy |
@@ -207,10 +248,12 @@ Generalizes the original single-channel `register()` to glob-based discovery: e.
 every registered `f3*` workspace — intended to run nightly so newly-created public channels
 (the original motivating case: `disc-it` going unnoticed in `f3pugetsound`) get picked up
 automatically instead of requiring a human to notice and run `channel register` by name. This is
-now wired into `scripts/nightly-backup-digest.sh`, but **one workspace per night** rather than all
-of them: the full (non-`-member-only`) listing it needs costs minutes per workspace and is
-rate-limit-prone, so the script rotates through the known workspaces by day-of-year, re-scanning
-each roughly weekly — see `docs/OPERATIONS.md` §Nightly Backup.
+now wired into `scripts/nightly-backup-digest.sh`, scanning **all registered workspaces every
+night** (`register_matching("*", "*", ...)`). The full (non-`-member-only`) listing it needs was
+originally assumed to cost minutes per workspace and be rate-limit-prone, which motivated an
+earlier day-of-year rotation through one workspace per night; measured in practice it's
+~1.5–2 minutes per workspace, cheap enough to scan all 9 every night instead — see
+`docs/OPERATIONS.md` §Nightly Backup.
 
 Three real bugs were found and fixed while building this, all in the shared `list_channels()`
 call both registration and the catalog depend on — fixed centrally in

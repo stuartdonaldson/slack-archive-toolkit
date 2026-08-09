@@ -130,7 +130,7 @@ appending everything to `~/slack-backups/nightly.log`. In order, each run:
 
 | # | Step | Notes |
 |---|------|-------|
-| 0 | Copy the canonical LLM context pack's deployment files (`docs/llm-context/{ingestion-contract,query-policy,f3-domain-context,project-instructions,session-preamble}.md`, `prompts/*.md`, and the active `augmentations/*.md`) into `~/slack-exports/llm-context/` | `docs/` is canonical and git-tracked; this stops the operator's working copies from silently diverging. `docs/llm-context/README.md` is the upload guide for both one-off sessions and ChatGPT Projects. The legacy per-file prompt/context docs were retired in `sat-ejk.5` per `docs/llm-context/MIGRATION-PLAN.md` Phase 5. Local edits made under `~/slack-exports/` **are overwritten every night** — edit the copy in `docs/` and commit it |
+| 0 | Copy the canonical LLM context pack into `~/slack-exports/llm-context/` | Individually uploadable Project-knowledge files live under `docs/llm-context/uploads/`; `project-instructions.md` and `session-preamble.md` are pasted, while `prompts/*.md` are selected by an operator. [docs/llm-context/README.md](llm-context/README.md) is the upload and validation guide for both one-off sessions and ChatGPT Projects. The legacy per-file prompt/context docs were retired in `sat-ejk.5` per [ADR-0008](adr/0008-llm-context-pack-decomposition.md). Local edits made under `~/slack-exports/` **are overwritten every night** — edit the copy in `docs/` |
 | 1 | `scripts/auth-refresh/keepalive.sh` — headless credential keep-alive (§4) | Non-fatal; a hard logout still needs interactive `npm run refresh` |
 | 2 | `scripts/preflight-auth.sh channels.json` — stale-session banner (§2) | Informational, always exits 0 |
 | 3 | `./slackbackup channel register <one workspace> '*'` — pick up newly-created public channels | **One workspace per night**, rotating — see below |
@@ -145,7 +145,7 @@ The script deliberately does **not** `set -e`: a single workspace or channel fai
 keep-alive itself — must not stop the rest of the run. Each step's exit code is echoed into the
 log (`----- <step> exited N -----`) rather than acted on.
 
-### Nightly channel registration (one workspace per night)
+### Nightly channel registration (all workspaces, every night)
 
 Step 3 exists because a newly-created public channel is otherwise invisible to the backup until a
 human notices and registers it by hand (the motivating case: `disc-it` went un-backed-up for weeks
@@ -153,12 +153,14 @@ in `f3pugetsound`). `channel_logic.register_matching` already skips private, arc
 `shuttered*`-named, and already-registered channels, so it only ever *adds*.
 
 The cost is the **full** (non-`-member-only`) catalog listing it must do per workspace to know
-what exists — minutes per workspace and rate-limit-prone, with no cheaper "just the new ones" API
-(see `docs/references/slackdump-cli-notes.md`). Scanning all workspaces nightly would meaningfully
-lengthen an already-long run, so the script rotates: `day-of-year mod <workspace count>` picks one
-workspace per night, re-scanning each roughly weekly — plenty responsive for "a new channel was
-created." The log line names which workspace was scanned and its position in the rotation.
-Already-registered lines are filtered out of the log to keep it readable.
+what exists — flagged in `docs/references/slackdump-cli-notes.md` as potentially minutes per
+workspace and rate-limit-prone, with no cheaper "just the new ones" API. This originally motivated
+scanning only one workspace per night (`day-of-year mod <workspace count>`), re-scanning each
+roughly weekly. Measured in practice it's actually ~1.5–2 minutes per workspace, not "several" —
+cheap enough across all 9 registered workspaces that the script now scans every workspace every
+night (`./slackbackup channel register '*' '*'`), so a newly-created channel shows up in the very
+next run instead of waiting up to a week for its rotation slot. Already-registered lines are
+filtered out of the log to keep it readable.
 
 To force a scan of a specific workspace immediately:
 

@@ -24,6 +24,17 @@ from . import slackdump
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "slackbackup"
 FAST_TTL_SECONDS = 900
+# 6h: unvalidated since first set. The only empirical basis on record is the
+# very first commit's one-off measurement (2026-06-23, f3pugetsound, 464
+# channels): 4m20s wall-clock, rate-limited twice (docs/references/
+# slackdump-cli-notes.md). Re-run 2026-08-08 on the *same* workspace/channel
+# count: ~59s, zero rate-limit events - a 4-5x speedup with no throttling,
+# for reasons not confirmed (Slack's rate limits are load-dependent, so this
+# could be normal variance rather than a real improvement - one clean run
+# doesn't overturn the original measurement). Revisit this TTL (and the
+# "expensive/throttle-prone" framing below) only after several more
+# back-to-back full-tier runs at different times of day confirm which
+# behavior is typical, not off a single data point either direction.
 FULL_TTL_SECONDS = 21600
 
 

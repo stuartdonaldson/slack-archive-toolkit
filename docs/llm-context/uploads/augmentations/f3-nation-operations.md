@@ -40,7 +40,7 @@ The same person may appear in more than one role, but the roles are distinct —
 | Role | Source | Meaning | Do not confuse with |
 |---|---|---|---|
 | Slack workspace admin/owner | Slack profile export | Controls Slack workspace administration, permissions, app installation, and workspace governance | F3-Nation app admin, Site Q, regional leadership |
-| F3-Nation app / region admin | Manual `/f3-nation-settings` extraction (see [f3-nation-admins.md](f3-nation-admins.md)) | Can configure F3-Nation app settings for that region | Slack workspace admin, Site Q, regional leadership |
+| F3-Nation app / region admin | Live `api.f3nation.com` role read (see [f3nation-pugetsound.md](f3nation-pugetsound.md)) | Can configure F3-Nation app settings for that region | Slack workspace admin, Site Q, regional leadership |
 | Site Q | SLT settings, AO/channel metadata, leadership data, or messages | AO-level leadership / workout ownership | Slack admin or F3-Nation app admin |
 | Regional leadership | Maintained leadership data, channel descriptions, messages, or qualified profile/title hints | Human regional leadership such as Nantan, Weasel Shaker, 1st F, 2nd F, 3rd F, Comz | Slack admin, F3-Nation app admin, Site Q |
 
@@ -129,7 +129,7 @@ Examples:
 
 ## Query guidance
 
-When asked **who can fix or configure the F3-Nation bot**, use the F3-Nation app admin list for the relevant region in [f3-nation-admins.md](f3-nation-admins.md).
+When asked **who can fix or configure the F3-Nation bot**, use the F3-Nation app admin/editor list for the relevant region/AO in [f3nation-pugetsound.md](f3nation-pugetsound.md) ("who can correct this" line — note it does not distinguish admin from editor role, only that either can make the change).
 
 When asked **who controls the Slack workspace**, use the Slack owner/admin data from the profile export.
 

@@ -27,13 +27,13 @@ export PYTHONUNBUFFERED=1
 mkdir -p "$ARCHIVE_ROOT"
 mkdir -p "$HOME/slack-exports"
 
-# Canonical LLM context pack (docs/llm-context/, sat-ejk migration) is the
-# active upload/copy source as of Phase 4 integration. Refresh a curated
-# ~/slack-exports/llm-context/ runtime subtree each run so operator uploads
-# stay in sync with git. Mirror the whole tree EXCEPT planning/review/
-# maintenance material that must not reach the runtime upload area (per
-# MIGRATION-PLAN.md Phase 4's "must avoid copying planning records ... into
-# the runtime upload area") — a deny-list via rsync --exclude, not a per-file
+# Canonical LLM context pack (docs/llm-context/, sat-ejk migration, decision
+# recorded in docs/adr/0008-llm-context-pack-decomposition.md) is the active
+# upload/copy source. The individually uploadable Project-knowledge files
+# live under uploads/; refresh a curated ~/slack-exports/llm-context/ runtime
+# subtree each run so operator uploads stay in sync with git. Mirror the
+# whole tree EXCEPT planning/review/maintenance material that must not reach
+# the runtime upload area — a deny-list via rsync --exclude, not a per-file
 # allow-list, so a new prompt or augmentation file is picked up automatically
 # without editing this script.
 mkdir -p "$HOME/slack-exports/llm-context"
@@ -43,21 +43,19 @@ rsync -a --delete \
    --exclude 'REVIEW-*.md' \
    --exclude 'VALIDATION-RESULTS.md' \
    --exclude 'validation-set.md' \
-   --exclude 'augmentations/README.md' \
-   --exclude 'augmentations/archive/' \
-   --exclude 'augmentations/sources/' \
+    --exclude 'uploads/augmentations/archive/' \
+    --exclude 'uploads/augmentations/sources/' \
    "$REPO_ROOT/docs/llm-context/" "$HOME/slack-exports/llm-context/"
 # Excluded: this dir's own operator-facing README (assembly/maintenance
-# guide, not upload content), planning/review/validation records, the
-# augmentations index (operator-facing, not upload content), archived
+# guide, not upload content), planning/review/validation records, archived
 # superseded augmentation snapshots, and raw source material backing a
 # cumulative augmentation (e.g. sotn-transcripts.md's transcripts) — citation
-# backup, not upload material.
+# backup, not upload material. The augmentation index is retained under
+# uploads/ because it is individually uploaded with selected augmentations.
 
 # The legacy per-file prompt/context docs (F3 culture notes, ingestion/
 # newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the
-# canonical pack above was validated and integrated (MIGRATION-PLAN.md
-# Phase 5) — no longer copied here.
+# canonical pack above was validated and integrated — no longer copied here.
 
 {
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
@@ -82,27 +80,21 @@ rsync -a --delete \
     # nightly" is in its own docstring); it already only *registers*
     # channels.json-missing ones, skipping private/archived/"shuttered*"/
     # already-registered regardless of glob - nothing to optimize there.
-    # The unavoidable cost is the FULL (non-member-only) catalog listing
-    # register_matching does per workspace to even know what's out there to
-    # diff against - confirmed several minutes and rate-limit-prone per
-    # workspace in docs/references/slackdump-cli-notes.md, with no cheaper
-    # "just the new ones" API to fall back on. Scanning all 9 workspaces
-    # every night could meaningfully lengthen an already-long run, so
-    # instead rotate one workspace per night (day-of-year mod workspace
-    # count) - bounds the added cost to a single workspace's full listing
-    # while still rescanning every workspace roughly weekly, plenty
-    # responsive for "a new channel was created."
-    mapfile -t _known_workspaces < <(./slackbackup workspace list 2>/dev/null | tail -n +2 | awk '{print $1}')
-    if [ "${#_known_workspaces[@]}" -gt 0 ]; then
-        _day_of_year=$((10#$(date -u +%j)))
-        _ws_idx=$(( _day_of_year % ${#_known_workspaces[@]} ))
-        _ws_tonight="${_known_workspaces[$_ws_idx]}"
-        echo "channel register: scanning '$_ws_tonight' tonight (workspace $((_ws_idx + 1))/${#_known_workspaces[@]} in nightly rotation)"
-        ./slackbackup channel register "$_ws_tonight" '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
-        echo "----- channel register exited ${PIPESTATUS[0]} -----"
-    else
-        echo "channel register: skipping - could not list known workspaces" >&2
-    fi
+    # The cost is the FULL (non-member-only) catalog listing register_matching
+    # does per workspace to even know what's out there to diff against -
+    # docs/references/slackdump-cli-notes.md warns this can run several
+    # minutes and be rate-limit-prone per workspace, and originally motivated
+    # rotating one workspace's scan per night (day-of-year mod workspace
+    # count) instead of scanning all of them. Measured in practice (2026-08-07
+    # f3tundra, 2026-08-08 f3cascades) it's actually ~1.5-2 minutes per
+    # workspace, not "several" - cheap enough across all 9 registered
+    # workspaces that scanning every one nightly (via the 'f3*'/'*'-equivalent
+    # workspace glob register_matching already supports) is worth the ~15-20
+    # min it adds, so newly-created channels show up the very next run instead
+    # of waiting up to a week for their rotation slot.
+    echo "channel register: scanning all registered workspaces tonight"
+    ./slackbackup channel register '*' '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
+    echo "----- channel register exited ${PIPESTATUS[0]} -----"
 
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"

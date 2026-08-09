@@ -43,10 +43,22 @@ file/canvas harvesting) for how this project uses these facts.
   existing archive appends a duplicate chunk on top rather than overwriting (confirmed:
   message count doubled, every thread-root row 4x). Always: no existing
   `slackdump.sqlite` → `archive`; existing → `resume`.
-- `resume -dedupe` has a **confirmed data-loss bug**: it deletes thread-root
-  (`IS_PARENT=1`) message rows (verified by diffing against an independent fresh
-  archive — 9/9 thread parents missing in a 55-message test channel). **Never use
-  `-dedupe`.** Accept duplicate rows across resume cycles instead.
+- `resume -dedupe` (the inline flag) has a **confirmed data-loss bug**: it deletes
+  thread-root (`IS_PARENT=1`) message rows (verified by diffing against an independent
+  fresh archive — 9/9 thread parents missing in a 55-message test channel). **Never
+  pass `-dedupe` to `resume`.**
+  The standalone `slackdump tools dedupe -mode message-key -execute <archive_directory>`
+  command does NOT have this bug (verified 2026-08-08, SlackBackup-9hq: collapsed 178
+  duplicate-laden rows to 20 correct ones on a real archive, thread-root row intact,
+  and a subsequent `convert -f export` produced the correct message count). `-mode
+  message-key` collapses by (channel, ts) even when Slack-regenerated fields differ
+  between fetches, keeping the latest copy; the default `-mode exact` mode is stricter
+  and untested here. `backup_logic.backup_channel()` runs this after every `resume()`
+  to clean up the duplicate rows the lookback window re-inserts each cycle — see
+  `docs/DESIGN.md`. Note: `slackdump convert -f export` already produces a correct,
+  deduplicated message count even against an *undeduped* archive (verified same date) —
+  the accumulation is a disk-bloat/archive-size problem, not a digest-correctness one,
+  but still worth cleaning up since it grows unbounded for actively-posting channels.
 - `archive`/`resume` exit **0** and write a 0-message archive for a not-found or
   inaccessible channel ID — there is no non-zero exit code to detect a bad channel ID.
   Don't rely on exit code alone to validate `channels.json` entries.

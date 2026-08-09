@@ -83,4 +83,4 @@ Source transcript: [`sources/sotn-2026-07-30-transcript.md`](sources/sotn-2026-0
 - After each new SOTN call: transcribe or obtain the transcript, save the raw source under `sources/`, and append a new dated entry above using the same header-block fields.
 - Extract facts relevant to regional inquiries (roles, tools, figures, named programs, safety guidance); don't try to make the summary a full replay — cite the source transcript for exact wording.
 - Note explicitly in a new entry when it corrects or updates a fact from an earlier entry; leave the earlier entry's text unchanged (it's a historical record of what was said on that date).
-- Add the new entry to [../README.md](../README.md)'s Active table `Collected` column update, and to this file — the README table points at "this file", not at each entry.
+- Add the new entry to [the context-pack README](../../README.md)'s Active table `Collected` column update, and to this file — the README table points at "this file", not at each entry.
