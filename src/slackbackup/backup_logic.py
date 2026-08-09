@@ -137,12 +137,95 @@ def _write_last_backup(target_dir: Path) -> None:
     (target_dir / ".last_backup").write_text(_ts() + "\n")
 
 
+def _dedupe_channel_user_fast(db_path: Path) -> int:
+    """Direct-SQL fast-path dedupe of the CHANNEL_USER table (SlackBackup
+    sat-ece). `slackdump tools dedupe -mode message-key -execute` writes
+    every join NULL-safe (`A.col = B.col OR (A.col IS NULL AND B.col IS
+    NULL)`) so it generically supports entities with nullable key columns -
+    this defeats SQLite's ability to use an index seek. On channels whose
+    CHANNEL_USER table has grown very large (100k+ rows - observed
+    f3nation/3rd-f at 245,975, f3nation/1st-f at 263,310, f3nation/comz-
+    nation at 162,690, 2026-08-09) that query plan pegs the CLI at its
+    DEDUPE_TIMEOUT_SECONDS bound and gets killed. CHANNEL_ID/USER_ID are
+    NOT NULL in our schema (see the CREATE TABLE in this project's own
+    archives), so the NULL-safety is unneeded overhead here - a plain-
+    equality GROUP BY against the same table finished in 85ms against
+    245,975 rows in manual testing, vs. 900s+ via the CLI.
+
+    Semantically equivalent to slackdump's own "by key" dedupe for this
+    table: group by (CHANNEL_ID, USER_ID), keep only the row with
+    MAX(CHUNK_ID) per group, delete the rest. Called *before* the CLI
+    dedupe (see _dedupe_quietly) so that by the time the CLI's own
+    CHANNEL_USER pass runs, the table has already shrunk to its real
+    (non-duplicated) size - keeping that pass fast even though the CLI has
+    no per-table flag to skip CHANNEL_USER outright (checked via `slackdump
+    help tools dedupe` - no such flag exists). We deliberately do NOT
+    reimplement dedupe for MESSAGE/S_USER/CHANNEL/FILE - those have stayed
+    fast via the CLI in every real archive observed so far.
+
+    Not implemented here (sat-ece, optional/cosmetic): slackdump's own
+    dedupe also prunes now-empty CHUNK rows that referenced purely-
+    duplicate CHANNEL_USER rows (`prunableChunkIDs`/`deleteChunksByID` in
+    its Go source). That's table hygiene, not correctness - skipped to keep
+    this fast path minimal; the CLI dedupe that still runs afterward covers
+    CHUNK pruning for the tables it fully owns.
+
+    Returns 0 (no-op) if the file or the CHANNEL_USER table doesn't exist
+    yet - mirrors _max_message_ts's contract of never side-effect-creating
+    the file just by looking."""
+    if not db_path.exists():
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        cur = conn.execute(
+            """
+            DELETE FROM CHANNEL_USER
+            WHERE (CHANNEL_ID, USER_ID, CHUNK_ID) NOT IN (
+                SELECT CHANNEL_ID, USER_ID, MAX(CHUNK_ID)
+                FROM CHANNEL_USER
+                GROUP BY CHANNEL_ID, USER_ID
+            )
+            """
+        )
+        removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        conn.commit()
+    except sqlite3.OperationalError:
+        # No CHANNEL_USER table (e.g. a fresh/empty archive, or a database
+        # produced by a slackdump mode that never creates it) - nothing to
+        # dedupe, not an error.
+        return 0
+    finally:
+        conn.close()
+    return removed
+
+
+def _dedupe_channel_user_fast_quietly(channel_directory: Path) -> None:
+    """Runs _dedupe_channel_user_fast against this channel's archive,
+    swallowing failure the same way _dedupe_quietly does for the CLI
+    dedupe - a housekeeping step must never turn an otherwise-successful
+    resume into a reported channel failure."""
+    db_path = channel_directory / "slackdump.sqlite"
+    try:
+        removed = _dedupe_channel_user_fast(db_path)
+    except sqlite3.Error as exc:
+        _log(f"backup: channel_user dedupe failed for {channel_directory} (non-fatal, continuing): {exc}")
+        return
+    if removed:
+        _log(f"backup: dedupe removed {removed} duplicate channel_user row(s) from {channel_directory}")
+
+
 def _dedupe_quietly(channel_directory: Path) -> None:
-    """Runs slackdump.dedupe() after a resume, swallowing failure - a
-    housekeeping step that trims accumulated duplicate rows (SlackBackup-9hq)
-    must never turn an otherwise-successful resume into a reported channel
-    failure. Logged either way so a persistent dedupe problem is still
-    visible in the nightly log, just not fatal to the run."""
+    """Runs the CHANNEL_USER fast path, then slackdump.dedupe() (the CLI's
+    `tools dedupe -mode message-key -execute`) after a resume, each
+    swallowing its own failure - a housekeeping step that trims accumulated
+    duplicate rows (SlackBackup-9hq, sat-ece) must never turn an otherwise-
+    successful resume into a reported channel failure. Logged either way so
+    a persistent dedupe problem is still visible in the nightly log, just
+    not fatal to the run. Fast path runs first - see
+    _dedupe_channel_user_fast's docstring for why running it before the CLI
+    call is what keeps the CLI's own CHANNEL_USER pass from timing out."""
+    _dedupe_channel_user_fast_quietly(channel_directory)
     try:
         removed = slackdump.dedupe(channel_directory)
     except slackdump.SlackdumpError as exc:

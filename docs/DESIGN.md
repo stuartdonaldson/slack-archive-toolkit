@@ -180,6 +180,28 @@ night's cron fire):
   `dedupe` (local sqlite-only, no network) gets a tight bound; `archive`/`resume` (real network
   I/O + file downloads, can legitimately run long on a channel's first-ever full history) get
   generous ones.
+- **CHANNEL_USER fast-path dedupe** (`backup_logic._dedupe_channel_user_fast`, SlackBackup
+  sat-ece) — even with the timeout above, `tools dedupe -mode message-key -execute` still hit
+  `DEDUPE_TIMEOUT_SECONDS` and got killed on channels whose `CHANNEL_USER` table has grown very
+  large (100k+ rows — observed 2026-08-09 on f3nation/3rd-f at 245,975 rows, f3nation/1st-f at
+  263,310, f3nation/comz-nation at 162,690; channels under ~20k rows deduped fine in seconds).
+  Root cause, confirmed by reading `slackdump`'s Go source
+  (`internal/chunk/backend/dbase/repository/dedupe.go`): its dedupe SQL writes every join
+  NULL-safe (`A.col = B.col OR (A.col IS NULL AND B.col IS NULL)`) to generically support
+  entities with nullable key columns, which defeats SQLite's ability to use an index seek. Our
+  `CHANNEL_USER` table's key columns (`CHANNEL_ID`, `USER_ID`) are `NOT NULL` in our schema, so
+  that NULL-safety is unneeded overhead — a plain-equality query against the same table finished
+  in 85ms against 245,975 rows in manual testing, vs. 900s+ via the CLI. `_dedupe_quietly` now
+  runs a direct-SQL dedupe of `CHANNEL_USER` (group by `(CHANNEL_ID, USER_ID)`, keep only the row
+  with `MAX(CHUNK_ID)` per group) *before* calling `slackdump.dedupe()`, so by the time the CLI's
+  own `CHANNEL_USER` pass runs the table has already shrunk to its real (non-duplicated) size —
+  `slackdump` has no per-table flag to skip `CHANNEL_USER` outright (checked via `slackdump help
+  tools dedupe`), so keeping that pass cheap is what actually avoids the timeout, not skipping
+  the CLI call. `MESSAGE`/`S_USER`/`CHANNEL`/`FILE` are deliberately left to the CLI, unreimplemented — those tables have stayed fast in every real archive observed so far. Not implemented
+  (cosmetic, not correctness-critical): slackdump's own dedupe also prunes now-empty `CHUNK` rows
+  that referenced purely-duplicate `CHANNEL_USER` rows (`prunableChunkIDs`/`deleteChunksByID` in
+  its Go source) — the CLI dedupe that still runs afterward covers `CHUNK` pruning for the tables
+  it fully owns.
 
 ---
 
@@ -194,7 +216,7 @@ night's cron fire):
 | `workspace_logic.py` | Registers a workspace session: looks up its `xoxc-` token in `~/.slackdump-tokens.json`, combines with a freshly-pasted `xoxd-` cookie, hands both to `slackdump workspace import`. | Yes |
 | `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob- or comma-list-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked. | No (via `catalog_logic`) |
 | `catalog_logic.py` | Owns the only call site for `slackdump.list_channels()`. Two-tier cache (fast member-only / expensive full) persisted to `~/.cache/slackbackup/<workspace>.catalog.json`. Also owns `registered_at`/`last_posted`/`effective_recency` — fields with no Slack-API source at all, purely this app's own bookkeeping. | Yes |
-| `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` and writes the `.last_backup` seal stamp after a successful backup; optional `--workspace`/`--channel` subset selectors; orders a multi-channel run by `effective_recency` within a workspace and interleaves across workspaces (`_interleave_by_workspace`) to spread per-workspace rate-limit pressure; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; `sync_catalog_from_local` (CLI `backup sync-catalog`) backfills `last_posted`/`registered_at` from local archives only, no API calls, for use after an interrupted run; timestamped logging + per-workspace progress + run summary. `backup_channel` acquires `channel_lock` for the whole archive/resume/dedupe/bot-image-backfill sequence; `run`'s per-channel loop treats a lock conflict as a soft skip, same as `SlackdumpError` (see Concurrency, above). | Yes |
+| `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` and writes the `.last_backup` seal stamp after a successful backup; optional `--workspace`/`--channel` subset selectors; orders a multi-channel run by `effective_recency` within a workspace and interleaves across workspaces (`_interleave_by_workspace`) to spread per-workspace rate-limit pressure; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; `sync_catalog_from_local` (CLI `backup sync-catalog`) backfills `last_posted`/`registered_at` from local archives only, no API calls, for use after an interrupted run; timestamped logging + per-workspace progress + run summary. `backup_channel` acquires `channel_lock` for the whole archive/resume/dedupe/bot-image-backfill sequence; `run`'s per-channel loop treats a lock conflict as a soft skip, same as `SlackdumpError` (see Concurrency, above). `_dedupe_quietly` runs a direct-SQL `CHANNEL_USER` fast-path dedupe (`_dedupe_channel_user_fast`, sat-ece) before the CLI's `tools dedupe` call — see Concurrency, above. | Yes |
 | `export_logic.py` | Read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster, and report-job (`--jobs`) loading/path-templating. General-purpose: all F3-specific leadership logic is delegated to a pluggable handler (`handlers/`), not inline. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. Also owns the `files_out` sidecar's build/merge (`merge_files_out`), which keeps extracted file text out of the digest document itself. Every `convert_export` call site acquires `channel_lock` first and treats a conflict as a soft skip (`"locked"` channel/workspace status, alongside the existing `"missing_archive"`) - see Concurrency, above. | Yes (`convert_export` only) |
 | `handlers/` (`__init__.py`, `f3.py`) | Region/workspace-specific digest processing pulled out of `export_logic.py`. `f3.py` holds every F3 title/role regex + leadership rollup behind a two-function protocol (`annotate_profile`, `build_leadership`); `__init__.py` is the registry (`get`/`NAMES`). Selected via `export digest --leadership-handler` or a job's `leadership_handler` field — see `docs/DESIGN-export.md`. | No |
 | `channel_digest_logic.py` | On-demand `channel-digest run`: archives channels matching an fnmatch glob (e.g. `shuttered-*`, untracked) and writes/merges a schema-versioned (`slack-channel-digest-v2`) JSON of surviving messages/files/orphaned Canvases — for recovering content outside `channels.json`. Not in the nightly cadence — see `docs/DESIGN-files.md`. | Yes (`archive` + `convert_export`) |

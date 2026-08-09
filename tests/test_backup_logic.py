@@ -17,6 +17,32 @@ def _make_db(path, message_count):
     conn.close()
 
 
+def _make_channel_user_db(path, rows):
+    """rows: list of (channel_id, user_id, chunk_id) tuples - real
+    CHANNEL_USER schema (sat-ece), so the fast-path dedupe SQL is exercised
+    against the actual table shape, not a stand-in."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE CHANNEL_USER (
+            CHANNEL_ID TEXT NOT NULL,
+            USER_ID TEXT NOT NULL,
+            CHUNK_ID INTEGER NOT NULL,
+            LOAD_DTTM TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            IDX INTEGER NOT NULL,
+            PRIMARY KEY (CHANNEL_ID, USER_ID, CHUNK_ID)
+        )
+        """
+    )
+    for idx, (channel_id, user_id, chunk_id) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO CHANNEL_USER (CHANNEL_ID, USER_ID, CHUNK_ID, IDX) VALUES (?, ?, ?, ?)",
+            (channel_id, user_id, chunk_id, idx),
+        )
+    conn.commit()
+    conn.close()
+
+
 def test_channel_dir_keys_by_workspace_and_slug(tmp_path):
     d = backup_logic.channel_dir(tmp_path, "f3test", "general")
     assert d == tmp_path / "f3test" / "general"
@@ -102,6 +128,124 @@ def test_backup_channel_dedupe_failure_is_non_fatal(tmp_path, monkeypatch):
     kind = backup_logic.backup_channel("C1", "general", "f3test", archive_root, cache_dir=tmp_path / "cache")
 
     assert kind == "resume"
+
+
+# --- CHANNEL_USER fast-path dedupe (sat-ece) ------------------------------
+#
+# `slackdump tools dedupe -mode message-key -execute` writes every join
+# NULL-safe (`A.col = B.col OR (A.col IS NULL AND B.col IS NULL)`), which
+# defeats SQLite's index seek. CHANNEL_ID/USER_ID are NOT NULL in our schema
+# so that NULL-safety is unneeded overhead - a direct-SQL plain-equality
+# dedupe against the same table is what actually stays fast at 100k+ rows.
+
+
+def test_dedupe_channel_user_fast_keeps_max_chunk_id_and_removes_rest(tmp_path):
+    db_path = tmp_path / "slackdump.sqlite"
+    _make_channel_user_db(
+        db_path,
+        [
+            ("C1", "U1", 1),
+            ("C1", "U1", 2),  # keep - max CHUNK_ID for (C1, U1)
+            ("C1", "U2", 5),  # keep - only row for (C1, U2)
+            ("C2", "U1", 3),
+            ("C2", "U1", 9),  # keep - max CHUNK_ID for (C2, U1)
+        ],
+    )
+
+    removed = backup_logic._dedupe_channel_user_fast(db_path)
+
+    assert removed == 2
+    conn = sqlite3.connect(db_path)
+    try:
+        remaining = sorted(conn.execute("SELECT CHANNEL_ID, USER_ID, CHUNK_ID FROM CHANNEL_USER").fetchall())
+    finally:
+        conn.close()
+    assert remaining == [("C1", "U1", 2), ("C1", "U2", 5), ("C2", "U1", 9)]
+
+
+def test_dedupe_channel_user_fast_no_duplicates_is_untouched(tmp_path):
+    db_path = tmp_path / "slackdump.sqlite"
+    rows = [("C1", "U1", 1), ("C1", "U2", 1), ("C2", "U1", 1)]
+    _make_channel_user_db(db_path, rows)
+
+    removed = backup_logic._dedupe_channel_user_fast(db_path)
+
+    assert removed == 0
+    conn = sqlite3.connect(db_path)
+    try:
+        remaining = sorted(conn.execute("SELECT CHANNEL_ID, USER_ID, CHUNK_ID FROM CHANNEL_USER").fetchall())
+    finally:
+        conn.close()
+    assert remaining == sorted(rows)
+
+
+def test_dedupe_channel_user_fast_empty_table_returns_zero(tmp_path):
+    db_path = tmp_path / "slackdump.sqlite"
+    _make_channel_user_db(db_path, [])
+
+    assert backup_logic._dedupe_channel_user_fast(db_path) == 0
+
+
+def test_dedupe_channel_user_fast_missing_db_returns_zero(tmp_path):
+    # Mirrors _max_message_ts's contract: never side-effect-create the file
+    # just by looking - sqlite3.connect() would silently do that otherwise.
+    db_path = tmp_path / "slackdump.sqlite"
+
+    assert backup_logic._dedupe_channel_user_fast(db_path) == 0
+    assert not db_path.exists()
+
+
+def test_dedupe_quietly_runs_channel_user_fast_path_before_cli_dedupe(tmp_path, monkeypatch):
+    channel_directory = tmp_path / "f3test" / "general"
+    channel_directory.mkdir(parents=True)
+    db_path = channel_directory / "slackdump.sqlite"
+    _make_channel_user_db(db_path, [("C1", "U1", 1), ("C1", "U1", 2)])
+    _make_db(db_path, message_count=0)  # adds MESSAGE table onto the same file
+
+    calls = []
+    monkeypatch.setattr(backup_logic.slackdump, "dedupe", lambda d: calls.append(("cli_dedupe", d)) or 0)
+
+    backup_logic._dedupe_quietly(channel_directory)
+
+    assert calls == [("cli_dedupe", channel_directory)]
+    conn = sqlite3.connect(db_path)
+    try:
+        remaining = conn.execute("SELECT COUNT(*) FROM CHANNEL_USER").fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 1
+
+
+def test_dedupe_quietly_channel_user_fast_path_failure_is_non_fatal(tmp_path, monkeypatch, capsys):
+    """A malformed/locked CHANNEL_USER table must not stop the CLI message
+    dedupe from still running, same non-fatal contract as the CLI dedupe
+    itself (SlackBackup-9hq)."""
+    channel_directory = tmp_path / "f3test" / "general"
+    channel_directory.mkdir(parents=True)
+    db_path = channel_directory / "slackdump.sqlite"
+    _make_db(db_path, message_count=0)  # no CHANNEL_USER table at all
+
+    calls = []
+    monkeypatch.setattr(backup_logic.slackdump, "dedupe", lambda d: calls.append(("cli_dedupe", d)) or 0)
+
+    backup_logic._dedupe_quietly(channel_directory)
+
+    assert calls == [("cli_dedupe", channel_directory)]
+
+
+def test_dedupe_quietly_logs_channel_user_rows_removed(tmp_path, monkeypatch, capsys):
+    channel_directory = tmp_path / "f3test" / "general"
+    channel_directory.mkdir(parents=True)
+    db_path = channel_directory / "slackdump.sqlite"
+    _make_channel_user_db(db_path, [("C1", "U1", 1), ("C1", "U1", 2)])
+
+    monkeypatch.setattr(backup_logic.slackdump, "dedupe", lambda d: 0)
+
+    backup_logic._dedupe_quietly(channel_directory)
+
+    out = capsys.readouterr().out
+    assert "dedupe removed 1 duplicate channel_user row(s)" in out
+    assert str(channel_directory) in out
 
 
 def test_backup_channel_backfills_bot_images_after_resume(tmp_path, monkeypatch):
