@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from slackbackup import catalog_logic, export_logic
+from slackbackup import catalog_logic, channel_lock, export_logic
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
 
@@ -128,6 +128,14 @@ def test_digest_message_url():
 def test_digest_channel_url():
     url = export_logic.digest_channel_url("f3pugetsound", "C123")
     assert url == "https://f3pugetsound.slack.com/archives/C123"
+
+
+def test_digest_channel_url_prefers_team_id_when_given():
+    # The workspace-subdomain archives/ link doesn't reliably route to the
+    # right workspace in every session; app.slack.com/client/<team_id>/...
+    # (what Slack's own "Copy link" on a channel actually generates) does.
+    url = export_logic.digest_channel_url("f3kirkland", "C0A6VSZ1DFB", "T0A3F37ETTP")
+    assert url == "https://app.slack.com/client/T0A3F37ETTP/C0A6VSZ1DFB"
 
 
 def test_select_messages_in_range_nests_threads_without_month_bucketing():
@@ -386,7 +394,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v5"
+    assert result["schema_version"] == "slack-llm-digest-v6"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
@@ -837,6 +845,31 @@ def test_load_channel_files_returns_empty_for_malformed_or_missing_archive(tmp_p
     assert export_logic._load_channel_files(channel_dir) == []
 
 
+def _make_workspace_db(path: Path, team_id: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE WORKSPACE (ID INTEGER PRIMARY KEY, TEAM_ID TEXT)")
+    conn.execute("INSERT INTO WORKSPACE (TEAM_ID) VALUES (?)", (team_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_load_team_id_reads_workspace_table(tmp_path):
+    channel_dir = tmp_path / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    _make_workspace_db(channel_dir / "slackdump.sqlite", "T0A3F37ETTP")
+
+    assert export_logic._load_team_id(channel_dir) == "T0A3F37ETTP"
+
+
+def test_load_team_id_returns_none_for_malformed_or_missing_archive(tmp_path):
+    channel_dir = tmp_path / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    assert export_logic._load_team_id(channel_dir) is None  # no slackdump.sqlite at all
+
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")  # 0-byte placeholder
+    assert export_logic._load_team_id(channel_dir) is None
+
+
 def test_build_digest_includes_all_files_per_channel_images_and_non_image(tmp_path):
     archive_root = tmp_path / "archive"
     channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
@@ -890,11 +923,11 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
     )
 
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
-    assert meta["description"] == "Ask anything here"
-    # topic and purpose are kept distinct even when description's
-    # topic-falls-back-to-purpose merge would have collapsed them
+    # topic and description (Slack's purpose, renamed to match Slack's UI
+    # label) are kept distinct - no merged field (dropped in v6, see
+    # ADR-0007) to collapse them
     assert meta["topic"] == "Read the pinned FAQ first"
-    assert meta["purpose"] == "Ask anything here"
+    assert meta["description"] == "Ask anything here"
     assert meta["creator"] == "U999"
     assert meta["created_at"] == "2023-11-14T22:13:20Z"
 
@@ -919,7 +952,7 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
     assert meta == {
         "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok",
         "channel_url": "https://f3pugetsound.slack.com/archives/C1", "files": [],
-        "description": None, "topic": None, "purpose": None, "creator": None, "created_at": None,
+        "topic": None, "description": None, "creator": None, "created_at": None,
         "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
         "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
         "activity_status": "active", "activity_status_basis": "has messages during export_scope",
@@ -1093,10 +1126,39 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
         {
             "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
             "channel_url": "https://f3pugetsound.slack.com/archives/C1",
-            "files": [], "description": None, "topic": None, "purpose": None, "creator": None, "created_at": None,
+            "files": [], "topic": None, "description": None, "creator": None, "created_at": None,
         }
     ]
     assert result["messages"] == []
+
+
+def test_build_digest_skips_locked_channel_and_continues(tmp_path):
+    # sat-7k9: export shares the per-channel lock with backup/dedupe, so it
+    # never reads a channel mid-write (e.g. mid-resume/dedupe). A locked
+    # channel is a soft skip (like missing_archive), not a hard failure -
+    # other channels must still get exported.
+    archive_root = tmp_path / "archive"
+    for ws in ("f3pugetsound", "f3kirkland"):
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
+    ]))
+
+    locked_channel_dir = archive_root / "f3kirkland" / "helpdesk"
+    with channel_lock.channel_lock(locked_channel_dir):
+        result = export_logic.build_digest(
+            channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+            catalog_cache_dir=tmp_path / "empty-cache",
+        )
+
+    statuses = {c["workspace"]: c["status"] for c in result["channels"]}
+    assert statuses == {"f3pugetsound": "ok", "f3kirkland": "locked"}
+    assert len(result["messages"]) > 0  # the unlocked channel's messages still made it in
 
 
 def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
@@ -1208,6 +1270,26 @@ def test_build_digest_channel_url_present_on_ok_channels(tmp_path):
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
     assert meta["channel_url"] == "https://f3pugetsound.slack.com/archives/C1"
     assert meta["status"] == "ok"
+
+
+def test_build_digest_channel_url_uses_team_id_when_workspace_table_present(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    _make_workspace_db(channel_dir / "slackdump.sqlite", "T0A3F37ETTP")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C0A6VSZ1DFB", "name": "ao-ruck-mountain", "workspace": "f3kirkland"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C0A6VSZ1DFB")
+    assert meta["channel_url"] == "https://app.slack.com/client/T0A3F37ETTP/C0A6VSZ1DFB"
 
 
 def test_build_digest_channel_url_present_on_missing_archive_channels(tmp_path):
@@ -1755,7 +1837,7 @@ def test_build_digest_emits_top_level_mentions_index(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v5"
+    assert result["schema_version"] == "slack-llm-digest-v6"
     assert isinstance(result["mentions"], dict)
     assert "mentions_index" in result["manifest"]["counting_rules"]
 
@@ -1818,7 +1900,7 @@ def test_build_monthly_digests_stamps_month_on_export_scope(tmp_path):
 
     for month, doc in results.items():
         assert doc["export_scope"]["month"] == month
-        assert doc["schema_version"] == "slack-llm-digest-v5"
+        assert doc["schema_version"] == "slack-llm-digest-v6"
 
 
 def test_build_monthly_digests_recomputes_channel_activity_per_month(tmp_path):
@@ -2513,6 +2595,23 @@ def test_gather_and_shard_spill_layout_matches_design(tmp_path):
     for ws in ("f3aaa", "f3bbb", "f3ccc"):
         assert (spill_dir / "done" / f"{ws}__C-{ws}").exists()
     assert (spill_dir / "files.ndjson").exists()
+
+
+def test_gather_and_shard_skips_locked_channel_and_continues(tmp_path):
+    # sat-7k9, same reasoning as build_digest's equivalent test.
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+
+    locked_channel_dir = archive_root / "f3bbb" / "helpdesk"
+    with channel_lock.channel_lock(locked_channel_dir):
+        channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+            channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+            tmp_path / "empty-cache", None, None, spill_dir,
+        )
+
+    statuses = {c["workspace"]: c["status"] for c in channels_meta}
+    assert statuses == {"f3aaa": "ok", "f3bbb": "locked", "f3ccc": "ok"}
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}  # unlocked channels still contributed
 
 
 def test_write_monthly_digests_matches_build_monthly_digests(tmp_path):

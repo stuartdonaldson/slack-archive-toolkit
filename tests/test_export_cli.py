@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from slackbackup import export, export_logic
+from slackbackup import channel_lock, export, export_logic
 
 
 _SAMPLE_FILES_OUT_ENTRY = {
@@ -326,3 +326,28 @@ def test_run_job_files_out_carries_forward_first_seen_at_across_runs(tmp_path, m
 
     assert second_run["first_seen_at"] == first_seen_at
     assert second_run["content_changed_at"] is None
+
+
+def test_monthly_returns_clean_error_when_channel_is_locked(tmp_path, monkeypatch):
+    # sat-7k9: single-channel export monthly is a one-shot manual CLI, not
+    # a batch loop, so a lock conflict has nowhere to "skip and continue"
+    # to - report it clearly and exit non-zero rather than crash or hang.
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3test" / "general"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    def _boom(channel_dir, out_dir):
+        raise AssertionError("convert_export must not run while the channel is locked")
+
+    monkeypatch.setattr(export.slackdump, "convert_export", _boom)
+
+    args = argparse.Namespace(
+        archive_root=str(archive_root), workspace="f3test", channel="general",
+        out=str(tmp_path / "out"), date_from=None, date_to=None,
+    )
+
+    with channel_lock.channel_lock(channel_dir):
+        rc = export._monthly(args)
+
+    assert rc != 0

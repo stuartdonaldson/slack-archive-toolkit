@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import export_logic, handlers, selector_logic, slackdump
+from . import channel_lock, export_logic, handlers, selector_logic, slackdump
 
 DEFAULT_ARCHIVE_ROOT = Path.home() / "slack-backups"
 DEFAULT_EXPORTS_DIR = Path.home() / "slack-exports"
@@ -182,15 +182,24 @@ def _monthly(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as export_dir:
-        print(f"export monthly: converting {db_path} -> export day files", file=sys.stderr)
-        slackdump.convert_export(channel_dir, Path(export_dir))
+    # sat-7k9: shares the per-channel lock with backup/dedupe. This is a
+    # one-shot manual CLI, not a batch loop, so a lock conflict has nowhere
+    # to skip-and-continue to - report it clearly and exit non-zero rather
+    # than crash or (pre-sat-hh0) potentially hang against a stuck holder.
+    try:
+        with channel_lock.channel_lock(channel_dir):
+            with tempfile.TemporaryDirectory() as export_dir:
+                print(f"export monthly: converting {db_path} -> export day files", file=sys.stderr)
+                slackdump.convert_export(channel_dir, Path(export_dir))
 
-        last_backup_file = channel_dir / ".last_backup"
-        export_logic.export_transform(
-            Path(export_dir), args.workspace, args.channel, args.date_from, args.date_to,
-            out_dir, last_backup_file,
-        )
+                last_backup_file = channel_dir / ".last_backup"
+                export_logic.export_transform(
+                    Path(export_dir), args.workspace, args.channel, args.date_from, args.date_to,
+                    out_dir, last_backup_file,
+                )
+    except channel_lock.ChannelLockedError as exc:
+        print(f"export monthly: {exc}", file=sys.stderr)
+        return 3
     return 0
 
 

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Callable, AbstractSet
 from zoneinfo import ZoneInfo
 
-from . import catalog_logic, selector_logic
+from . import catalog_logic, channel_lock, selector_logic
 from .handlers import f3 as _default_handler
 
 _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -461,7 +461,17 @@ def trailing_days_range(days: int | None, as_of: str) -> tuple[str | None, str]:
     return from_date.isoformat(), as_of
 
 
-def digest_channel_url(workspace: str, channel_id: str) -> str:
+def digest_channel_url(workspace: str, channel_id: str, team_id: str | None = None) -> str:
+    """The workspace-subdomain form (https://<workspace>.slack.com/archives/
+    <channel_id>) does not reliably route to the right workspace in every
+    browser/app session; the app.slack.com/client/<team_id>/<channel_id>
+    form - what Slack's own "Copy link" on a channel actually generates -
+    does. Falls back to the subdomain form only when team_id isn't
+    available (e.g. a missing_archive channel with no local
+    slackdump.sqlite to read WORKSPACE.TEAM_ID from - see
+    _load_team_id)."""
+    if team_id:
+        return f"https://app.slack.com/client/{team_id}/{channel_id}"
     return f"https://{workspace}.slack.com/archives/{channel_id}"
 
 
@@ -470,28 +480,27 @@ def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
 
 
 def _channel_context(catalog: dict, channel_id: str) -> dict:
-    """description/topic/purpose/creator/created_at for one channel,
-    read-only from an already-loaded catalog cache (no API call, no
-    refresh - the digest stays local-only; if the cache was never warmed
-    for this channel, e.g. a fresh checkout, these are just None rather
-    than triggering a live fetch). created_at is an ISO8601 string, not
-    the raw epoch, matching this module's posted_at_local convention
-    elsewhere.
+    """topic/description/creator/created_at for one channel, read-only
+    from an already-loaded catalog cache (no API call, no refresh - the
+    digest stays local-only; if the cache was never warmed for this
+    channel, e.g. a fresh checkout, these are just None rather than
+    triggering a live fetch). created_at is an ISO8601 string, not the raw
+    epoch, matching this module's posted_at_local convention elsewhere.
 
-    `description` is catalog_logic.description_of()'s topic-falls-back-to-
-    purpose merge, kept as-is for existing consumers. `topic`/`purpose` are
-    added alongside it (additive, no schema_version bump - see ADR-0001)
-    because that merge silently drops the purpose text whenever a topic is
-    also set; a channel can use one for status/logistics and the other for
-    its actual charter (e.g. a site-Q or leadership channel's purpose),
-    and losing either one is a real signal loss for a query over the
-    digest."""
+    `topic` and `description` are Slack's own two verbatim channel
+    fields - `description` is named to match Slack's own UI (its channel
+    details panel labels this field "Description"; Slack's API and this
+    project's catalog cache call it `purpose`). Kept distinct rather than
+    merged (v6 dropped the prior topic-falls-back-to-purpose `description`
+    field, see ADR-0007) - a channel can use `topic` for status/logistics
+    and `description` for its actual charter (e.g. a site-Q or leadership
+    channel's purpose), and merging them risks silently dropping whichever
+    one lost the merge's priority order."""
     channel = catalog["channels"].get(channel_id, {})
     created = channel.get("created")
     return {
-        "description": channel.get("description") or None,
         "topic": channel.get("topic") or None,
-        "purpose": channel.get("purpose") or None,
+        "description": channel.get("purpose") or None,
         "creator": channel.get("creator") or None,
         "created_at": (
             datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
@@ -694,6 +703,28 @@ def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str
     if not local_path.exists():
         return None
     return str(local_path.relative_to(channel_dir.parent.parent))
+
+
+def _load_team_id(channel_dir: Path) -> str | None:
+    """Reads channel_dir's slackdump.sqlite WORKSPACE table for the Slack
+    team id (T...) used by digest_channel_url - convert_fn's export output
+    never surfaces this (channels.json's context_team_id would work too,
+    but WORKSPACE is already the pattern _load_channel_files uses: direct
+    from the archive, no convert_fn dependency). Read-only, local-only, no
+    API call. None (rather than a raise) on a missing/malformed archive -
+    the caller falls back to the workspace-subdomain URL form."""
+    db_path = channel_dir / "slackdump.sqlite"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT TEAM_ID FROM WORKSPACE ORDER BY ID DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
 
 
 def _load_channel_files(channel_dir: Path) -> list[dict]:
@@ -1444,11 +1475,27 @@ def _gather_digest_data(
             )
             continue
 
-        with tempfile.TemporaryDirectory() as export_dir:
-            export_dir_path = Path(export_dir)
-            convert_fn(channel_dir, export_dir_path)
-            all_messages = _load_all_messages(export_dir_path)
-            users_map = _load_users_map(export_dir_path)
+        # sat-7k9: shares the per-channel lock with backup/dedupe/bot-image
+        # backfill - a channel mid-resume/dedupe must not be read here, and
+        # a lock conflict is a soft skip (like missing_archive above), not
+        # a hard failure - one busy channel must not abort the whole digest.
+        try:
+            with channel_lock.channel_lock(channel_dir):
+                with tempfile.TemporaryDirectory() as export_dir:
+                    export_dir_path = Path(export_dir)
+                    convert_fn(channel_dir, export_dir_path)
+                    all_messages = _load_all_messages(export_dir_path)
+                    users_map = _load_users_map(export_dir_path)
+        except channel_lock.ChannelLockedError as exc:
+            print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+            channels_meta.append(
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                    "files": [], **channel_info,
+                }
+            )
+            continue
 
         # Canvas edit history (sat-811 §9) is read from the whole raw
         # stream, not the range-filtered slice below - it's cumulative like
@@ -1480,7 +1527,7 @@ def _gather_digest_data(
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
+                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, _load_team_id(channel_dir)),
                 "files": [_digest_file_view(f) for f in files_full], **channel_info,
             }
         )
@@ -1646,11 +1693,26 @@ def gather_and_shard_digest_data(
             if resumed:
                 months_seen.update(_channel_months_on_disk(spill_dir, workspace, channel_id))
             else:
-                with tempfile.TemporaryDirectory() as export_dir:
-                    export_dir_path = Path(export_dir)
-                    convert_fn(channel_dir, export_dir_path)
-                    all_messages = _load_all_messages(export_dir_path)
-                    users_map = _load_users_map(export_dir_path)
+                # sat-7k9: shares the per-channel lock with backup/dedupe -
+                # a lock conflict is a soft skip (like missing_archive
+                # above), not a hard failure.
+                try:
+                    with channel_lock.channel_lock(channel_dir):
+                        with tempfile.TemporaryDirectory() as export_dir:
+                            export_dir_path = Path(export_dir)
+                            convert_fn(channel_dir, export_dir_path)
+                            all_messages = _load_all_messages(export_dir_path)
+                            users_map = _load_users_map(export_dir_path)
+                except channel_lock.ChannelLockedError as exc:
+                    print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+                    channels_meta.append(
+                        {
+                            "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                            "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                            "files": [], **channel_info,
+                        }
+                    )
+                    continue
 
                 canvas_events_by_file = _extract_canvas_modification_events(all_messages, channel, channel_id)
                 all_messages = [m for m in all_messages if m.get("subtype") != "tabbed_canvas_updated"]
@@ -1692,7 +1754,7 @@ def gather_and_shard_digest_data(
             channels_meta.append(
                 {
                     "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
+                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, _load_team_id(channel_dir)),
                     "files": [_digest_file_view(f) for f in files_full], **channel_info,
                 }
             )
@@ -2008,7 +2070,7 @@ def _assemble_digest(
         export_scope["month"] = month
 
     return {
-        "schema_version": "slack-llm-digest-v5",
+        "schema_version": "slack-llm-digest-v6",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": export_scope,
         "manifest": {
@@ -2124,7 +2186,7 @@ def build_digest(
     """Merges messages from the trailing `days` days (or everything ever
     archived, when `days` is None) across every (workspace, channel) in
     `channels_file` matching `workspace_glob` into one chronologically-
-    sorted slack-llm-digest-v5 document. See _gather_digest_data and
+    sorted slack-llm-digest-v6 document. See _gather_digest_data and
     _assemble_digest for the two phases this composes; see
     build_monthly_digests for the equivalent split into one document per
     calendar month.
@@ -2177,7 +2239,7 @@ def build_monthly_digests(
     profiles_doc: dict | None = None,
     files_out_sink: list[dict] | None = None,
 ) -> dict[str, dict]:
-    """Same data and same slack-llm-digest-v5 schema as build_digest, but
+    """Same data and same slack-llm-digest-v6 schema as build_digest, but
     split into one document per calendar month (keyed "YYYY-MM") instead of
     one merged document. A thread's replies stay with their parent's
     month even when a reply itself lands in a later month - see
@@ -2221,7 +2283,7 @@ def write_monthly_digests(
     Phase 2 / sat-svu): shards every channel's messages/file content to disk
     via gather_and_shard_digest_data instead of holding the whole job's
     messages and file content in memory at once, then assembles and writes
-    each month's slack-llm-digest-v5 document one at a time (reusing
+    each month's slack-llm-digest-v6 document one at a time (reusing
     _assemble_digest unchanged - same document, only the memory shape of
     getting there differs), discarding that month's message slice before
     moving to the next.
@@ -2375,11 +2437,20 @@ def build_user_profiles(
             continue
 
         channel_dir = archive_root / workspace / archived["name"]
-        with tempfile.TemporaryDirectory() as export_dir:
-            export_dir_path = Path(export_dir)
-            convert_fn(channel_dir, export_dir_path)
-            users_file = export_dir_path / "users.json"
-            raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
+        # sat-7k9: shares the per-channel lock with backup/dedupe - a
+        # locked channel marks this workspace "locked" (soft skip, like
+        # missing_archive above), not a hard failure.
+        try:
+            with channel_lock.channel_lock(channel_dir):
+                with tempfile.TemporaryDirectory() as export_dir:
+                    export_dir_path = Path(export_dir)
+                    convert_fn(channel_dir, export_dir_path)
+                    users_file = export_dir_path / "users.json"
+                    raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
+        except channel_lock.ChannelLockedError as exc:
+            print(f"export users: skipping {workspace} - {exc}", file=sys.stderr)
+            workspaces_out.append({"workspace": workspace, "status": "locked", "profiles": []})
+            continue
 
         profiles = [_clean_user(u) for u in raw_users]
         if handler is not None:
