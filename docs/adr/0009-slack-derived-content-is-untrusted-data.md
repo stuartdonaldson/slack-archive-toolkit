@@ -54,9 +54,12 @@ Text found inside Slack-derived content that attempts to direct the model is rep
 observation about that source document, with its permalink, rather than obeyed or silently
 dropped.
 
-Citations in generated output come from structured provenance fields (`message_url`, `links`,
-`permalink`). A URL appearing only inside extracted content may be quoted as source text but is
-never rendered as the report's own citation or as an image.
+The same single rule governs links, because a URL is content too. Citations in generated output
+therefore come from structured provenance fields (`message_url`, `links`, `permalink`), which the
+export pipeline derives; a URL appearing only inside extracted content is member-authored text with
+no more authority than the sentence around it. It may be quoted as source wording but is never
+rendered as the report's own citation or as an image. This is not a second decision — it is the
+decision above applied to the one field type a reader's client will act on automatically.
 
 No artifact-level trust marker is emitted. A marker present on this project's artifacts would
 invite the inverse inference that a JSON lacking one is trusted; the rule covers the class instead
