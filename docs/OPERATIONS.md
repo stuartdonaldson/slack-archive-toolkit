@@ -168,6 +168,48 @@ To force a scan of a specific workspace immediately:
 ./slackbackup channel register <workspace> '*' --channels-file channels.json
 ```
 
+### Stopping an in-progress run
+
+`scripts/stop-nightly-backup.sh` (bd `sat-b9b`) stops a running
+`nightly-backup-digest.sh` and verifies the stop, instead of hand-walking `ps`/`kill`
+across the wrapper, whichever `slackbackup` stage is active (`backup run` or
+`export digest`), and any orphaned `slackdump` child (archive/resume/dedupe/convert) —
+the wrapper doesn't propagate `SIGTERM` to that child itself.
+
+```bash
+./scripts/stop-nightly-backup.sh                 # defaults: wrapper at
+                                                   # scripts/nightly-backup-digest.sh,
+                                                   # archive root ~/slack-backups
+./scripts/stop-nightly-backup.sh --grace-seconds 10   # tune the SIGTERM grace window
+./scripts/stop-nightly-backup.sh --wrapper-script <path> --archive-root <dir>  # non-default paths
+```
+
+What it does, in order:
+
+1. Finds the running wrapper by its exact script path (not a name substring, which could
+   catch an unrelated process) — reports cleanly and exits 0 if none is running.
+2. Walks the full process tree under it by parentage (`pgrep -P`, recursively — not
+   `pgrep -f slackdump`, which risks matching an unrelated concurrent process),
+   captured *before* any signal is sent, since a dead parent's children are reparented
+   and no longer discoverable via their original parent.
+3. Sends `SIGTERM` to the wrapper, then to anything in the tree still alive after a
+   bounded poll (not a blind `sleep N`).
+4. Sends `SIGKILL` to anything still alive after a further bounded grace period
+   (`--grace-seconds`, default 5s per phase — ~15s worst case end to end).
+5. Verifies via `kill -0` that nothing in the tree remains, then scans every
+   `<workspace>/.<channel>.lock` file under the archive root
+   (`src/slackbackup/channel_lock.py`): a lock whose pid is still alive is flagged as a
+   live holder needing manual attention (should not normally happen right after this
+   script's own kill pass); a lock whose pid is dead is reported informationally and
+   left in place — reclaim-by-liveness (`channel_lock()`) handles it automatically on
+   the next use, so this script never deletes lock files.
+
+Prints one final `STATUS:` line: stopped cleanly (nothing was running, or `SIGTERM`
+alone was enough), force-killed (some process needed `SIGKILL`, but the run is
+confirmed fully stopped), or a live lock holder / a process that survived `SIGKILL` —
+either of which needs manual attention (exit codes 1 and 2 respectively; see the
+script's own `--help` for details).
+
 ### Tiered cadence (why most channels are "skipped" nightly)
 
 `backup run` no longer opens slackdump for every tracked channel each night. A cadence
