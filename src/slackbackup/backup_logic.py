@@ -416,13 +416,19 @@ def run(
             f"no channels in {channels_file} match {' and '.join(parts)}"
         )
 
-    # Warm each workspace's fast-tier catalog, but don't let one workspace with
-    # an expired session abort the whole multi-workspace run - skip it and carry
-    # on with the rest (its channels would only fail downstream anyway).
+    # Warm each workspace's fast- and full-tier catalog, but don't let one
+    # workspace with an expired session abort the whole multi-workspace run -
+    # skip it and carry on with the rest (its channels would only fail
+    # downstream anyway). Fast tier catches newly-joined-as-member channels
+    # (merge_fast is the only path that sets member=True); full tier fills in
+    # metadata (topic/purpose/creator/created) and discovers non-member public
+    # channels. refresh_full has its own TTL so calling it every run is safe -
+    # it no-ops when the cache is fresh.
     skipped_workspaces: dict[str, str] = {}
     for workspace in sorted({entry["workspace"] for entry in entries}):
         try:
             catalog_logic.refresh_fast(workspace, cache_dir=cache_dir)
+            catalog_logic.refresh_full(workspace, cache_dir=cache_dir)
         except slackdump.SlackdumpError as exc:
             _log(
                 f"backup run: skipping workspace '{workspace}' - catalog refresh failed "

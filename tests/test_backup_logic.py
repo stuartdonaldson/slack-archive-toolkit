@@ -415,12 +415,15 @@ def test_run_warms_fast_tier_catalog_once_per_distinct_workspace(tmp_path, monke
     ]))
 
     warmed = []
+    warmed_full = []
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: warmed.append(ws))
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: warmed_full.append(ws))
     monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "archive")
 
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
 
     assert sorted(warmed) == ["f3a", "f3b"]
+    assert sorted(warmed_full) == ["f3a", "f3b"]
 
 
 def test_run_continues_on_per_channel_failure_and_reports_overall_failure(tmp_path, monkeypatch):
@@ -440,6 +443,7 @@ def test_run_continues_on_per_channel_failure_and_reports_overall_failure(tmp_pa
         return "archive"
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", fake_backup_channel)
 
     all_ok = backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
@@ -469,6 +473,7 @@ def test_run_skips_locked_channel_and_continues(tmp_path, monkeypatch):
         return "archive"
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", fake_backup_channel)
 
     all_ok = backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
@@ -505,6 +510,7 @@ def test_run_skips_workspace_whose_catalog_refresh_fails_and_backs_up_the_rest(t
 
     attempted = []
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", fake_refresh)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(
         backup_logic, "backup_channel",
         lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append((ws, slug)) or "archive",
@@ -540,6 +546,7 @@ def test_run_processes_most_recently_active_channels_first(tmp_path, monkeypatch
 
     attempted = []
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(
         backup_logic, "backup_channel",
         lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append(slug) or "resume",
@@ -608,6 +615,7 @@ def test_run_interleaves_across_workspaces_instead_of_draining_one_first(tmp_pat
 
     attempted_workspaces = []
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(
         backup_logic, "backup_channel",
         lambda cid, slug, ws, root, full=False, cache_dir=None: attempted_workspaces.append(ws) or "archive",
@@ -623,6 +631,7 @@ def test_run_logs_a_final_summary(tmp_path, monkeypatch, capsys):
     channels_file.write_text(json.dumps([{"id": "C1", "name": "general", "workspace": "f3a"}]))
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "resume")
 
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
@@ -639,6 +648,7 @@ def test_run_log_lines_are_timestamped(tmp_path, monkeypatch, capsys):
     channels_file.write_text(json.dumps([{"id": "C1", "name": "general", "workspace": "f3a"}]))
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "resume")
 
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
@@ -788,6 +798,7 @@ def test_run_logs_per_workspace_progress_counter(tmp_path, monkeypatch, capsys):
     ]))
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "archive")
 
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache", today=TODAY)
@@ -818,6 +829,7 @@ def test_run_skips_dormant_channel_not_due_and_records_skip(tmp_path, monkeypatc
     )
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     # force this channel onto a non-due stagger night
     monkeypatch.setattr(backup_logic, "should_check_tonight", lambda entry, record, today: False)
 
@@ -845,6 +857,7 @@ def test_run_records_last_checked_and_last_action_for_checked_channel(tmp_path, 
     )
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "resume")
 
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=cache_dir, today=TODAY)
@@ -873,6 +886,7 @@ def test_run_full_resync_ignores_cadence_and_checks_everything(tmp_path, monkeyp
     )
 
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     # even if cadence would skip, -full must run
     monkeypatch.setattr(backup_logic, "should_check_tonight", lambda entry, record, today: False)
 
@@ -901,6 +915,7 @@ def _selector_channels_file(tmp_path):
 def _attempt_recorder(monkeypatch):
     attempted = []
     monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
     monkeypatch.setattr(
         backup_logic, "backup_channel",
         lambda cid, slug, ws, root, full=False, cache_dir=None: attempted.append((ws, slug)) or "archive",
