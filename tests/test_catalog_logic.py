@@ -113,6 +113,87 @@ def test_refresh_fast_calls_slackdump_when_cache_is_stale(tmp_path, monkeypatch)
     assert data["fast_refreshed_at"] == 1000.0
 
 
+def _seed_full_catalog(tmp_path, workspace, count):
+    """Pre-populate a catalog with `count` not-member channels, standing in
+    for an already-known-good full-tier cache."""
+    channels = [
+        {"id": f"C{i}", "name": f"chan{i}", "topic": {"value": ""}, "purpose": {"value": ""}}
+        for i in range(count)
+    ]
+    data = catalog_logic.merge_full(_fresh(), channels)
+    catalog_logic.save(tmp_path, workspace, data)
+
+
+def test_refresh_full_retries_on_truncated_response_then_accepts_recovery(tmp_path, monkeypatch):
+    _seed_full_catalog(tmp_path, "f3test", 6)
+    responses = iter([[CH1], [CH1], [CH1, CH2, CH3]])  # 1, 1, then a plausible 3-of-6
+
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: next(responses))
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["full_refreshed_at"] == 2000.0
+    assert "C1" in data["channels"]
+
+
+def test_refresh_full_does_not_stamp_when_still_truncated_after_retries(tmp_path, monkeypatch):
+    _seed_full_catalog(tmp_path, "f3test", 60)
+
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: [CH1])
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    # A silently-truncated response must not reset the TTL clock.
+    assert data["full_refreshed_at"] == 0.0
+    # But the (harmless, upsert-only) merge still happens.
+    assert "C1" in data["channels"]
+    assert len(data["channels"]) == 60
+
+
+def test_refresh_full_accepts_first_try_when_not_truncated(tmp_path, monkeypatch):
+    _seed_full_catalog(tmp_path, "f3test", 2)
+    calls = []
+
+    def fake_list_channels(member_only):
+        calls.append(member_only)
+        return [CH1, CH2, CH3]
+
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", fake_list_channels)
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["full_refreshed_at"] == 2000.0
+    assert len(calls) == 1
+
+
+def test_refresh_full_no_baseline_never_flags_truncation(tmp_path, monkeypatch):
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: [CH1])
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["full_refreshed_at"] == 2000.0
+
+
+def test_refresh_fast_does_not_stamp_when_still_truncated_after_retries(tmp_path, monkeypatch):
+    channels = [
+        {"id": f"C{i}", "name": f"chan{i}", "topic": {"value": ""}, "purpose": {"value": ""}}
+        for i in range(60)
+    ]
+    catalog_logic.save(tmp_path, "f3test", catalog_logic.merge_fast(_fresh(), channels))
+
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: [CH1])
+
+    data = catalog_logic.refresh_fast("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["fast_refreshed_at"] == 0.0
+
+
+def test_is_truncated_helper():
+    assert catalog_logic._is_truncated(5, 60) is True
+    assert catalog_logic._is_truncated(59, 60) is False
+    assert catalog_logic._is_truncated(0, 0) is False
+
+
 def test_lookup_falls_back_to_full_tier_on_fast_miss(tmp_path, monkeypatch):
     calls = []
 

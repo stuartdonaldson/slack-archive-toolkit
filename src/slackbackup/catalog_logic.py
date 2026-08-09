@@ -97,6 +97,52 @@ def merge_full(data: dict, channels: list[dict]) -> dict:
     return data
 
 
+_TRUNCATION_RETRIES = 3  # 1 initial attempt + 2 retries
+
+
+def _is_truncated(new_count: int, existing_count: int) -> bool:
+    """True if `new_count` looks implausibly smaller than what's already
+    cached (< 50%, per sat-dnr). Never flags anything when there's no prior
+    baseline to compare against — a first-ever refresh can't be "truncated"."""
+    return existing_count > 0 and new_count < existing_count * 0.5
+
+
+def _list_channels_guarded(
+    member_only: bool, existing_count: int, tier: str
+) -> tuple[list[dict], bool]:
+    """Calls slackdump.list_channels(), retrying up to `_TRUNCATION_RETRIES`
+    times if the result looks implausibly truncated against `existing_count`
+    (sat-dnr: a cold 'list channels -no-chan-cache' call has been observed
+    intermittently returning ~5 entries instead of the real count, exit 0,
+    nothing on stderr — an immediate retry of the identical command returned
+    the correct count). Returns (channels, still_truncated); still_truncated
+    is True only when every attempt looked truncated, so the caller can avoid
+    silently stamping the refresh timestamp on a bad result."""
+    channels: list[dict] = []
+    for attempt in range(1, _TRUNCATION_RETRIES + 1):
+        channels = slackdump.list_channels(member_only=member_only)
+        if not _is_truncated(len(channels), existing_count):
+            return channels, False
+        if attempt < _TRUNCATION_RETRIES:
+            print(
+                f"catalog: {tier}-tier list_channels returned only "
+                f"{len(channels)} channel(s), implausibly fewer than the "
+                f"{existing_count} already cached (attempt {attempt}/"
+                f"{_TRUNCATION_RETRIES}) — retrying...",
+                file=sys.stderr,
+            )
+    print(
+        f"catalog: WARNING — {tier}-tier list_channels still returned only "
+        f"{len(channels)} channel(s) after {_TRUNCATION_RETRIES} attempts, vs "
+        f"{existing_count} already cached; this looks like a truncated "
+        "response (see sat-dnr). Merging it anyway (a merge can only add "
+        f"channels, never remove one), but NOT stamping {tier}_refreshed_at "
+        "so the next run retries instead of trusting a full TTL cycle.",
+        file=sys.stderr,
+    )
+    return channels, True
+
+
 def refresh_fast(
     workspace: str,
     cache_dir: Path = DEFAULT_CACHE_DIR,
@@ -114,9 +160,13 @@ def refresh_fast(
         file=sys.stderr,
     )
     slackdump.select_workspace_or_die(workspace)
-    channels = slackdump.list_channels(member_only=True)
+    existing_count = sum(1 for ch in data["channels"].values() if ch["member"])
+    channels, truncated = _list_channels_guarded(
+        member_only=True, existing_count=existing_count, tier="fast"
+    )
     data = merge_fast(data, channels)
-    data["fast_refreshed_at"] = now
+    if not truncated:
+        data["fast_refreshed_at"] = now
     save(cache_dir, workspace, data)
     return data
 
@@ -140,9 +190,13 @@ def refresh_full(
         file=sys.stderr,
     )
     slackdump.select_workspace_or_die(workspace)
-    channels = slackdump.list_channels(member_only=False)
+    existing_count = len(data["channels"])
+    channels, truncated = _list_channels_guarded(
+        member_only=False, existing_count=existing_count, tier="full"
+    )
     data = merge_full(data, channels)
-    data["full_refreshed_at"] = now
+    if not truncated:
+        data["full_refreshed_at"] = now
     save(cache_dir, workspace, data)
     return data
 
