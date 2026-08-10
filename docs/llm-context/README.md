@@ -94,7 +94,7 @@ The canonical upload files were copied from the retired sources below during the
 | [uploads/f3-domain-context.md](uploads/f3-domain-context.md) | `docs/f3-culture.md` |
 | [prompts/newsletter.md](prompts/newsletter.md) | `docs/newsletter-prompt.md` |
 | [prompts/fng-getting-started.md](prompts/fng-getting-started.md) | `docs/fng-getting-started-prompt.md` |
-| [uploads/augmentations/f3-nation-operations.md](uploads/augmentations/f3-nation-operations.md) | F3-Nation role distinctions, operations, and diagnostic guidance. |
+| [uploads/augmentations/f3-nation-apps.md](uploads/augmentations/f3-nation-apps.md) | F3-Nation tools, administration boundaries, operations, and diagnostic guidance. |
 
 ## Maintenance rules
 

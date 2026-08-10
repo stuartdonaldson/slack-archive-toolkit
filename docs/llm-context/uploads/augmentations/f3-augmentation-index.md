@@ -11,11 +11,11 @@ automated source, but hand-maintained Markdown is the default and none are
 auto-generated today.
 
 Most files are a **single-snapshot** augmentation: one current state,
-re-collected and overwritten in place when re-verified (`f3-nation-operations.md`,
+re-collected and overwritten in place when re-verified (`f3-nation-apps.md`,
 `f3-nation-admins.md`). A file may instead be a **cumulative** augmentation
 that appends a new dated entry each time its source recurs, without
-superseding earlier entries (`sotn-transcripts.md`, for periodic call
-transcripts) — check each file's own header for which pattern it follows.
+superseding earlier entries (`sotn-summaries.md`, for periodic call
+summaries) — check each file's own header for which pattern it follows.
 
 Every file uses a stable name (not a dated filename) and carries its currency in a header block (`collected:`, `source:`, `collected_by:`, `fidelity:`, `coverage:`, `known_gaps:`, `refresh_trigger:`, `refresh_owner:`) so "any applicable dated augmentation" in the upload set is a lookup, not a judgment call. A cumulative file carries one header block per entry instead of one for the whole file.
 
@@ -27,9 +27,9 @@ An augmentation file itself is operator-authored and trusted (ADR-0009). Raw thi
 
 | File | Covers | Collected |
 | --- | --- | --- |
-| [f3-nation-operations.md](f3-nation-operations.md) | F3-Nation Slack bot features, role/ownership distinctions, diagnostic routing | 2026-06-30 |
-| [sotn-transcripts.md](sotn-transcripts.md) | SLT State of the Nation call transcripts (cumulative — one entry per call) | 2026-07-30 (latest entry) |
-| [f3nation-pugetsound.md](f3nation-pugetsound.md) | F3-Nation Admin, Regional SLT, AO Locations Description and Time and Site-Q — live-pulled from `api.f3nation.com`, superseded the earlier manually-extracted `f3-nation-admins.md` (retired: narrower scope - admin only, no Redmond - and staler by five weeks) | 2026-08-07 |
+| [f3-nation-apps.md](f3-nation-apps.md) | F3-Nation tools (including org.f3nation.com/map.f3nation.com/pax-vault.f3nation.com data sources and edit paths), Slack bot features, role/ownership distinctions, and diagnostic routing | 2026-08-10 |
+| [sotn-summaries.md](sotn-summaries.md) | Hand-compiled SLT State of the Nation call summaries (cumulative — one entry per call; raw transcripts are under `sources/`) | 2026-07-30 (latest entry) |
+| [f3-nation-pugetsound.md](f3-nation-pugetsound.md) | F3-Nation Admin, Regional SLT, AO Locations Description and Time and Site-Q — live-pulled from `api.f3nation.com`| 2026-08-10 |
 
 ## Archive
 
@@ -52,6 +52,6 @@ for how to rank and report a disagreement rather than resolve it.
 
 ## Maintenance
 
-- Update a roster or operations file by editing its Markdown table/content and header block together.
+- Update a roster or app-operations file by editing its Markdown table/content and header block together.
 - Update the `collected:` date whenever the underlying facts are re-verified, even if unchanged.
 - Generate a JSON derivative only for a demonstrated automated consumer; generate it from the reviewed Markdown, never hand-edit both.
