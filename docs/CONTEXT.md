@@ -94,7 +94,8 @@ against this vision, not an accepted shortcut.
 - **Cross-workspace digest** (`export digest`) — one merged, chronological JSON document
   covering the trailing 180 days by default (or a different N via `--days`) across every
   workspace matching a glob or comma-separated selector list, enriched with
-  per-channel context, non-image file/Canvas content, and both inferred leadership roles and
+  per-channel context, non-image file/Canvas metadata (extracted text lives in the companion
+  `files_out` sidecar as of schema v4, not inline), and both inferred leadership roles and
   authoritative Slack account roles — designed as direct LLM input, e.g. for a newsletter
   prompt. Also carries precomputed per-channel and per-workspace activity counts (message/
   reply/participant counts, active-vs-inactive status, most-active channel with a bot-excluded
@@ -103,10 +104,14 @@ against this vision, not an accepted shortcut.
 - **User profile export** (`export users`) — full per-workspace user roster with `slack_roles`
   (admin/owner/bot/etc.) — see `docs/DESIGN-export.md`.
 - **Report jobs** (`export digest --jobs 'jobs/*.json'`) — drive one or more digests (each with an
-  optional companion user roster) from operator-owned, gitignored `jobs/*.json` files that fully
-  specify their own archive root, channels file, workspaces, day window, output path
-  (`{as_of}`-templated), and leadership handler — instead of command-line flags. Wired into the
-  nightly script; F3 leadership tagging is pluggable per job — see `docs/DESIGN-export.md`.
+  optional companion user roster and/or companion `files_out` sidecar) from operator-owned,
+  gitignored `jobs/*.json` files that fully specify their own archive root, channels file,
+  workspaces, day window, output path (`{as_of}`-templated), and leadership handler — instead of
+  command-line flags. `files_out`, when set, is a cumulative document (merged across runs, not
+  bounded by the digest's own day window) carrying each channel file's extracted text plus
+  change-detection fields (`content_sha256`, `content_changed_at`) and, for Canvases, an edit
+  history parsed from Slack's own `tabbed_canvas_updated` notices. Wired into the nightly script;
+  F3 leadership tagging is pluggable per job — see `docs/DESIGN-export.md`.
 - **Untracked-channel digest** (`channel-digest run`) — an on-demand tool that archives every
   channel matching an fnmatch glob (e.g. `shuttered-*`) and writes a single merge-aware JSON
   digest of surviving messages/files/orphaned Canvases — for recovering content from channels
@@ -119,6 +124,13 @@ against this vision, not an accepted shortcut.
 - **Canvas/file catalog** — designed (`docs/DESIGN-files.md`) but **not yet ported to Python**;
   the shell implementation (`scripts/fetch-files.sh`, `scripts/build-file-index.sh`) is the only
   one that exists today.
+- **Bot-image backfill & gallery viewer** (`files gallery generate`) — F3 Nation's backblast/
+  preblast bot posts photos as Block Kit image blocks, not native Slack file uploads, so
+  `archive`/`resume` never captures them; `backup_channel` now backfills each not-yet-present
+  image into `<channel_dir>/__bot-images/` as a non-fatal post-step on every archive/resume.
+  `files gallery generate <workspace_dir>` scans those folders across a workspace and writes a
+  single self-contained `image-gallery.html`, thumbnails grouped by channel and sorted by
+  backblast date — see `docs/DESIGN-files.md`.
 
 ---
 

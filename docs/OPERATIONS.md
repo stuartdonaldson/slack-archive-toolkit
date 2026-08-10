@@ -125,11 +125,90 @@ window (nightly is comfortably inside the observed ~2–3 week expiry).
 ## Nightly Backup
 
 `scripts/nightly-backup-digest.sh` is invoked by a Windows Scheduled Task
-(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am. It runs the
-headless auth keep-alive (§4), then the auth pre-flight (§2), then `backup run`, then the
-digest / users / job-digest exports, appending everything to `~/slack-backups/nightly.log`.
-It deliberately does **not** `set -e`: a single workspace or channel failure — or the
-keep-alive itself — must not stop the rest of the run.
+(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am,
+appending everything to `~/slack-backups/nightly.log`. In order, each run:
+
+| # | Step | Notes |
+|---|------|-------|
+| 0 | Copy the canonical LLM context pack into `~/slack-exports/llm-context/` | Individually uploadable Project-knowledge files live under `docs/llm-context/uploads/`; `project-instructions.md` and `session-preamble.md` are pasted, while `prompts/*.md` are selected by an operator. [docs/llm-context/README.md](llm-context/README.md) is the upload and validation guide for both one-off sessions and ChatGPT Projects. The legacy per-file prompt/context docs were retired in `sat-ejk.5` per [ADR-0008](adr/0008-llm-context-pack-decomposition.md). Local edits made under `~/slack-exports/` **are overwritten every night** — edit the copy in `docs/` |
+| 1 | `scripts/auth-refresh/keepalive.sh` — headless credential keep-alive (§4) | Non-fatal; a hard logout still needs interactive `npm run refresh` |
+| 2 | `scripts/preflight-auth.sh channels.json` — stale-session banner (§2) | Informational, always exits 0 |
+| 3 | `./slackbackup channel register <one workspace> '*'` — pick up newly-created public channels | **One workspace per night**, rotating — see below |
+| 4 | `./slackbackup backup run channels.json ~/slack-backups` | Subject to the tiered cadence filter, below |
+| 5 | `./slackbackup export digest --jobs jobs/*.json` — one digest (plus optional user roster and `files_out` sidecar) per report job | Job files are gitignored; see `docs/DESIGN-export.md` §Report jobs |
+
+There is deliberately **no blanket `export digest` / `export users` step** any more: every real
+recipient is described by a job file in `jobs/`, and the blanket run duplicated that work at full
+cost. Both remain available as manual commands when needed.
+
+The script deliberately does **not** `set -e`: a single workspace or channel failure — or the
+keep-alive itself — must not stop the rest of the run. Each step's exit code is echoed into the
+log (`----- <step> exited N -----`) rather than acted on.
+
+### Nightly channel registration (all workspaces, every night)
+
+Step 3 exists because a newly-created public channel is otherwise invisible to the backup until a
+human notices and registers it by hand (the motivating case: `disc-it` went un-backed-up for weeks
+in `f3pugetsound`). `channel_logic.register_matching` already skips private, archived,
+`shuttered*`-named, and already-registered channels, so it only ever *adds*.
+
+The cost is the **full** (non-`-member-only`) catalog listing it must do per workspace to know
+what exists — flagged in `docs/references/slackdump-cli-notes.md` as potentially minutes per
+workspace and rate-limit-prone, with no cheaper "just the new ones" API. This originally motivated
+scanning only one workspace per night (`day-of-year mod <workspace count>`), re-scanning each
+roughly weekly. Measured in practice it's actually ~1.5–2 minutes per workspace, not "several" —
+cheap enough across all 9 registered workspaces that the script now scans every workspace every
+night (`./slackbackup channel register '*' '*'`), so a newly-created channel shows up in the very
+next run instead of waiting up to a week for its rotation slot. Already-registered lines are
+filtered out of the log to keep it readable.
+
+To force a scan of a specific workspace immediately:
+
+```bash
+./slackbackup channel register <workspace> '*' --channels-file channels.json
+```
+
+### Stopping an in-progress run
+
+`scripts/stop-nightly-backup.sh` (bd `sat-b9b`) stops a running
+`nightly-backup-digest.sh` and verifies the stop, instead of hand-walking `ps`/`kill`
+across the wrapper, whichever `slackbackup` stage is active (`backup run` or
+`export digest`), and any orphaned `slackdump` child (archive/resume/dedupe/convert) —
+the wrapper doesn't propagate `SIGTERM` to that child itself.
+
+```bash
+./scripts/stop-nightly-backup.sh                 # defaults: wrapper at
+                                                   # scripts/nightly-backup-digest.sh,
+                                                   # archive root ~/slack-backups
+./scripts/stop-nightly-backup.sh --grace-seconds 10   # tune the SIGTERM grace window
+./scripts/stop-nightly-backup.sh --wrapper-script <path> --archive-root <dir>  # non-default paths
+```
+
+What it does, in order:
+
+1. Finds the running wrapper by its exact script path (not a name substring, which could
+   catch an unrelated process) — reports cleanly and exits 0 if none is running.
+2. Walks the full process tree under it by parentage (`pgrep -P`, recursively — not
+   `pgrep -f slackdump`, which risks matching an unrelated concurrent process),
+   captured *before* any signal is sent, since a dead parent's children are reparented
+   and no longer discoverable via their original parent.
+3. Sends `SIGTERM` to the wrapper, then to anything in the tree still alive after a
+   bounded poll (not a blind `sleep N`).
+4. Sends `SIGKILL` to anything still alive after a further bounded grace period
+   (`--grace-seconds`, default 5s per phase — ~15s worst case end to end).
+5. Verifies via `kill -0` that nothing in the tree remains, then scans every
+   `<workspace>/.<channel>.lock` file under the archive root
+   (`src/slackbackup/channel_lock.py`): a lock whose pid is still alive is flagged as a
+   live holder needing manual attention (should not normally happen right after this
+   script's own kill pass); a lock whose pid is dead is reported informationally and
+   left in place — reclaim-by-liveness (`channel_lock()`) handles it automatically on
+   the next use, so this script never deletes lock files.
+
+Prints one final `STATUS:` line: stopped cleanly (nothing was running, or `SIGTERM`
+alone was enough), force-killed (some process needed `SIGKILL`, but the run is
+confirmed fully stopped), or a live lock holder / a process that survived `SIGKILL` —
+either of which needs manual attention (exit codes 1 and 2 respectively; see the
+script's own `--help` for details).
 
 ### Tiered cadence (why most channels are "skipped" nightly)
 
@@ -143,3 +222,24 @@ is far inside Slack's ~90-day retention, so a skipped channel that suddenly gets
 still re-checked while every post is live. To force a full sweep regardless of cadence, run
 `backup run` with `-f/--full`. To retune, edit the single `BACKUP_CADENCE_TIERS` constant.
 Deleting a workspace's catalog resets `last_checked`, so the next run checks everything once.
+
+### Recovering catalog recency after an interrupted run
+
+`backup run` stamps `last_posted`/`registered_at`/`last_checked` per channel as it goes, so an
+interrupted run leaves the catalog partially stale. `backup sync-catalog` rebuilds those recency
+fields from **local archives only** — no Slack API calls, safe to run any time:
+
+```bash
+./slackbackup backup sync-catalog channels.json ~/slack-backups
+```
+
+### The `files_out` sidecar is not disposable output
+
+Everything under `~/slack-exports/` is regenerable from the archive **except** a job's `files_out`
+sidecar. It is cumulative across runs: each run merges into the existing document and carries
+forward files whose source has since aged out of Slack's ~90-day retention or whose channel fell
+outside that run's selectors. Deleting it discards records the archive can no longer reproduce.
+A corrupt/unreadable sidecar is logged and treated as absent (the job still completes), which
+means a truncated file silently restarts the history — back it up with the digests, and check the
+`N files -> <path>` log line for an unexpected drop. See `docs/DESIGN-export.md` §`files_out`
+sidecar.

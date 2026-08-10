@@ -3,6 +3,7 @@ message ever archived (or the trailing N days, via --days) across every
 f3* workspace. Separate from test_export_logic.py (the per-channel-month
 exporter) - different schema, same underlying fixtures.
 """
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from slackbackup import catalog_logic, export_logic
+from slackbackup import catalog_logic, channel_lock, export_logic
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
 
@@ -127,6 +128,14 @@ def test_digest_message_url():
 def test_digest_channel_url():
     url = export_logic.digest_channel_url("f3pugetsound", "C123")
     assert url == "https://f3pugetsound.slack.com/archives/C123"
+
+
+def test_digest_channel_url_prefers_team_id_when_given():
+    # The workspace-subdomain archives/ link doesn't reliably route to the
+    # right workspace in every session; app.slack.com/client/<team_id>/...
+    # (what Slack's own "Copy link" on a channel actually generates) does.
+    url = export_logic.digest_channel_url("f3kirkland", "C0A6VSZ1DFB", "T0A3F37ETTP")
+    assert url == "https://app.slack.com/client/T0A3F37ETTP/C0A6VSZ1DFB"
 
 
 def test_select_messages_in_range_nests_threads_without_month_bucketing():
@@ -385,7 +394,7 @@ def test_build_digest_merges_across_workspaces_chronologically(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v3"
+    assert result["schema_version"] == "slack-llm-digest-v6"
     assert {c["workspace"] for c in result["channels"]} == {"f3pugetsound", "f3kirkland"}
 
     ts_values = [float(m["ts"]) for m in result["messages"]]
@@ -689,6 +698,25 @@ def test_extract_file_content_none_when_no_local_path():
     assert export_logic._extract_file_content("text/plain", None) is None
 
 
+def test_extract_file_content_never_reads_bytes_of_an_unsupported_mimetype(tmp_path, monkeypatch):
+    """sat-svu regression: the real OOM cause behind sat-811's repeated kill
+    wasn't cross-channel accumulation, it was this function calling
+    path.read_text() on every unsupported mimetype (images, video) before
+    checking whether it was even text-shaped - harmless for a small file, but
+    a several-hundred-MB video blob got fully decoded into memory just to be
+    discarded. Proven here by making read_text unreachable rather than by
+    provisioning an actual huge fixture file."""
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"fake video bytes")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("read_text must not be called for an unsupported mimetype")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+
+    assert export_logic._extract_file_content("video/mp4", path) is None
+
+
 _MINIMAL_PDF = b"""%PDF-1.4
 1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
 2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
@@ -817,6 +845,31 @@ def test_load_channel_files_returns_empty_for_malformed_or_missing_archive(tmp_p
     assert export_logic._load_channel_files(channel_dir) == []
 
 
+def _make_workspace_db(path: Path, team_id: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE WORKSPACE (ID INTEGER PRIMARY KEY, TEAM_ID TEXT)")
+    conn.execute("INSERT INTO WORKSPACE (TEAM_ID) VALUES (?)", (team_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_load_team_id_reads_workspace_table(tmp_path):
+    channel_dir = tmp_path / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    _make_workspace_db(channel_dir / "slackdump.sqlite", "T0A3F37ETTP")
+
+    assert export_logic._load_team_id(channel_dir) == "T0A3F37ETTP"
+
+
+def test_load_team_id_returns_none_for_malformed_or_missing_archive(tmp_path):
+    channel_dir = tmp_path / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    assert export_logic._load_team_id(channel_dir) is None  # no slackdump.sqlite at all
+
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")  # 0-byte placeholder
+    assert export_logic._load_team_id(channel_dir) is None
+
+
 def test_build_digest_includes_all_files_per_channel_images_and_non_image(tmp_path):
     archive_root = tmp_path / "archive"
     channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
@@ -859,6 +912,7 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
     catalog = catalog_logic.load(cache_dir, "f3pugetsound")
     catalog["channels"]["C1"] = {
         "member": True, "name": "helpdesk", "description": "Ask anything here",
+        "topic": "Read the pinned FAQ first", "purpose": "Ask anything here",
         "is_private": False, "is_archived": False, "creator": "U999", "created": 1700000000,
     }
     catalog_logic.save(cache_dir, "f3pugetsound", catalog)
@@ -869,6 +923,10 @@ def test_build_digest_enriches_channels_meta_from_catalog_cache(tmp_path):
     )
 
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    # topic and description (Slack's purpose, renamed to match Slack's UI
+    # label) are kept distinct - no merged field (dropped in v6, see
+    # ADR-0007) to collapse them
+    assert meta["topic"] == "Read the pinned FAQ first"
     assert meta["description"] == "Ask anything here"
     assert meta["creator"] == "U999"
     assert meta["created_at"] == "2023-11-14T22:13:20Z"
@@ -894,7 +952,7 @@ def test_build_digest_channel_context_is_none_when_catalog_never_warmed(tmp_path
     assert meta == {
         "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "ok",
         "channel_url": "https://f3pugetsound.slack.com/archives/C1", "files": [],
-        "description": None, "creator": None, "created_at": None,
+        "topic": None, "description": None, "creator": None, "created_at": None,
         "root_message_count": 5, "reply_count": 3, "total_message_count": 8, "participant_count": 7,
         "first_message_utc": "2026-04-10T09:00:00Z", "last_message_utc": "2026-06-05T12:00:00Z",
         "activity_status": "active", "activity_status_basis": "has messages during export_scope",
@@ -1068,10 +1126,39 @@ def test_build_digest_missing_archive_is_soft_skip(tmp_path):
         {
             "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "status": "missing_archive",
             "channel_url": "https://f3pugetsound.slack.com/archives/C1",
-            "files": [], "description": None, "creator": None, "created_at": None,
+            "files": [], "topic": None, "description": None, "creator": None, "created_at": None,
         }
     ]
     assert result["messages"] == []
+
+
+def test_build_digest_skips_locked_channel_and_continues(tmp_path):
+    # sat-7k9: export shares the per-channel lock with backup/dedupe, so it
+    # never reads a channel mid-write (e.g. mid-resume/dedupe). A locked
+    # channel is a soft skip (like missing_archive), not a hard failure -
+    # other channels must still get exported.
+    archive_root = tmp_path / "archive"
+    for ws in ("f3pugetsound", "f3kirkland"):
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
+    ]))
+
+    locked_channel_dir = archive_root / "f3kirkland" / "helpdesk"
+    with channel_lock.channel_lock(locked_channel_dir):
+        result = export_logic.build_digest(
+            channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+            catalog_cache_dir=tmp_path / "empty-cache",
+        )
+
+    statuses = {c["workspace"]: c["status"] for c in result["channels"]}
+    assert statuses == {"f3pugetsound": "ok", "f3kirkland": "locked"}
+    assert len(result["messages"]) > 0  # the unlocked channel's messages still made it in
 
 
 def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
@@ -1183,6 +1270,26 @@ def test_build_digest_channel_url_present_on_ok_channels(tmp_path):
     meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
     assert meta["channel_url"] == "https://f3pugetsound.slack.com/archives/C1"
     assert meta["status"] == "ok"
+
+
+def test_build_digest_channel_url_uses_team_id_when_workspace_table_present(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3kirkland" / "ao-ruck-mountain"
+    channel_dir.mkdir(parents=True)
+    _make_workspace_db(channel_dir / "slackdump.sqlite", "T0A3F37ETTP")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C0A6VSZ1DFB", "name": "ao-ruck-mountain", "workspace": "f3kirkland"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C0A6VSZ1DFB")
+    assert meta["channel_url"] == "https://app.slack.com/client/T0A3F37ETTP/C0A6VSZ1DFB"
 
 
 def test_build_digest_channel_url_present_on_missing_archive_channels(tmp_path):
@@ -1730,7 +1837,7 @@ def test_build_digest_emits_top_level_mentions_index(tmp_path):
         catalog_cache_dir=tmp_path / "empty-cache",
     )
 
-    assert result["schema_version"] == "slack-llm-digest-v3"
+    assert result["schema_version"] == "slack-llm-digest-v6"
     assert isinstance(result["mentions"], dict)
     assert "mentions_index" in result["manifest"]["counting_rules"]
 
@@ -1793,7 +1900,7 @@ def test_build_monthly_digests_stamps_month_on_export_scope(tmp_path):
 
     for month, doc in results.items():
         assert doc["export_scope"]["month"] == month
-        assert doc["schema_version"] == "slack-llm-digest-v3"
+        assert doc["schema_version"] == "slack-llm-digest-v6"
 
 
 def test_build_monthly_digests_recomputes_channel_activity_per_month(tmp_path):
@@ -1831,3 +1938,776 @@ def test_build_monthly_digests_matches_build_digest_totals(tmp_path):
     total_roots = sum(len(doc["messages"]) for doc in monthly.values())
     assert total_roots == len(full["messages"])
     assert sorted(monthly) == ["2026-04", "2026-05", "2026-06"]
+
+
+# --- sat-811 Phase 1: files_out sidecar (schema v4) ---
+
+
+def test_digest_file_view_strips_content_and_blob_fields_keeps_archive_status():
+    """archive_status moves INTO the digest (sat-4uf) so has_content: false
+    is self-explanatory without a sidecar lookup - only the extracted text
+    itself and its sidecar-only provenance fields stay sidecar-only."""
+    full = {
+        "id": "F1", "name": "notes.txt", "content": "hello", "content_sha256": "abc",
+        "archive_status": "content_extracted", "blob_captured_at": "2026-01-01T00:00:00Z",
+    }
+    view = export_logic._digest_file_view(full)
+    assert "content" not in view
+    assert "content_sha256" not in view
+    assert "blob_captured_at" not in view
+    assert view["archive_status"] == "content_extracted"
+    assert view["has_content"] is True
+    assert view["id"] == "F1"
+
+
+def test_digest_file_view_has_content_false_when_content_is_none():
+    view = export_logic._digest_file_view({"id": "F1", "content": None})
+    assert view["has_content"] is False
+
+
+def test_build_digest_channel_files_lose_content_but_gain_has_content(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<p>Coverage needed.</p>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    canvas = next(f for f in meta["files"] if f["id"] == "F05KESM0B7C")
+    image = next(f for f in meta["files"] if f["id"] == "F0BBJTND1KR")
+    assert "content" not in canvas
+    assert canvas["has_content"] is True
+    assert canvas["archive_status"] == "content_extracted"
+    assert image["has_content"] is False
+    # sat-4uf: has_content: false is self-explanatory from the digest alone -
+    # no sidecar lookup needed to learn why (blob never downloaded here).
+    assert image["archive_status"] == "no_blob"
+
+
+def test_load_channel_files_sets_content_sha256_and_archive_status(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    upload_dir = channel_dir / "__uploads" / "F05KESM0B7C"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "Upcoming_Q_Schedule").write_text("<p>Coverage needed.</p>")
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE, IMAGE_FILE])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    canvas = next(f for f in files if f["id"] == "F05KESM0B7C")
+    image = next(f for f in files if f["id"] == "F0BBJTND1KR")
+    assert canvas["archive_status"] == "content_extracted"
+    assert canvas["content_sha256"] == hashlib.sha256(canvas["content"].encode("utf-8")).hexdigest()
+    assert image["archive_status"] == "no_blob"  # blob never downloaded in this fixture
+    assert image["content_sha256"] is None
+
+
+def test_load_channel_files_archive_status_tombstone_when_mode_is_tombstone(tmp_path):
+    channel_dir = tmp_path / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    tombstoned = {**CANVAS_FILE, "id": "FDEAD1", "mode": "tombstone"}
+    _make_file_db(channel_dir / "slackdump.sqlite", [tombstoned])
+
+    files = export_logic._load_channel_files(channel_dir)
+
+    assert files[0]["archive_status"] == "tombstone"
+
+
+# --- sat-4uf: routine unsupported-media classification and the files_out
+# sidecar inclusion rule (slack-llm-files-v2) ---
+
+
+def test_is_ordinary_unsupported_media_true_for_image_video_audio_mimetypes():
+    assert export_logic._is_ordinary_unsupported_media("image/jpeg", "jpg") is True
+    assert export_logic._is_ordinary_unsupported_media("video/quicktime", "mov") is True
+    assert export_logic._is_ordinary_unsupported_media("audio/mpeg", "mp3") is True
+
+
+def test_is_ordinary_unsupported_media_false_for_pdf_and_unrecognized_mimetypes():
+    assert export_logic._is_ordinary_unsupported_media("application/pdf", "pdf") is False
+    assert export_logic._is_ordinary_unsupported_media("application/octet-stream", "bin") is False
+
+
+def test_is_ordinary_unsupported_media_falls_back_to_filetype_when_mimetype_missing():
+    assert export_logic._is_ordinary_unsupported_media(None, "heic") is True
+    assert export_logic._is_ordinary_unsupported_media("", "mp4") is True
+    assert export_logic._is_ordinary_unsupported_media(None, "pdf") is False
+    assert export_logic._is_ordinary_unsupported_media(None, None) is False
+
+
+def test_sidecar_worth_keeping_true_for_content_extracted_regardless_of_mimetype():
+    entry = {"archive_status": "content_extracted", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_true_for_tombstone_regardless_of_mimetype():
+    entry = {"archive_status": "tombstone", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_false_for_no_blob_ordinary_media():
+    entry = {"archive_status": "no_blob", "mimetype": "image/jpeg", "filetype": "jpg"}
+    assert export_logic._sidecar_worth_keeping(entry) is False
+
+
+def test_sidecar_worth_keeping_false_for_unsupported_type_ordinary_media():
+    entry = {"archive_status": "unsupported_type", "mimetype": "video/quicktime", "filetype": "mov"}
+    assert export_logic._sidecar_worth_keeping(entry) is False
+
+
+def test_sidecar_worth_keeping_true_for_no_blob_non_media_mimetype():
+    """A PDF that never downloaded is exceptional - it should have had
+    extractable text - unlike an ordinary image with no blob."""
+    entry = {"archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf"}
+    assert export_logic._sidecar_worth_keeping(entry) is True
+
+
+def test_sidecar_worth_keeping_true_when_archive_status_missing():
+    """Conservative default for entries with no archive_status set at all
+    (e.g. synthetic/older callers) - unknown is kept, not treated as routine."""
+    assert export_logic._sidecar_worth_keeping({"id": "F1"}) is True
+
+
+def _canvas_update_message(ts: str, editor_text: str, file_id: str) -> dict:
+    return {
+        "type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": ts,
+        "blocks": [
+            {"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": f"{editor_text} made updates to a canvas tab: "},
+                    {"type": "canvas", "Raw": json.dumps({"type": "canvas", "file_id": file_id})},
+                ]},
+            ]},
+        ],
+    }
+
+
+def test_parse_canvas_update_message_extracts_editor_and_file_id():
+    msg = _canvas_update_message("1780000000.000100", "Daniel Hüsch", "F05KESM0B7C")
+    parsed = export_logic._parse_canvas_update_message(msg)
+    assert parsed == {"file_id": "F05KESM0B7C", "editor_name": "Daniel Hüsch", "ts": "1780000000.000100"}
+
+
+def test_parse_canvas_update_message_unwraps_double_wrapped_raw_from_slackdump_export():
+    """Regression: `slackdump convert -f export` has no native struct for
+    this rich_text sub-element, so it round-trips it through its own
+    generic {"type":..., "Raw": <json-string>} wrapper on top of whatever
+    was already in the archive - observed 2 levels deep on a real
+    f3nation message (sat-811 §9), not the 1 level a raw sqlite row
+    shows."""
+    double_wrapped = {
+        "type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": "1780000000.000100",
+        "blocks": [
+            {"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "James Carroll made updates to a canvas tab: "},
+                    {"type": "canvas", "Raw": json.dumps({
+                        "type": "canvas",
+                        "Raw": json.dumps({"type": "canvas", "file_id": "F0A7R2GS743"}),
+                    })},
+                ]},
+            ]},
+        ],
+    }
+    parsed = export_logic._parse_canvas_update_message(double_wrapped)
+    assert parsed == {"file_id": "F0A7R2GS743", "editor_name": "James Carroll", "ts": "1780000000.000100"}
+
+
+def test_parse_canvas_update_message_none_for_other_subtypes():
+    assert export_logic._parse_canvas_update_message({"subtype": "channel_join", "ts": "1.0"}) is None
+
+
+def test_parse_canvas_update_message_none_when_block_shape_unrecognized():
+    msg = {"type": "message", "subtype": "tabbed_canvas_updated", "user": "USLACKBOT", "ts": "1.0", "blocks": []}
+    assert export_logic._parse_canvas_update_message(msg) is None
+
+
+def test_resolve_canvas_event_resolves_single_editor_unambiguously():
+    profiles = {"U1": {"id": "U1", "real_name": "Daniel Hüsch"}}
+    event = {"ts": "1780000000.000100", "editor_name": "Daniel Hüsch", "channel": "ao-book-club", "channel_id": "C1"}
+    resolved = export_logic._resolve_canvas_event(event, profiles)
+    assert resolved["editor_user_id"] == "U1"
+    assert resolved["editor_match_confidence"] == "high"
+    assert resolved["message_ts"] == "1780000000.000100"
+
+
+def test_resolve_canvas_event_never_guesses_compound_editor():
+    profiles = {"U1": {"id": "U1", "real_name": "Daniel Hüsch"}, "U2": {"id": "U2", "real_name": "Justin Kinney"}}
+    event = {
+        "ts": "1780000000.000100", "editor_name": "Daniel Hüsch and Justin Kinney",
+        "channel": "ao-book-club", "channel_id": "C1",
+    }
+    resolved = export_logic._resolve_canvas_event(event, profiles)
+    assert "editor_user_id" not in resolved
+    assert "editor_match_confidence" not in resolved
+    assert resolved["editor_name"] == "Daniel Hüsch and Justin Kinney"
+
+
+def _canvas_update_convert_fn(channel_dir: Path, out_dir: Path) -> None:
+    """A convert_fn stand-in producing one human root message plus one
+    tabbed_canvas_updated system message referencing CANVAS_FILE."""
+    out = out_dir / channel_dir.name
+    out.mkdir(parents=True)
+    (out_dir / "users.json").write_text(json.dumps([
+        {"id": "U1", "name": "daniel", "real_name": "Daniel Hüsch", "profile": {"display_name": "Daniel"}},
+    ]))
+    (out / "2026-06-02.json").write_text(json.dumps([
+        {"type": "message", "user": "U1", "ts": "1780387200.000100", "text": "morning post"},
+        _canvas_update_message("1780387300.000100", "Daniel Hüsch", CANVAS_FILE["id"]),
+    ]))
+
+
+def test_gather_digest_data_strips_canvas_update_messages_and_fixes_counts(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert all(m.get("subtype") != "tabbed_canvas_updated" for m in result["messages"])
+    meta = next(c for c in result["channels"] if c["channel_id"] == "C1")
+    assert meta["root_message_count"] == 1  # the canvas notice no longer counts
+    assert meta["participant_count"] == 1  # USLACKBOT excluded
+
+
+def test_gather_digest_data_files_out_sink_collects_content_and_modification_history(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    sink: list[dict] = []
+    export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        catalog_cache_dir=tmp_path / "empty-cache", files_out_sink=sink,
+    )
+
+    entry = next(f for f in sink if f["id"] == CANVAS_FILE["id"])
+    assert entry["workspace"] == "f3pugetsound"
+    assert entry["channel_id"] == "C1"
+    assert entry["modification_history_completeness"] == "partial"
+    event = entry["modification_history"][0]
+    assert event["editor_name"] == "Daniel Hüsch"
+    assert event["editor_user_id"] == "U1"
+    assert event["message_ts"] == "1780387300.000100"
+
+
+def test_merge_files_out_first_run_stamps_first_seen_at_no_content_changed(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert doc["schema_version"] == "slack-llm-files-v2"
+    assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] is None
+
+
+def test_merge_files_out_carries_forward_first_seen_at_unchanged_content(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] is None
+
+
+def test_merge_files_out_stamps_content_changed_at_when_sha_differs(tmp_path):
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "xyz"}]
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+    assert doc["files"][0]["content_changed_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_merge_files_out_last_modified_at_is_max_of_modification_history():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "modification_history": [{"at": "2026-03-01T00:00:00Z"}, {"at": "2026-07-01T00:00:00Z"}],
+    }]
+    doc = export_logic.merge_files_out(entries, None, "2026-07-02T00:00:00Z")
+    assert doc["files"][0]["last_modified_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_merge_files_out_is_additive_carries_forward_entry_out_of_this_runs_scan():
+    """A file recorded in a prior run but absent from this run's entries
+    (channel fell outside a --workspace/--channel selector, its 90-day
+    Slack retention window expired, or its archive is transiently
+    missing) stays in the sidecar unchanged rather than being dropped -
+    the sidecar must not destroy its own record of a file Slack has
+    already destroyed."""
+    entries: list[dict] = []  # nothing seen this run - e.g. a narrow --channel selector
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert len(doc["files"]) == 1
+    assert doc["files"][0] == previous["files"][0]  # carried forward byte-for-byte
+
+
+def test_merge_files_out_skips_malformed_prior_entries():
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+    previous = {"files": [
+        {"id": "F2"},  # missing workspace/channel_id - malformed, must not raise or leak into output
+        "not-a-dict",
+        {"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc",
+         "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None},
+    ]}
+
+    doc = export_logic.merge_files_out(entries, previous, "2026-07-01T00:00:00Z")
+
+    assert [f["id"] for f in doc["files"]] == ["F1"]
+    assert doc["files"][0]["first_seen_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_merge_files_out_ignores_non_dict_previous_sidecar():
+    entries = [{"workspace": "f3pugetsound", "channel_id": "C1", "id": "F1", "content_sha256": "abc"}]
+
+    doc = export_logic.merge_files_out(entries, "garbage", "2026-07-01T00:00:00Z")
+
+    assert doc["files"][0]["first_seen_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_merge_files_out_drops_routine_media_entry_from_this_runs_entries():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "unsupported_type", "mimetype": "image/jpeg", "filetype": "jpg",
+    }]
+
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == []
+
+
+def test_merge_files_out_keeps_non_media_no_blob_entry_from_this_runs_entries():
+    entries = [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf",
+    }]
+
+    doc = export_logic.merge_files_out(entries, None, "2026-07-01T00:00:00Z")
+
+    assert [f["id"] for f in doc["files"]] == ["F1"]
+
+
+def test_merge_files_out_prunes_routine_media_entry_carried_from_previous_sidecar():
+    """sat-4uf: the sidecar self-cleans on merge - a legacy image/video/audio
+    no_blob/unsupported_type record from before this change drops out the
+    next time the sidecar is written, even though nothing this run touches
+    that file (it's out of this run's --workspace/--channel scope)."""
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "unsupported_type", "mimetype": "image/jpeg", "filetype": "jpg",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out([], previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == []
+
+
+def test_merge_files_out_still_carries_forward_non_media_entry_out_of_scope():
+    previous = {"files": [{
+        "workspace": "f3pugetsound", "channel_id": "C1", "id": "F1",
+        "archive_status": "no_blob", "mimetype": "application/pdf", "filetype": "pdf",
+        "first_seen_at": "2026-01-01T00:00:00Z", "content_changed_at": None,
+    }]}
+
+    doc = export_logic.merge_files_out([], previous, "2026-07-01T00:00:00Z")
+
+    assert doc["files"] == previous["files"]
+
+
+# --- consistency metrics (sat-ejk.6: deterministic referential-integrity
+# counts over the digest's own channels/messages/user_index) ---
+
+
+def test_compute_consistency_counts_duplicate_channel_ids():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": []},
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": []},
+        {"workspace": "f3pugetsound", "channel_id": "C2", "files": []},
+        {"workspace": "f3kirkland", "channel_id": "C1", "files": []},  # different workspace, not a duplicate
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["channel_id_duplicate_count"] == 1
+
+
+def test_compute_consistency_file_reference_and_has_content_split():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True},
+            {"id": "F2", "has_content": False},
+            {"id": "F3", "has_content": False},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["file_reference_count"] == 3
+    assert result["file_has_content_true_count"] == 1
+    assert result["file_has_content_false_count"] == 2
+
+
+def test_compute_consistency_file_archive_status_counts():
+    """sat-4uf: has_content's true/false split doesn't say *why* a file has
+    no content - archive_status_counts breaks that out so a consumer can
+    tell routine unsupported media apart from an exceptional failure
+    without re-deriving it from individual file entries."""
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "archive_status": "content_extracted"},
+            {"id": "F2", "has_content": False, "archive_status": "unsupported_type"},
+            {"id": "F3", "has_content": False, "archive_status": "unsupported_type"},
+            {"id": "F4", "has_content": False, "archive_status": "no_blob"},
+            {"id": "F5", "has_content": False, "archive_status": "tombstone"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, [], {})
+
+    assert result["file_archive_status_counts"] == {
+        "content_extracted": 1, "unsupported_type": 2, "no_blob": 1, "tombstone": 1,
+    }
+
+
+def test_compute_consistency_file_message_ts_matched_against_digest_messages():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "message_ts": "1000.0001"},  # matches the root below
+            {"id": "F2", "has_content": False, "message_ts": "9999.0001"},  # no matching message
+            {"id": "F3", "has_content": False},  # no message_ts at all - not counted as present
+        ]},
+    ]
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "replies": [
+            {"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, messages_slice, {})
+
+    assert result["file_message_ts_present_count"] == 2
+    assert result["file_message_ts_matched_count"] == 1
+    assert result["file_message_ts_unmatched_count"] == 1
+
+
+def test_compute_consistency_file_message_ts_matches_a_reply_too():
+    channels_out = [
+        {"workspace": "f3pugetsound", "channel_id": "C1", "files": [
+            {"id": "F1", "has_content": True, "message_ts": "1000.0002"},  # matches the reply, not the root
+        ]},
+    ]
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "replies": [
+            {"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"},
+        ]},
+    ]
+
+    result = export_logic._compute_consistency(channels_out, messages_slice, {})
+
+    assert result["file_message_ts_matched_count"] == 1
+    assert result["file_message_ts_unmatched_count"] == 0
+
+
+def test_compute_consistency_in_scope_false_orphan_flags_a_parent_with_no_replies():
+    # select_messages_in_range never actually produces this shape (an
+    # in_scope: false parent always carries the reply that pulled it in) -
+    # this exercises the sanity check as an invariant, not a reachable
+    # real-world case.
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "in_scope": False},
+    ]
+
+    result = export_logic._compute_consistency([], messages_slice, {})
+
+    assert result["in_scope_false_orphan_count"] == 1
+
+
+def test_compute_consistency_in_scope_false_with_replies_is_not_an_orphan():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "in_scope": False,
+         "replies": [{"ts": "1000.0002", "workspace": "f3pugetsound", "channel_id": "C1"}]},
+    ]
+
+    result = export_logic._compute_consistency([], messages_slice, {})
+
+    assert result["in_scope_false_orphan_count"] == 0
+
+
+def test_compute_consistency_mention_unresolved_against_user_index():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "mentions": ["U1", "U2"]},
+    ]
+    user_index = {"f3pugetsound": {"U1": {"display_name": "Al", "is_bot": False}}}
+
+    result = export_logic._compute_consistency([], messages_slice, user_index)
+
+    assert result["mention_unresolved_count"] == 1
+
+
+def test_compute_consistency_mention_resolved_when_present_in_user_index():
+    messages_slice = [
+        {"ts": "1000.0001", "workspace": "f3pugetsound", "channel_id": "C1", "mentions": ["U1"]},
+    ]
+    user_index = {"f3pugetsound": {"U1": {"display_name": "Al", "is_bot": False}}}
+
+    result = export_logic._compute_consistency([], messages_slice, user_index)
+
+    assert result["mention_unresolved_count"] == 0
+
+
+def test_compute_consistency_includes_interpretation_notes():
+    result = export_logic._compute_consistency([], [], {})
+
+    assert "scope" in result["notes"]
+    assert "in_scope_false_orphan_count" in result["notes"]
+    assert "mention_unresolved_count" in result["notes"]
+    assert "file_message_ts_unmatched_count" in result["notes"]
+
+
+def test_build_digest_emits_consistency_block(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "helpdesk"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+    ]))
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert result["consistency"]["channel_id_duplicate_count"] == 0
+    assert result["consistency"]["in_scope_false_orphan_count"] == 0
+    assert "consistency" in result["manifest"]["counting_rules"]
+
+
+# --- sat-811 Phase 2 / sat-svu: month-sharded spill ---
+
+
+def _multi_channel_digest_setup(tmp_path, workspaces=("f3aaa", "f3bbb", "f3ccc")):
+    """Three channels (one per workspace, alphabetically-ordered to match
+    both channels.json's declaration order and the spill's glob-sorted
+    read-back order - see the parity test below) all backed by the same
+    3-month "helpdesk" fixture via _fake_convert, giving >=3 channels x
+    >=2 months from existing fixture data."""
+    archive_root = tmp_path / "archive"
+    entries = []
+    for ws in workspaces:
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+        entries.append({"id": f"C-{ws}", "name": "helpdesk", "workspace": ws})
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps(entries))
+    return channels_file, archive_root
+
+
+_STUB_PROFILES_DOC = {"schema_version": "slack-user-profiles-v1", "workspaces": []}
+
+
+def test_gather_and_shard_flushes_each_channel_before_converting_the_next(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+    shard_counts_before_convert: list[int] = []
+
+    def spy_convert(channel_dir: Path, out_dir: Path) -> None:
+        months_root = spill_dir / "months"
+        shards = list(months_root.glob("*/*.ndjson")) if months_root.exists() else []
+        shard_counts_before_convert.append(len(shards))
+        _fake_convert(channel_dir, out_dir)
+
+    # A precomputed (stub) profiles_doc so build_user_profiles' own
+    # one-conversion-per-workspace call doesn't interleave with (and
+    # confuse counting of) the per-channel conversions under test.
+    export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", spy_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir,
+    )
+
+    # Channel 1 converts before anything is spilled; channel 2 converts
+    # only after channel 1's shards already sit on disk; channel 3 only
+    # after both prior channels' shards do - proves the gather phase
+    # never holds more than one channel's messages resident at a time
+    # (each is flushed to disk and released before the next is read).
+    assert shard_counts_before_convert[0] == 0
+    assert shard_counts_before_convert[1] >= 1
+    assert shard_counts_before_convert[2] >= shard_counts_before_convert[1]
+
+
+def test_gather_and_shard_spill_layout_matches_design(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+
+    channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        tmp_path / "empty-cache", None, None, spill_dir,
+    )
+
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}
+    assert len(channels_meta) == 3
+    for month in months_seen:
+        shards = list((spill_dir / "months" / month).glob("*.ndjson"))
+        assert len(shards) >= 1
+    for ws in ("f3aaa", "f3bbb", "f3ccc"):
+        assert (spill_dir / "done" / f"{ws}__C-{ws}").exists()
+    assert (spill_dir / "files.ndjson").exists()
+
+
+def test_gather_and_shard_skips_locked_channel_and_continues(tmp_path):
+    # sat-7k9, same reasoning as build_digest's equivalent test.
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+
+    locked_channel_dir = archive_root / "f3bbb" / "helpdesk"
+    with channel_lock.channel_lock(locked_channel_dir):
+        channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+            channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+            tmp_path / "empty-cache", None, None, spill_dir,
+        )
+
+    statuses = {c["workspace"]: c["status"] for c in channels_meta}
+    assert statuses == {"f3aaa": "ok", "f3bbb": "locked", "f3ccc": "ok"}
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}  # unlocked channels still contributed
+
+
+def test_write_monthly_digests_matches_build_monthly_digests(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+
+    expected = export_logic.build_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache-a",
+    )
+
+    out_template = str(tmp_path / "streamed-{month}.json")
+    written = export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert, out_template,
+        catalog_cache_dir=tmp_path / "empty-cache-b",
+    )
+
+    assert sorted(p.name for p in written) == sorted(f"streamed-{month}.json" for month in expected)
+    assert sorted(expected) == ["2026-04", "2026-05", "2026-06"]
+    for month, expected_doc in expected.items():
+        streamed_doc = json.loads((tmp_path / f"streamed-{month}.json").read_text())
+        # generated_at is a live wall-clock timestamp on both sides -
+        # excluded from the comparison, everything else must match exactly.
+        assert {**streamed_doc, "generated_at": None} == {**expected_doc, "generated_at": None}
+
+
+def test_write_monthly_digests_uses_own_temporary_spill_dir_and_cleans_up(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    out_template = str(tmp_path / "streamed-{month}.json")
+
+    written = export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert, out_template,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    assert len(written) == 3
+    for path in written:
+        assert path.exists()
+    # No spill directory left behind in tmp_path itself (a fresh
+    # TemporaryDirectory elsewhere is used and removed on success).
+    assert not any(p.name == "spill" for p in tmp_path.iterdir())
+
+
+def test_write_monthly_digests_writes_files_out_sidecar_from_spill(tmp_path):
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3pugetsound" / "ao-active-book-club"
+    channel_dir.mkdir(parents=True)
+    _make_file_db(channel_dir / "slackdump.sqlite", [CANVAS_FILE])
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "ao-active-book-club", "workspace": "f3pugetsound"},
+    ]))
+
+    files_out_path = tmp_path / "files-out.json"
+    export_logic.write_monthly_digests(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
+        str(tmp_path / "streamed-{month}.json"), catalog_cache_dir=tmp_path / "empty-cache",
+        files_out_path=files_out_path,
+    )
+
+    doc = json.loads(files_out_path.read_text())
+    assert doc["schema_version"] == "slack-llm-files-v2"
+    entry = next(f for f in doc["files"] if f["id"] == CANVAS_FILE["id"])
+    assert entry["modification_history_completeness"] == "partial"
+    assert entry["modification_history"][0]["editor_name"] == "Daniel Hüsch"
+
+
+def test_gather_and_shard_resume_skips_done_channel_and_recovers_its_months(tmp_path):
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path, workspaces=("f3aaa", "f3bbb"))
+    spill_dir = tmp_path / "spill"
+
+    convert_calls: list[Path] = []
+
+    def counting_convert(channel_dir: Path, out_dir: Path) -> None:
+        convert_calls.append(channel_dir)
+        _fake_convert(channel_dir, out_dir)
+
+    export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", counting_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir,
+    )
+    assert len(convert_calls) == 2
+
+    # Simulate the first run having been interrupted right after f3aaa
+    # finished: drop f3bbb's done marker (and its shards, as a real crash
+    # mid-write would leave them incomplete/absent) so only f3aaa looks done.
+    (spill_dir / "done" / "f3bbb__C-f3bbb").unlink()
+    for shard in spill_dir.glob("months/*/f3bbb__C-f3bbb.ndjson"):
+        shard.unlink()
+
+    convert_calls.clear()
+    channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", counting_convert,
+        tmp_path / "empty-cache", None, _STUB_PROFILES_DOC, spill_dir, resume=True,
+    )
+
+    assert [c.parent.name for c in convert_calls] == ["f3bbb"]
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}
+    assert len(channels_meta) == 2

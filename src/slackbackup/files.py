@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from . import files_logic
+from . import files_logic, gallery_logic
 
 
 def register(groups: argparse._SubParsersAction) -> None:
@@ -55,6 +55,25 @@ def register(groups: argparse._SubParsersAction) -> None:
     p_list.add_argument("index_json")
     p_list.set_defaults(handler=_list)
 
+    p_gallery = sub.add_parser(
+        "gallery",
+        help="build an HTML thumbnail gallery of a workspace's harvested bot images",
+    )
+    gallery_sub = p_gallery.add_subparsers(dest="gallery_command", required=True)
+    p_gallery_generate = gallery_sub.add_parser(
+        "generate",
+        help="scan __bot-images/ folders under a workspace dir and write image-gallery.html",
+        epilog=(
+            "Example:\n  ./slackbackup files gallery generate ~/slack-backups/f3kirkland\n"
+            "Output: <workspace_dir>/image-gallery.html (default), thumbnails grouped by\n"
+            "channel, sorted by backblast date, with a small/medium/large size toggle."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_gallery_generate.add_argument("workspace_dir", type=Path)
+    p_gallery_generate.add_argument("--out", type=Path, default=None, help="output HTML path (default: <workspace_dir>/image-gallery.html)")
+    p_gallery_generate.set_defaults(handler=_gallery_generate)
+
 
 def _not_implemented(args: argparse.Namespace) -> int:
     raise NotImplementedError("files commands not yet ported from fetch-files.sh / build-file-index.sh")
@@ -72,4 +91,10 @@ def _list(args: argparse.Namespace) -> int:
     print("by context type:")
     for context_type, count in sorted(summary["by_context_type"].items()):
         print(f"  {context_type}: {count}")
+    return 0
+
+
+def _gallery_generate(args: argparse.Namespace) -> int:
+    out_path = gallery_logic.generate_gallery(args.workspace_dir, out_path=args.out)
+    print(f"wrote: {out_path}")
     return 0

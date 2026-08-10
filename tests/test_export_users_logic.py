@@ -6,7 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
-from slackbackup import export_logic
+from slackbackup import channel_lock, export_logic
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
 
@@ -104,6 +104,30 @@ def test_build_user_profiles_missing_archive_per_workspace(tmp_path):
     result = export_logic.build_user_profiles(channels_file, archive_root, "f3*", _fake_convert)
 
     assert result["workspaces"] == [{"workspace": "f3pugetsound", "status": "missing_archive", "profiles": []}]
+
+
+def test_build_user_profiles_locked_channel_marks_workspace_locked(tmp_path):
+    # sat-7k9: users.json conversion also shares the per-channel lock - a
+    # locked chosen channel marks that workspace "locked" (soft skip, like
+    # missing_archive) rather than failing the whole job.
+    archive_root = tmp_path / "archive"
+    for ws in ("f3pugetsound", "f3kirkland"):
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
+    ]))
+
+    with channel_lock.channel_lock(archive_root / "f3kirkland" / "helpdesk"):
+        result = export_logic.build_user_profiles(channels_file, archive_root, "f3*", _fake_convert)
+
+    workspaces = {w["workspace"]: w for w in result["workspaces"]}
+    assert workspaces["f3pugetsound"]["status"] == "ok"
+    assert workspaces["f3kirkland"] == {"workspace": "f3kirkland", "status": "locked", "profiles": []}
 
 
 def test_build_user_profiles_only_converts_one_channel_per_workspace(tmp_path):

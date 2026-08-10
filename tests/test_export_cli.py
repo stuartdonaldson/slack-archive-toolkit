@@ -11,7 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from slackbackup import export, export_logic
+from slackbackup import channel_lock, export, export_logic
+
+
+_SAMPLE_FILES_OUT_ENTRY = {
+    "workspace": "f3pugetsound", "channel": "helpdesk", "channel_id": "C1", "id": "F1",
+    "content": "hello", "content_sha256": "abc123",
+}
 
 
 def _write_job(path: Path, **fields) -> Path:
@@ -32,6 +38,8 @@ def _base_args(**overrides) -> argparse.Namespace:
         out=None,
         leadership_handler=None,
         split_by_month=False,
+        spill_dir=None,
+        resume=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -50,28 +58,47 @@ def _stub_profiles(monkeypatch, raise_for_glob=None):
 
     def fake_build_digest(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
-        catalog_cache_dir=None, handler=None, profiles_doc=None,
+        catalog_cache_dir=None, handler=None, profiles_doc=None, files_out_sink=None,
     ):
         fake_build_digest.calls.append(days)
+        if files_out_sink is not None:
+            files_out_sink.append(_SAMPLE_FILES_OUT_ENTRY)
         return {"channels": [], "messages": []}
 
-    def fake_build_monthly_digests(
-        channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
-        catalog_cache_dir=None, handler=None, profiles_doc=None,
+    def fake_write_monthly_digests(
+        channels_file, archive_root, workspace_glob, days, as_of, convert_fn, out_template,
+        catalog_cache_dir=None, handler=None, profiles_doc=None, files_out_path=None,
+        spill_dir=None, resume=False,
     ):
-        fake_build_monthly_digests.calls.append(days)
-        return {
+        fake_write_monthly_digests.calls.append(days)
+        fake_write_monthly_digests.spill_dirs.append(spill_dir)
+        fake_write_monthly_digests.resumes.append(resume)
+        written = []
+        for month, doc in {
             "2026-04": {"channels": [], "messages": [], "export_scope": {"month": "2026-04"}},
             "2026-05": {"channels": [], "messages": [], "export_scope": {"month": "2026-05"}},
-        }
+        }.items():
+            out_path = export_logic.resolve_job_out(out_template, as_of, month=month)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+            written.append(out_path)
+        if files_out_path is not None:
+            files_out_path.parent.mkdir(parents=True, exist_ok=True)
+            files_out_path.write_text(json.dumps({
+                "schema_version": "slack-llm-files-v2", "generated_at": f"{as_of}T00:00:00Z",
+                "files": [{**_SAMPLE_FILES_OUT_ENTRY, "first_seen_at": f"{as_of}T00:00:00Z", "content_changed_at": None}],
+            }))
+        return written
 
     fake_build_digest.calls = []
-    fake_build_monthly_digests.calls = []
+    fake_write_monthly_digests.calls = []
+    fake_write_monthly_digests.spill_dirs = []
+    fake_write_monthly_digests.resumes = []
 
     monkeypatch.setattr(export.export_logic, "build_user_profiles", fake_build_user_profiles)
     monkeypatch.setattr(export.export_logic, "build_digest", fake_build_digest)
-    monkeypatch.setattr(export.export_logic, "build_monthly_digests", fake_build_monthly_digests)
-    return fake_build_digest, fake_build_monthly_digests
+    monkeypatch.setattr(export.export_logic, "write_monthly_digests", fake_write_monthly_digests)
+    return fake_build_digest, fake_write_monthly_digests
 
 
 # --- Change 1: --days default of 180, and --jobs per-job fallback ---
@@ -199,30 +226,38 @@ def test_digest_split_by_month_rejects_out_without_month_placeholder(tmp_path, m
 
 
 def test_digest_split_by_month_writes_one_file_per_month(tmp_path, monkeypatch):
-    _, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    _, fake_write_monthly_digests = _stub_profiles(monkeypatch)
     out_template = str(tmp_path / "digest-{month}.json")
     args = _base_args(archive_root=str(tmp_path), out=out_template, split_by_month=True)
 
     exit_code = export._digest(args)
 
     assert exit_code == 0
-    assert fake_build_monthly_digests.calls == [180]
+    assert fake_write_monthly_digests.calls == [180]
     assert (tmp_path / "digest-2026-04.json").exists()
     assert (tmp_path / "digest-2026-05.json").exists()
 
 
 def test_digest_split_by_month_default_out_includes_month_placeholder(tmp_path, monkeypatch):
-    _, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    # Pre-existing test-hygiene bug (not previously caught): without this,
+    # the direct (--out-less) path falls through to export.DEFAULT_EXPORTS_DIR
+    # (~/slack-exports on a real machine) and this test actually wrote junk
+    # digest files there on every run.
+    monkeypatch.setattr(export, "DEFAULT_EXPORTS_DIR", tmp_path / "exports")
+    _, fake_write_monthly_digests = _stub_profiles(monkeypatch)
     args = _base_args(archive_root=str(tmp_path), split_by_month=True)
 
     exit_code = export._digest(args)
 
     assert exit_code == 0
-    assert fake_build_monthly_digests.calls == [180]
+    assert fake_write_monthly_digests.calls == [180]
+    assert (tmp_path / "exports" / "f3-digest-2026-07-01-2026-04.json").exists()
+    assert (tmp_path / "exports" / "f3-digest-2026-07-01-2026-05.json").exists()
+    assert not (Path.home() / "slack-exports" / "f3-digest-2026-07-01-2026-04.json").exists()
 
 
 def test_run_job_split_by_month_uses_build_monthly_digests(tmp_path, monkeypatch):
-    fake_build_digest, fake_build_monthly_digests = _stub_profiles(monkeypatch)
+    fake_build_digest, fake_write_monthly_digests = _stub_profiles(monkeypatch)
     job_file = _write_job(
         tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"], split_by_month=True,
         out=str(tmp_path / "job-out-{as_of}-{month}.json"),
@@ -232,7 +267,7 @@ def test_run_job_split_by_month_uses_build_monthly_digests(tmp_path, monkeypatch
 
     export._run_job(str(job_file), job, args, "2026-07-01")
 
-    assert fake_build_monthly_digests.calls == [180]
+    assert fake_write_monthly_digests.calls == [180]
     assert fake_build_digest.calls == []
     assert (tmp_path / "job-out-2026-07-01-2026-04.json").exists()
     assert (tmp_path / "job-out-2026-07-01-2026-05.json").exists()
@@ -242,3 +277,77 @@ def test_resolve_job_out_substitutes_month_placeholder():
     resolved = export_logic.resolve_job_out("~/exports/digest-{as_of}-{month}.json", "2026-07-01", month="2026-04")
 
     assert resolved.name == "digest-2026-07-01-2026-04.json"
+
+
+def test_run_job_writes_files_out_sidecar_when_job_sets_files_out(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(
+        tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"],
+        files_out=str(tmp_path / "job-files-{as_of}.json"),
+    )
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+
+    files_out_path = tmp_path / "job-files-2026-07-01.json"
+    assert files_out_path.exists()
+    doc = json.loads(files_out_path.read_text())
+    assert doc["schema_version"] == "slack-llm-files-v2"
+    assert doc["files"][0]["id"] == "F1"
+    assert doc["files"][0]["first_seen_at"] == doc["generated_at"]
+
+
+def test_run_job_omits_files_out_write_when_job_has_no_files_out_field(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"])
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+
+    assert list(tmp_path.glob("job-files-*.json")) == []
+
+
+def test_run_job_files_out_carries_forward_first_seen_at_across_runs(tmp_path, monkeypatch):
+    _stub_profiles(monkeypatch)
+    job_file = _write_job(
+        tmp_path / "job.json", archive_root=str(tmp_path), workspaces=["f3ok"],
+        files_out=str(tmp_path / "job-files-{as_of}.json"),
+    )
+    job = export_logic.load_job(job_file)
+    args = _base_args()
+
+    export._run_job(str(job_file), job, args, "2026-07-01")
+    first_seen_at = json.loads((tmp_path / "job-files-2026-07-01.json").read_text())["files"][0]["first_seen_at"]
+
+    export._run_job(str(job_file), job, args, "2026-07-02")
+    second_run = json.loads((tmp_path / "job-files-2026-07-02.json").read_text())["files"][0]
+
+    assert second_run["first_seen_at"] == first_seen_at
+    assert second_run["content_changed_at"] is None
+
+
+def test_monthly_returns_clean_error_when_channel_is_locked(tmp_path, monkeypatch):
+    # sat-7k9: single-channel export monthly is a one-shot manual CLI, not
+    # a batch loop, so a lock conflict has nowhere to "skip and continue"
+    # to - report it clearly and exit non-zero rather than crash or hang.
+    archive_root = tmp_path / "archive"
+    channel_dir = archive_root / "f3test" / "general"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    def _boom(channel_dir, out_dir):
+        raise AssertionError("convert_export must not run while the channel is locked")
+
+    monkeypatch.setattr(export.slackdump, "convert_export", _boom)
+
+    args = argparse.Namespace(
+        archive_root=str(archive_root), workspace="f3test", channel="general",
+        out=str(tmp_path / "out"), date_from=None, date_to=None,
+    )
+
+    with channel_lock.channel_lock(channel_dir):
+        rc = export._monthly(args)
+
+    assert rc != 0

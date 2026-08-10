@@ -65,6 +65,29 @@ monolithic file — check all of these, not just `docs/DESIGN.md`:
 | docs/DESIGN-files.md | Channel catalog + canvas/file harvesting — **designed, not yet implemented** |
 | docs/references/slackdump-cli-notes.md | slackdump CLI behavior/cost/gotchas — check before re-deriving anything about how slackdump itself behaves |
 
+A digest/profile/sidecar schema change (docs/DESIGN-export.md is the schema authority) requires
+a matching update to docs/llm-context/uploads/ingestion-contract.md — it is the consumer-facing restatement
+of that schema for the LLM context pack and must not drift from it (see
+docs/adr/0008-llm-context-pack-decomposition.md).
+
+## Before Implementing (interim, project-scoped)
+
+_Added 2026-08-09 per docs/lessons-learned/resolved/2026-08-09-subagent-dispatch-missed-related-code-search.md.
+This is a project-scoped interim mitigation, not the durable fix — the same root causes are
+tracked globally at /mnt/c/dev/DevStandard/docs/lessons-learned/2026-07-20-duplicated-call-site-logic-not-flagged-by-any-gate.md
+(a second, independent project hit the same gap; see that file's 2026-08-09 addendum). When that
+global work lands (implementation-gate / simplify skill update), re-derive whether this section is
+still needed or can be removed in favor of the upstream fix._
+
+- **Search before you write.** Before implementing new logic, grep this codebase for existing
+  functions/modules doing something similar (especially in the same file). If you find a close
+  match, extend/refactor it or explicitly note in the implementation why a separate function is
+  warranted — don't add a second copy of a pattern you can see and name.
+- **Review dispatched work before reporting it done.** When implementation work is delegated to a
+  subagent (background Agent dispatch), run this project's `code-review` (or `simplify`) skill
+  against the resulting diff before presenting that work to the user as complete. A subagent's own
+  "tests pass" self-report is not a substitute for an independent reuse/simplification pass.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 

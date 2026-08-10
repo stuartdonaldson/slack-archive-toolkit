@@ -21,7 +21,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import sys
 import tempfile
 import zipfile
 
@@ -33,7 +35,7 @@ from pathlib import Path
 from typing import Callable, AbstractSet
 from zoneinfo import ZoneInfo
 
-from . import catalog_logic, selector_logic
+from . import catalog_logic, channel_lock, selector_logic
 from .handlers import f3 as _default_handler
 
 _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -459,7 +461,17 @@ def trailing_days_range(days: int | None, as_of: str) -> tuple[str | None, str]:
     return from_date.isoformat(), as_of
 
 
-def digest_channel_url(workspace: str, channel_id: str) -> str:
+def digest_channel_url(workspace: str, channel_id: str, team_id: str | None = None) -> str:
+    """The workspace-subdomain form (https://<workspace>.slack.com/archives/
+    <channel_id>) does not reliably route to the right workspace in every
+    browser/app session; the app.slack.com/client/<team_id>/<channel_id>
+    form - what Slack's own "Copy link" on a channel actually generates -
+    does. Falls back to the subdomain form only when team_id isn't
+    available (e.g. a missing_archive channel with no local
+    slackdump.sqlite to read WORKSPACE.TEAM_ID from - see
+    _load_team_id)."""
+    if team_id:
+        return f"https://app.slack.com/client/{team_id}/{channel_id}"
     return f"https://{workspace}.slack.com/archives/{channel_id}"
 
 
@@ -468,16 +480,36 @@ def digest_message_url(workspace: str, channel_id: str, ts: str) -> str:
 
 
 def _channel_context(catalog: dict, channel_id: str) -> dict:
-    """description/creator/created_at for one channel, read-only from an
-    already-loaded catalog cache (no API call, no refresh - the digest
-    stays local-only; if the cache was never warmed for this channel, e.g.
-    a fresh checkout, these are just None rather than triggering a live
-    fetch). created_at is an ISO8601 string, not the raw epoch, matching
-    this module's posted_at_local convention elsewhere."""
+    """topic/description/creator/created_at for one channel, read-only
+    from an already-loaded catalog cache (no API call, no refresh - the
+    digest stays local-only; if the cache was never warmed for this
+    channel, e.g. a fresh checkout, these are just None rather than
+    triggering a live fetch). created_at is an ISO8601 string, not the raw
+    epoch, matching this module's posted_at_local convention elsewhere.
+
+    `topic` and `description` are Slack's own two verbatim channel
+    fields - `description` is named to match Slack's own UI (its channel
+    details panel labels this field "Description"; Slack's API and this
+    project's catalog cache call it `purpose`). Kept distinct rather than
+    merged (v6 dropped the prior topic-falls-back-to-purpose `description`
+    field, see ADR-0007) - a channel can use `topic` for status/logistics
+    and `description` for its actual charter (e.g. a site-Q or leadership
+    channel's purpose), and merging them risks silently dropping whichever
+    one lost the merge's priority order."""
     channel = catalog["channels"].get(channel_id, {})
     created = channel.get("created")
     return {
-        "description": channel.get("description") or None,
+        "topic": channel.get("topic") or None,
+        # `.get("purpose", channel.get("description"))`, not a plain
+        # `.get("purpose")`: a catalog.json cache written before sat-hkd
+        # added the raw `purpose` key has no such key at all, and would
+        # otherwise report `description: None` for every channel until its
+        # next refresh cycle (full-tier TTL is 6h) even though the cache's
+        # pre-v6 merged `description` value was already correct. Falls back
+        # only when `purpose` is truly absent (missing key) - a channel
+        # with a `purpose` key present but empty still reports None, per
+        # v6/ADR-0007's dropped-merge semantics.
+        "description": channel.get("purpose", channel.get("description")) or None,
         "creator": channel.get("creator") or None,
         "created_at": (
             datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
@@ -563,6 +595,18 @@ def _extract_zip_xml_text(path: Path, member_glob: str, pattern: re.Pattern) -> 
 
 
 def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
+    """sat-svu: the fallback branch below used to call path.read_text() for
+    *every* mimetype this function doesn't have a dedicated extractor for -
+    including images and video - before checking whether it was even
+    text-shaped, and discarded the result anyway (falling through to
+    `return None`) for anything that wasn't text/*/HTML-like. Harmless for
+    small files, but a several-hundred-MB video blob (real archived data:
+    f3cascades/ao-stray-balls, a 503 MB .MOV) got fully decoded into one
+    Python string just to be thrown away - the actual cause of the
+    f3-pugetsound job's repeated OOM kill (sat-811), not the whole-job
+    accumulation the month-sharded spill (this same ticket) also fixes.
+    Checking the mimetype up front instead means an unsupported type never
+    touches the file's bytes at all."""
     if path is None or not path.exists():
         return None
     if mimetype == "application/pdf":
@@ -573,15 +617,15 @@ def _extract_file_content(mimetype: str, path: Path | None) -> str | None:
         return _extract_zip_xml_text(path, "ppt/slides/slide*.xml", _TEXT_RUN_RE)
     if mimetype == _XLSX_MIMETYPE:
         return _extract_zip_xml_text(path, "xl/sharedStrings.xml", _SHARED_STRING_RE)
+    if mimetype not in _HTML_LIKE_MIMETYPES and not mimetype.startswith("text/"):
+        return None
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     if mimetype in _HTML_LIKE_MIMETYPES:
         return _html_to_text(raw)
-    if mimetype.startswith("text/"):
-        return raw
-    return None
+    return raw
 
 
 def _clean_file(data: dict) -> dict:
@@ -602,6 +646,61 @@ def _clean_file(data: dict) -> dict:
     }
 
 
+def _file_archive_status(data: dict, blob_exists: bool, content: str | None) -> str:
+    """One of content_extracted | no_blob | unsupported_type | tombstone
+    (sat-811 §8) - lets a files_out consumer tell "no text because Slack
+    deleted the file" apart from "no text because we can't parse this
+    type" apart from "we never captured the blob at all". The tombstone
+    check (Slack's FILE.mode == "tombstone" for a deleted file) is a
+    best-effort inference, not verified against a real tombstoned row in
+    this project's archives - a wrong guess here only costs a cosmetic
+    "unsupported_type"/"no_blob" instead of "tombstone", never content."""
+    if data.get("mode") == "tombstone":
+        return "tombstone"
+    if not blob_exists:
+        return "no_blob"
+    if content is not None:
+        return "content_extracted"
+    return "unsupported_type"
+
+
+_ORDINARY_UNSUPPORTED_MIME_PREFIXES = ("image/", "video/", "audio/")
+_ORDINARY_UNSUPPORTED_FILETYPES = {
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "bmp", "tiff", "tif",
+    "mp4", "mov", "avi", "mkv", "webm", "m4v",
+    "mp3", "wav", "m4a", "ogg", "aac", "flac",
+}
+
+
+def _is_ordinary_unsupported_media(mimetype: str | None, filetype: str | None) -> bool:
+    """True for the routine image/video/audio types the files_out sidecar
+    deliberately omits when there's no extracted content (sat-4uf) - a
+    no_blob/unsupported_type outcome is the expected, not exceptional,
+    result for these (thousands of them in a real archive), so a sidecar
+    record adds no diagnostic value. Falls back to `filetype` when
+    `mimetype` is missing/empty, since Slack doesn't always set one."""
+    if mimetype and mimetype.startswith(_ORDINARY_UNSUPPORTED_MIME_PREFIXES):
+        return True
+    return bool(filetype) and filetype.lower() in _ORDINARY_UNSUPPORTED_FILETYPES
+
+
+def _sidecar_worth_keeping(entry: dict) -> bool:
+    """files_out sidecar inclusion rule (schema v2, sat-4uf). content_extracted
+    is kept unconditionally - it's the sidecar's whole reason to exist.
+    tombstone is kept unconditionally too - deletion evidence a later run
+    can no longer recover, and it's cheap (Slack file deletions are rare).
+    no_blob/unsupported_type is dropped only when the file is ordinary
+    unsupported media (see _is_ordinary_unsupported_media) - the same
+    outcome for a PDF that never downloaded, or a mimetype we don't
+    recognize at all, is genuinely exceptional and stays. An entry with no
+    archive_status at all (a synthetic/older caller) is kept - unknown is
+    treated conservatively, not as routine."""
+    status = entry.get("archive_status")
+    if status not in ("no_blob", "unsupported_type"):
+        return True
+    return not _is_ordinary_unsupported_media(entry.get("mimetype"), entry.get("filetype"))
+
+
 def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str | None) -> str | None:
     """Path (relative to the archive root - two levels above channel_dir,
     i.e. <workspace>/<channel>/...) to the downloaded blob for a file, if
@@ -613,6 +712,28 @@ def _resolve_local_path(channel_dir: Path | None, file_id: str | None, name: str
     if not local_path.exists():
         return None
     return str(local_path.relative_to(channel_dir.parent.parent))
+
+
+def _load_team_id(channel_dir: Path) -> str | None:
+    """Reads channel_dir's slackdump.sqlite WORKSPACE table for the Slack
+    team id (T...) used by digest_channel_url - convert_fn's export output
+    never surfaces this (channels.json's context_team_id would work too,
+    but WORKSPACE is already the pattern _load_channel_files uses: direct
+    from the archive, no convert_fn dependency). Read-only, local-only, no
+    API call. None (rather than a raise) on a missing/malformed archive -
+    the caller falls back to the workspace-subdomain URL form."""
+    db_path = channel_dir / "slackdump.sqlite"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute("SELECT TEAM_ID FROM WORKSPACE ORDER BY ID DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
 
 
 def _load_channel_files(channel_dir: Path) -> list[dict]:
@@ -658,10 +779,161 @@ def _load_channel_files(channel_dir: Path) -> list[dict]:
         exists = blob_path.exists()
         cleaned["local_path"] = str(blob_path.relative_to(channel_dir.parent.parent)) if exists else None
         cleaned["content"] = _extract_file_content(cleaned["mimetype"] or "", blob_path if exists else None)
+        # sat-811 §8 (files_out sidecar change-detection): content_sha256
+        # lets a cumulative sidecar detect a real content edit even if the
+        # tabbed_canvas_updated notice that would have announced it was
+        # later deleted from the channel (see _extract_canvas_modification_events).
+        cleaned["content_sha256"] = (
+            hashlib.sha256(cleaned["content"].encode("utf-8")).hexdigest() if cleaned["content"] is not None else None
+        )
+        cleaned["blob_captured_at"] = _format_utc(blob_path.stat().st_mtime) if exists else None
+        cleaned["archive_status"] = _file_archive_status(data, exists, cleaned["content"])
         files.append(cleaned)
 
     files.sort(key=lambda f: f["created_at"] or "")
     return files
+
+
+_SIDECAR_ONLY_FILE_KEYS = ("content", "content_sha256", "blob_captured_at")
+
+
+def _digest_file_view(file_entry: dict) -> dict:
+    """The digest's channels[].files[] entry (schema v5, sat-811 §3 / sat-4uf):
+    everything _load_channel_files produces except the extracted `content`
+    itself and its sidecar-only provenance fields (content_sha256,
+    blob_captured_at) - the text lives in the files_out sidecar now,
+    joined by (workspace, channel_id, id). `archive_status` stays in the
+    digest (sat-4uf) so `has_content: false` is self-explanatory - a
+    consumer never needs the sidecar join just to learn *why* a file has
+    no content, only to read the content of one that has it."""
+    out = {k: v for k, v in file_entry.items() if k not in _SIDECAR_ONLY_FILE_KEYS}
+    out["has_content"] = file_entry.get("content") is not None
+    return out
+
+
+_CANVAS_MIMETYPE = "application/vnd.slack-docs"
+
+
+def _is_canvas_file(file_entry: dict) -> bool:
+    return file_entry.get("mimetype") == _CANVAS_MIMETYPE or file_entry.get("pretty_type") == "Canvas"
+
+
+_CANVAS_UPDATE_TEXT_RE = re.compile(r"^(.+?)\s+made updates to a canvas tab:\s*$")
+
+
+_CANVAS_UPDATE_UNWRAP_LIMIT = 5
+
+
+def _canvas_update_file_id(elements: list[dict]) -> str | None:
+    for el in elements:
+        # Verified against real archived tabbed_canvas_updated messages
+        # (sat-811 §9): the canvas block element's payload key is "Raw"
+        # (capital R), not "raw" - Slack's own inconsistent casing, not a
+        # typo here. slackdump's own `convert -f export` has no native Go
+        # struct for this rich_text sub-element type, so it round-trips the
+        # unrecognized element through its own generic {"type":...,
+        # "Raw": <json-string>} wrapper on top of whatever was already in
+        # the archive - observed 2 levels deep on a real f3nation message
+        # (once from Slack's own event shape, once more from slackdump's
+        # export step), so this unwraps repeatedly (bounded) until a
+        # "file_id" key surfaces, rather than assuming a fixed depth.
+        payload = el
+        for _ in range(_CANVAS_UPDATE_UNWRAP_LIMIT):
+            if not isinstance(payload, dict):
+                break
+            file_id = payload.get("file_id")
+            if file_id:
+                return file_id
+            raw = payload.get("Raw")
+            if not raw:
+                break
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                break
+    return None
+
+
+def _parse_canvas_update_message(msg: dict) -> dict | None:
+    """Parses a Slack `tabbed_canvas_updated` system message (sat-811 §9)
+    into {file_id, editor_name (raw, possibly compound), ts}, or None if
+    the block shape doesn't match - defensive, since this subtype's block
+    layout is reverse-engineered from the archive, not documented by
+    Slack. user is always USLACKBOT on this subtype; the real editor is
+    only present as a display-name string in the block text."""
+    if msg.get("subtype") != "tabbed_canvas_updated":
+        return None
+    editor_text = None
+    file_id = None
+    for block in msg.get("blocks") or []:
+        for outer in block.get("elements") or []:
+            elements = outer.get("elements") or []
+            if editor_text is None:
+                for el in elements:
+                    if el.get("type") == "text":
+                        match = _CANVAS_UPDATE_TEXT_RE.match(el.get("text") or "")
+                        if match:
+                            editor_text = match.group(1)
+                            break
+            if file_id is None:
+                file_id = _canvas_update_file_id(elements)
+    if file_id is None or editor_text is None:
+        return None
+    return {"file_id": file_id, "editor_name": editor_text, "ts": msg["ts"]}
+
+
+def _extract_canvas_modification_events(
+    all_messages: list[dict], channel: str, channel_id: str
+) -> dict[str, list[dict]]:
+    """Every `tabbed_canvas_updated` system message in one channel's raw
+    (unfiltered by export_scope - see sat-811 §8 "cumulative, not window-
+    relative") message stream, grouped by the canvas file_id it names.
+    Deduped by ts per file (resume cycles duplicate rows, like the FILE
+    table itself), sorted ascending. Editor-id resolution happens later,
+    once a workspace's profiles are available (see _resolve_canvas_editor)."""
+    by_file: dict[str, dict[str, dict]] = {}
+    for msg in all_messages:
+        parsed = _parse_canvas_update_message(msg)
+        if parsed is None:
+            continue
+        slot = by_file.setdefault(parsed["file_id"], {})
+        slot[parsed["ts"]] = {
+            "ts": parsed["ts"], "editor_name": parsed["editor_name"], "channel": channel, "channel_id": channel_id,
+        }
+    return {
+        file_id: sorted(events.values(), key=lambda e: float(e["ts"]))
+        for file_id, events in by_file.items()
+    }
+
+
+def _resolve_canvas_editor(name: str, profiles: dict[str, dict]) -> tuple[str | None, str | None]:
+    """Matches a canvas-update notice's raw editor display string against
+    a workspace's roster by normalized real_name. Only ever returns an id
+    for an unambiguous single match - "Never guess" (sat-811 §9)."""
+    norm = _normalize_name(name)
+    matches = [p for p in profiles.values() if _normalize_name(p.get("real_name")) == norm]
+    if len(matches) == 1:
+        return matches[0]["id"], "high"
+    return None, None
+
+
+def _resolve_canvas_event(event: dict, profiles: dict[str, dict]) -> dict:
+    out = {
+        "at": _format_utc(float(event["ts"])),
+        "editor_name": event["editor_name"],
+        "channel": event["channel"],
+        "channel_id": event["channel_id"],
+        "message_ts": event["ts"],
+    }
+    # Compound editors ("Daniel Hüsch and Justin Kinney") can't be resolved
+    # to one id - splitting them is only for detecting the compound case,
+    # never to guess which half made the edit.
+    if len(re.split(r"\s+and\s+", event["editor_name"])) == 1:
+        uid, confidence = _resolve_canvas_editor(event["editor_name"], profiles)
+        if uid is not None:
+            out["editor_user_id"] = uid
+            out["editor_match_confidence"] = confidence
+    return out
 
 
 def select_messages_in_range(
@@ -1137,6 +1409,7 @@ def _gather_digest_data(
     catalog_cache_dir: Path,
     handler,
     profiles_doc: dict | None,
+    files_out_sink: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, set[str]], dict, tuple[str | None, str]]:
     """Shared first phase of build_digest/build_monthly_digests: reads
     every (workspace, channel) in `channels_file` matching `workspace_glob`,
@@ -1147,7 +1420,14 @@ def _gather_digest_data(
     workspace's bot-id set, the profiles doc, and the resolved
     (date_from, date_to) range. A channel with no archive on disk is
     recorded with status "missing_archive" and skipped - one un-archived
-    channel must not abort a digest spanning many workspaces."""
+    channel must not abort a digest spanning many workspaces.
+
+    `files_out_sink`, when given, is appended to in place with one full
+    per-file entry (content, content_sha256, archive_status,
+    modification_history, ...) per channel file - the raw ingredients for
+    the files_out sidecar (sat-811 §3/§8/§9). The digest's own
+    channels_meta only ever gets the content-stripped view
+    (_digest_file_view) regardless of whether a sink was given."""
     date_from, date_to = trailing_days_range(days, as_of)
     from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
     to_epoch = _date_epoch(date_to, "23:59:59")
@@ -1166,14 +1446,29 @@ def _gather_digest_data(
         for ws_entry in profiles_doc["workspaces"]
         if ws_entry["status"] == "ok"
     }
+    # For canvas-editor resolution (sat-811 §9) - same shape as the
+    # analogous per-workspace profile lookups elsewhere in this module
+    # (_build_user_index, build_mentions_index).
+    profiles_by_workspace: dict[str, dict[str, dict]] = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
 
     channels_meta: list[dict] = []
     messages: list[dict] = []
 
     catalog_cache: dict[str, dict] = {}
 
-    for entry in select_channels(channels_file, workspace_glob):
+    entries = select_channels(channels_file, workspace_glob)
+    for i, entry in enumerate(entries, 1):
         workspace, channel, channel_id = entry["workspace"], entry["name"], entry["id"]
+        # Debug SlackBackup nightly hang (2026-08-04/05, see sat-811): this
+        # loop shells out to `slackdump convert` once per channel with no
+        # other output in between, so a stall or OOM kill here is otherwise
+        # invisible in nightly.log until the whole job silently never
+        # finishes. Cheap enough to leave in permanently.
+        print(f"export digest: converting {workspace}/{channel} [{i}/{len(entries)}]", file=sys.stderr, flush=True)
         if workspace not in catalog_cache:
             catalog_cache[workspace] = catalog_logic.load(catalog_cache_dir, workspace)
         channel_info = _channel_context(catalog_cache[workspace], channel_id)
@@ -1189,28 +1484,318 @@ def _gather_digest_data(
             )
             continue
 
-        with tempfile.TemporaryDirectory() as export_dir:
-            export_dir_path = Path(export_dir)
-            convert_fn(channel_dir, export_dir_path)
-            all_messages = _load_all_messages(export_dir_path)
-            users_map = _load_users_map(export_dir_path)
+        # sat-7k9: shares the per-channel lock with backup/dedupe/bot-image
+        # backfill - a channel mid-resume/dedupe must not be read here, and
+        # a lock conflict is a soft skip (like missing_archive above), not
+        # a hard failure - one busy channel must not abort the whole digest.
+        # _load_channel_files/_load_team_id read slackdump.sqlite too, so
+        # they must stay inside the lock alongside convert_fn - releasing it
+        # first would let a concurrent resume/dedupe rewrite the FILE table
+        # out from under this read (see code-review finding on PR #6).
+        try:
+            with channel_lock.channel_lock(channel_dir):
+                with tempfile.TemporaryDirectory() as export_dir:
+                    export_dir_path = Path(export_dir)
+                    convert_fn(channel_dir, export_dir_path)
+                    all_messages = _load_all_messages(export_dir_path)
+                    users_map = _load_users_map(export_dir_path)
+                files_full = _load_channel_files(channel_dir)
+                team_id = _load_team_id(channel_dir)
+        except channel_lock.ChannelLockedError as exc:
+            print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+            channels_meta.append(
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                    "files": [], **channel_info,
+                }
+            )
+            continue
+
+        # Canvas edit history (sat-811 §9) is read from the whole raw
+        # stream, not the range-filtered slice below - it's cumulative like
+        # the files_out sidecar itself, not export_scope-bounded. Then the
+        # notices are stripped before range-filtering/counting: they carry
+        # no text, their author is always USLACKBOT, and left in they
+        # inflate root_message_count/participant_count for a bot account
+        # (see §9's "currently corrupt activity counts").
+        canvas_events_by_file = _extract_canvas_modification_events(all_messages, channel, channel_id)
+        all_messages = [m for m in all_messages if m.get("subtype") != "tabbed_canvas_updated"]
 
         cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch, channel_dir=channel_dir)
         for msg in cleaned:
             _enrich_for_digest(msg, workspace, channel, channel_id)
         _assign_digest_seq(cleaned)
         messages.extend(cleaned)
-        files = _load_channel_files(channel_dir)
+        if files_out_sink is not None:
+            profiles = profiles_by_workspace.get(workspace, {})
+            for f in files_full:
+                entry = {**f, "workspace": workspace, "channel": channel, "channel_id": channel_id}
+                events = canvas_events_by_file.get(f["id"], [])
+                if events:
+                    entry["modification_history"] = [_resolve_canvas_event(e, profiles) for e in events]
+                if _is_canvas_file(f):
+                    entry.setdefault("modification_history", [])
+                    entry["modification_history_completeness"] = "partial"
+                files_out_sink.append(entry)
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id),
-                "files": files, **channel_info,
+                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, team_id),
+                "files": [_digest_file_view(f) for f in files_full], **channel_info,
             }
         )
 
     messages.sort(key=lambda m: float(m["ts"]))
     return channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to)
+
+
+# --- sat-811 Phase 2 / sat-svu: month-sharded spill, so a job spanning many
+# channels never holds more than one channel's messages/file content
+# resident at once. See docs/DESIGN-export.md "Scalability - month-sharded
+# spill" and ADR-0004. ---
+
+
+def _spill_channel_key(workspace: str, channel_id: str) -> str:
+    return f"{workspace}__{channel_id}"
+
+
+def _spill_month_path(spill_dir: Path, month: str, workspace: str, channel_id: str) -> Path:
+    return spill_dir / "months" / month / f"{_spill_channel_key(workspace, channel_id)}.ndjson"
+
+
+def _spill_done_marker(spill_dir: Path, workspace: str, channel_id: str) -> Path:
+    return spill_dir / "done" / _spill_channel_key(workspace, channel_id)
+
+
+def _spill_files_path(spill_dir: Path) -> Path:
+    return spill_dir / "files.ndjson"
+
+
+def _write_ndjson_line(fp, obj: dict) -> None:
+    fp.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    fp.write("\n")
+
+
+def _iter_ndjson(path: Path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def _channel_months_on_disk(spill_dir: Path, workspace: str, channel_id: str) -> set[str]:
+    """Months a resumed channel already has a shard file under - lets a
+    --resume run that skips re-converting/re-cleaning a done channel still
+    contribute its months to months_seen without re-deriving anything from
+    messages it never re-read."""
+    key = _spill_channel_key(workspace, channel_id)
+    months_root = spill_dir / "months"
+    if not months_root.exists():
+        return set()
+    return {p.parent.name for p in months_root.glob(f"*/{key}.ndjson")}
+
+
+def _load_month_messages(spill_dir: Path, month: str) -> list[dict]:
+    """Reads back one month's spilled shards (one file per channel that
+    contributed to this month), re-sorted by ts - each shard is already
+    ts-sorted internally (partition_messages_by_month preserves the
+    upstream sort), but shards interleave across channels."""
+    month_dir = spill_dir / "months" / month
+    messages: list[dict] = []
+    if month_dir.exists():
+        for shard in sorted(month_dir.glob("*.ndjson")):
+            messages.extend(_iter_ndjson(shard))
+    messages.sort(key=lambda m: float(m["ts"]))
+    return messages
+
+
+def gather_and_shard_digest_data(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    catalog_cache_dir: Path,
+    handler,
+    profiles_doc: dict | None,
+    spill_dir: Path,
+    resume: bool = False,
+) -> tuple[list[dict], set[str], dict[str, set[str]], dict, tuple[str | None, str]]:
+    """Streaming counterpart to _gather_digest_data: instead of accumulating
+    every channel's cleaned messages and every channel's file content into
+    one in-memory list/sink for the whole job, each channel's messages are
+    partitioned by month and appended to
+    <spill_dir>/months/<YYYY-MM>/<workspace>__<channel_id>.ndjson, and each
+    channel's file entries (with extracted content) are appended to
+    <spill_dir>/files.ndjson - both released from memory immediately after
+    writing. Only channels_meta (bounded by channel count, content-stripped
+    - the digest's own files[] view) stays resident for the whole job, same
+    as _gather_digest_data.
+
+    With resume=True, a channel whose <spill_dir>/done/<workspace>__
+    <channel_id> marker already exists is skipped entirely for this run
+    (no convert_fn, no message shard rewrite, no files_out entries) -
+    assumed complete from a prior interrupted run. Its months are recovered
+    by globbing which month directories already hold its shard file rather
+    than re-deriving them. Skipping its files_out entries too (rather than
+    re-deriving just those, which would need convert_fn output anyway for
+    canvas modification history) relies on merge_files_out's existing
+    carry-forward behavior for a file "absent from this run's scan" -
+    the same path already used when a channel falls outside a
+    --workspace/--channel selector.
+
+    A freshly processed (non-resumed) channel always gets fresh files_out
+    entries - _load_channel_files is a local sqlite read, not a convert_fn
+    shell-out, so resuming it buys nothing, and content_sha256 change-
+    detection depends on re-reading it - which is why <spill_dir>/
+    files.ndjson is truncated fresh at the start of every gather, never
+    appended across runs, regardless of resume.
+    """
+    date_from, date_to = trailing_days_range(days, as_of)
+    from_epoch = _date_epoch(date_from, "00:00:00") if date_from else 0.0
+    to_epoch = _date_epoch(date_to, "23:59:59")
+
+    if profiles_doc is None:
+        profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
+    bot_ids_by_workspace: dict[str, set[str]] = {
+        ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+    profiles_by_workspace: dict[str, dict[str, dict]] = {
+        ws_entry["workspace"]: {p["id"]: p for p in ws_entry["profiles"]}
+        for ws_entry in profiles_doc["workspaces"]
+        if ws_entry["status"] == "ok"
+    }
+
+    channels_meta: list[dict] = []
+    months_seen: set[str] = set()
+    catalog_cache: dict[str, dict] = {}
+
+    (spill_dir / "months").mkdir(parents=True, exist_ok=True)
+    (spill_dir / "done").mkdir(parents=True, exist_ok=True)
+    files_path = _spill_files_path(spill_dir)
+
+    entries = select_channels(channels_file, workspace_glob)
+    with files_path.open("w", encoding="utf-8") as files_fp:
+        for i, entry in enumerate(entries, 1):
+            workspace, channel, channel_id = entry["workspace"], entry["name"], entry["id"]
+            print(f"export digest: converting {workspace}/{channel} [{i}/{len(entries)}]", file=sys.stderr, flush=True)
+            if workspace not in catalog_cache:
+                catalog_cache[workspace] = catalog_logic.load(catalog_cache_dir, workspace)
+            channel_info = _channel_context(catalog_cache[workspace], channel_id)
+
+            channel_dir = archive_root / workspace / channel
+            if not (channel_dir / "slackdump.sqlite").exists():
+                channels_meta.append(
+                    {
+                        "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                        "status": "missing_archive", "channel_url": digest_channel_url(workspace, channel_id),
+                        "files": [], **channel_info,
+                    }
+                )
+                continue
+
+            done_marker = _spill_done_marker(spill_dir, workspace, channel_id)
+            resumed = resume and done_marker.exists()
+
+            if resumed:
+                months_seen.update(_channel_months_on_disk(spill_dir, workspace, channel_id))
+                # Still reads slackdump.sqlite (files[] view, team_id for
+                # channel_url) below, so it still needs the lock even though
+                # convert_fn/dedupe is skipped - see the non-resumed branch's
+                # note on why these reads share the lock.
+                try:
+                    with channel_lock.channel_lock(channel_dir):
+                        files_full = _load_channel_files(channel_dir)
+                        team_id = _load_team_id(channel_dir)
+                except channel_lock.ChannelLockedError as exc:
+                    print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+                    channels_meta.append(
+                        {
+                            "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                            "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                            "files": [], **channel_info,
+                        }
+                    )
+                    continue
+            else:
+                # sat-7k9: shares the per-channel lock with backup/dedupe -
+                # a lock conflict is a soft skip (like missing_archive
+                # above), not a hard failure. _load_channel_files/
+                # _load_team_id read slackdump.sqlite too, so they stay
+                # inside the lock alongside convert_fn - releasing it first
+                # would let a concurrent resume/dedupe rewrite the FILE
+                # table out from under this read (see code-review finding
+                # on PR #6).
+                try:
+                    with channel_lock.channel_lock(channel_dir):
+                        with tempfile.TemporaryDirectory() as export_dir:
+                            export_dir_path = Path(export_dir)
+                            convert_fn(channel_dir, export_dir_path)
+                            all_messages = _load_all_messages(export_dir_path)
+                            users_map = _load_users_map(export_dir_path)
+                        files_full = _load_channel_files(channel_dir)
+                        team_id = _load_team_id(channel_dir)
+                except channel_lock.ChannelLockedError as exc:
+                    print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+                    channels_meta.append(
+                        {
+                            "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                            "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                            "files": [], **channel_info,
+                        }
+                    )
+                    continue
+
+                canvas_events_by_file = _extract_canvas_modification_events(all_messages, channel, channel_id)
+                all_messages = [m for m in all_messages if m.get("subtype") != "tabbed_canvas_updated"]
+
+                cleaned = select_messages_in_range(all_messages, users_map, from_epoch, to_epoch, channel_dir=channel_dir)
+                for msg in cleaned:
+                    _enrich_for_digest(msg, workspace, channel, channel_id)
+                _assign_digest_seq(cleaned)
+
+                buckets = partition_messages_by_month(cleaned)
+                for month, month_messages in buckets.items():
+                    months_seen.add(month)
+                    shard_path = _spill_month_path(spill_dir, month, workspace, channel_id)
+                    shard_path.parent.mkdir(parents=True, exist_ok=True)
+                    with shard_path.open("w", encoding="utf-8") as shard_fp:
+                        for msg in month_messages:
+                            _write_ndjson_line(shard_fp, msg)
+
+                profiles = profiles_by_workspace.get(workspace, {})
+                for f in files_full:
+                    file_entry = {**f, "workspace": workspace, "channel": channel, "channel_id": channel_id}
+                    events = canvas_events_by_file.get(f["id"], [])
+                    if events:
+                        file_entry["modification_history"] = [_resolve_canvas_event(e, profiles) for e in events]
+                    if _is_canvas_file(f):
+                        file_entry.setdefault("modification_history", [])
+                        file_entry["modification_history_completeness"] = "partial"
+                    _write_ndjson_line(files_fp, file_entry)
+
+                del cleaned, all_messages, users_map
+                done_marker.touch()
+
+            # channels_meta's own files[] view (has_content only, no content)
+            # is cheap (sqlite-only, no convert_fn) and reused from whichever
+            # branch above (fresh or resumed) already loaded it under lock.
+            channels_meta.append(
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, team_id),
+                    "files": [_digest_file_view(f) for f in files_full], **channel_info,
+                }
+            )
+
+    return channels_meta, months_seen, bot_ids_by_workspace, profiles_doc, (date_from, date_to)
 
 
 def _channels_for_slice(
@@ -1288,6 +1873,198 @@ def partition_messages_by_month(messages: list[dict]) -> dict[str, list[dict]]:
     return buckets
 
 
+def merge_files_out(
+    entries: list[dict], previous_sidecar: dict | None, generated_at: str
+) -> dict:
+    """Builds the cumulative files_out sidecar document (sat-811 §8) from
+    this run's raw per-file entries (as collected via build_digest's/
+    build_monthly_digests' `files_out_sink`) plus the previous sidecar
+    snapshot, if any. Cumulative, not window-relative - like
+    _load_channel_files itself, this reflects "what documents currently
+    exist in this region", not "what changed in export_scope".
+
+    Keyed by (workspace, channel_id, id) across runs:
+    - first_seen_at carries forward from the first run a file id appeared
+      in, else is stamped with this run's generated_at.
+    - content_changed_at is stamped with this run's generated_at only when
+      content_sha256 actually differs from the previous snapshot (and
+      carried forward unchanged otherwise) - see _load_channel_files for
+      why this is the durable signal even when a canvas's
+      tabbed_canvas_updated notice was deleted from the channel (sat-811
+      §9's "presence is authoritative, absence proves nothing").
+    - last_modified_at, when a file carries modification_history, is the
+      max of that history's `at` values - the primary currency signal for
+      a canvas (sat-811 §8's ranking).
+
+    Additive, not a rebuild from this run's scan alone: a file previously
+    recorded but absent from `entries` this run (its channel fell outside
+    --workspace/--channel selectors, its 90-day Slack retention window
+    expired, or its archive is transiently missing) is carried forward
+    unchanged rather than dropped - Slack's own 90-day free-tier retention
+    already destroys the source; the sidecar must not additionally destroy
+    its own record of a file we saw when it was still there.
+
+    Schema v2 (sat-4uf): both the previously-carried entries and this run's
+    fresh entries are filtered through `_sidecar_worth_keeping` before
+    anything else - routine unsupported-media (image/video/audio)
+    no_blob/unsupported_type records are dropped, including ones carried
+    over from a pre-v2 sidecar (self-cleaning: an old sidecar's accumulated
+    JPG/PNG/MP4 cruft shrinks away over successive merges, not just stops
+    growing). content_extracted and tombstone records, and no_blob/
+    unsupported_type for anything that isn't ordinary media, are
+    unaffected - the "additive, never drop a live record" guarantee above
+    still holds for those.
+    """
+    if not isinstance(previous_sidecar, dict):
+        previous_sidecar = None  # non-dict JSON (truncated/corrupt sidecar) - treat as absent, not fatal
+
+    previous_by_key: dict[tuple, dict] = {}
+    for f in (previous_sidecar or {}).get("files", []):
+        if not isinstance(f, dict):
+            continue
+        if not _sidecar_worth_keeping(f):
+            continue
+        try:
+            key = (f["workspace"], f["channel_id"], f["id"])
+        except KeyError:
+            continue  # malformed prior entry - treat as absent, not fatal (sat-811 §8)
+        previous_by_key[key] = f
+
+    files_by_key: dict[tuple, dict] = dict(previous_by_key)
+    for entry in entries:
+        if not _sidecar_worth_keeping(entry):
+            continue
+        key = (entry["workspace"], entry["channel_id"], entry["id"])
+        prev = previous_by_key.get(key)
+        first_seen_at = prev.get("first_seen_at", generated_at) if prev is not None else generated_at
+        content_changed_at = prev.get("content_changed_at") if prev is not None else None
+        if prev is not None and prev.get("content_sha256") != entry.get("content_sha256"):
+            content_changed_at = generated_at
+        out = {**entry, "first_seen_at": first_seen_at, "content_changed_at": content_changed_at}
+        history = entry.get("modification_history")
+        if history:
+            out["last_modified_at"] = max(h["at"] for h in history)
+        files_by_key[key] = out  # this run's view wins over the carried-forward previous entry
+
+    files_out = list(files_by_key.values())
+    files_out.sort(key=lambda f: (f["workspace"], f["channel_id"], f["id"]))
+    return {
+        "schema_version": "slack-llm-files-v2",
+        "generated_at": generated_at,
+        "files": files_out,
+    }
+
+
+def _compute_consistency(channels_out: list[dict], messages_slice: list[dict], user_index: dict) -> dict:
+    """Deterministic referential-integrity metrics over this document's own
+    channels/messages/user_index - the "within this upload" checks from
+    docs/llm-context/ingestion-contract.md's Consistency and drift checks
+    §1, emitted so an LLM consumer reports them rather than eyeballing joins
+    and counts ad hoc. Cross-source consistency (an augmentation document's
+    roster/roles) and cross-run drift (versus a prior upload) stay
+    consumer-side - this build has no access to either. Counts only;
+    interpreting a count as a problem is left to the consumer, per `notes`
+    below and the ingestion contract."""
+    flat: list[dict] = []
+
+    def _walk(msg: dict) -> None:
+        flat.append(msg)
+        for reply in msg.get("replies", ()):
+            _walk(reply)
+
+    for msg in messages_slice:
+        _walk(msg)
+
+    ts_by_channel: dict[tuple, set[str]] = {}
+    for msg in flat:
+        ts_by_channel.setdefault((msg["workspace"], msg["channel_id"]), set()).add(msg["ts"])
+
+    channel_ids_seen: dict[str, set[str]] = {}
+    duplicate_channel_ids = 0
+    file_reference_count = 0
+    has_content_true = 0
+    has_content_false = 0
+    archive_status_counts: dict[str, int] = {}
+    file_ts_present = 0
+    file_ts_matched = 0
+
+    for ch in channels_out:
+        channel_id = ch.get("channel_id")
+        if channel_id:
+            seen = channel_ids_seen.setdefault(ch["workspace"], set())
+            if channel_id in seen:
+                duplicate_channel_ids += 1
+            seen.add(channel_id)
+        for f in ch.get("files", ()):
+            file_reference_count += 1
+            if f.get("has_content"):
+                has_content_true += 1
+            else:
+                has_content_false += 1
+            status = f.get("archive_status")
+            if status is not None:
+                archive_status_counts[status] = archive_status_counts.get(status, 0) + 1
+            message_ts = f.get("message_ts")
+            if message_ts is not None:
+                file_ts_present += 1
+                if message_ts in ts_by_channel.get((ch["workspace"], channel_id), ()):
+                    file_ts_matched += 1
+
+    in_scope_false_orphans = sum(
+        1 for msg in messages_slice if msg.get("in_scope") is False and not msg.get("replies")
+    )
+
+    unresolved_mentions = {
+        (msg["workspace"], uid)
+        for msg in flat
+        for uid in msg.get("mentions", ())
+        if uid not in user_index.get(msg["workspace"], {})
+    }
+
+    return {
+        "channel_id_duplicate_count": duplicate_channel_ids,
+        "file_reference_count": file_reference_count,
+        "file_has_content_true_count": has_content_true,
+        "file_has_content_false_count": has_content_false,
+        "file_archive_status_counts": archive_status_counts,
+        "file_message_ts_present_count": file_ts_present,
+        "file_message_ts_matched_count": file_ts_matched,
+        "file_message_ts_unmatched_count": file_ts_present - file_ts_matched,
+        "mention_unresolved_count": len(unresolved_mentions),
+        "in_scope_false_orphan_count": in_scope_false_orphans,
+        "notes": {
+            "scope": (
+                "Referential integrity within this document only (ingestion-contract.md's "
+                "'within the upload' checks). Cross-source consistency against an augmentation "
+                "document, and drift versus a prior upload, still need to be done by the consumer."
+            ),
+            "file_archive_status_counts": (
+                "Breaks the has_content: false count down by reason (schema v5, sat-4uf) - "
+                "content_extracted/tombstone/no_blob/unsupported_type and any other archive_status "
+                "value present, keyed directly by that value. A files_out sidecar record is only "
+                "expected for content_extracted (and any exceptional no_blob/unsupported_type on a "
+                "non-media file) - routine unsupported-media no_blob/unsupported_type counts here "
+                "are expected to have no sidecar record at all, not a gap."
+            ),
+            "file_message_ts_unmatched_count": (
+                "A split-by-month digest attaches every channel file to every month it appears "
+                "in, not just the month containing its message_ts - a nonzero count here is "
+                "expected on a monthly document and only meaningful on the unsplit (merged) "
+                "digest."
+            ),
+            "mention_unresolved_count": (
+                "Mentioned user ids with no matching profile in user_index for that workspace - "
+                "a deleted or external account, not necessarily an error."
+            ),
+            "in_scope_false_orphan_count": (
+                "Should always be 0 - an in_scope: false parent with no replies would itself be a "
+                "referential-integrity bug, since a parent is only marked in_scope: false because "
+                "an in-scope reply pulled it in."
+            ),
+        },
+    }
+
+
 def _assemble_digest(
     channels_meta_base: list[dict],
     messages_slice: list[dict],
@@ -1308,6 +2085,7 @@ def _assemble_digest(
     filename."""
     channels_out, activity_by_channel = _channels_for_slice(channels_meta_base, messages_slice, bot_ids_by_workspace)
     referenced_ids_by_workspace = _referenced_ids_for_slice(channels_meta_base, messages_slice)
+    user_index = _build_user_index(profiles_doc, referenced_ids_by_workspace)
 
     # Leadership candidates come from the full per-workspace roster
     # (build_user_profiles/profiles_doc), not just this slice's posters -
@@ -1328,12 +2106,27 @@ def _assemble_digest(
         export_scope["month"] = month
 
     return {
-        "schema_version": "slack-llm-digest-v3",
+        "schema_version": "slack-llm-digest-v6",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "export_scope": export_scope,
         "manifest": {
             "workspaces_included": len({c["workspace"] for c in channels_meta_base}),
             "counting_rules": {
+                "has_content": (
+                    "v4: a channel file's extracted text moved out of this document into a "
+                    "companion files_out sidecar (same job, same as_of) - join on (workspace, "
+                    "channel_id, id). v5: this file's own archive_status field (content_extracted / "
+                    "no_blob / unsupported_type / tombstone) explains has_content: false directly - "
+                    "no sidecar lookup needed to learn why. A sidecar record is only guaranteed for "
+                    "has_content: true; for has_content: false it exists only when archive_status is "
+                    "an exceptional failure (tombstone, or no_blob/unsupported_type on a file that "
+                    "isn't ordinary image/video/audio media) - a missing sidecar record for routine "
+                    "unsupported media (JPG/PNG/MP4/...) is expected, not a gap. "
+                    "tabbed_canvas_updated system messages (Slack's 'X made updates to a canvas "
+                    "tab' notices) are also stripped from messages[] in v4 and no longer inflate "
+                    "root_message_count/participant_count for the USLACKBOT account; see the "
+                    "sidecar's per-file modification_history for the edit events they carried."
+                ),
                 "root_message_count": "top-level messages only",
                 "reply_count": "nested replies under root messages",
                 "total_message_count": "root_message_count plus reply_count",
@@ -1389,6 +2182,14 @@ def _assemble_digest(
                     "dates, and Slack URLs are derived from ts + channel_id + workspace, never "
                     "duplicated here). Message text/URLs are never stored in the index."
                 ),
+                "consistency": (
+                    "top-level consistency key: deterministic referential-integrity counts over "
+                    "this document alone (channel_id_duplicate_count, file_reference_count plus "
+                    "has_content true/false splits, file_message_ts_present/matched/unmatched "
+                    "counts, mention_unresolved_count, in_scope_false_orphan_count). See its own "
+                    "notes for how to interpret each count; cross-source and cross-run drift "
+                    "checks are not covered here and stay consumer-side."
+                ),
             },
             "known_limitations": [
                 "Private or inaccessible channels may be absent",
@@ -1399,9 +2200,10 @@ def _assemble_digest(
         "channels": channels_out,
         "workspace_activity_index": _build_workspace_activity_index(channels_out, activity_by_channel),
         "messages": messages_slice,
-        "user_index": _build_user_index(profiles_doc, referenced_ids_by_workspace),
+        "user_index": user_index,
         "mentions": build_mentions_index(messages_slice, profiles_doc),
         "leadership": leadership,
+        "consistency": _compute_consistency(channels_out, messages_slice, user_index),
     }
 
 
@@ -1415,11 +2217,12 @@ def build_digest(
     catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
     handler=_default_handler,
     profiles_doc: dict | None = None,
+    files_out_sink: list[dict] | None = None,
 ) -> dict:
     """Merges messages from the trailing `days` days (or everything ever
     archived, when `days` is None) across every (workspace, channel) in
     `channels_file` matching `workspace_glob` into one chronologically-
-    sorted slack-llm-digest-v3 document. See _gather_digest_data and
+    sorted slack-llm-digest-v6 document. See _gather_digest_data and
     _assemble_digest for the two phases this composes; see
     build_monthly_digests for the equivalent split into one document per
     calendar month.
@@ -1436,7 +2239,10 @@ def build_digest(
     Each "ok" channel's entry also carries its files/Canvases (images
     included, see _load_channel_files) - read directly from the channel's own
     archive, not via convert_fn, since an unattached channel Canvas never
-    surfaces in a message-anchored export.
+    surfaces in a message-anchored export. v4 drops each file's extracted
+    `content` from this view (has_content only) - pass `files_out_sink` to
+    also collect the full per-file entries (content included) for the
+    companion files_out sidecar; see merge_files_out.
 
     `handler` (see handlers/__init__.py) supplies the digest's "leadership"
     section - defaults to the "f3" handler for backward compatibility with
@@ -1450,6 +2256,7 @@ def build_digest(
     """
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+        files_out_sink=files_out_sink,
     )
     return _assemble_digest(
         channels_meta, messages, profiles_doc, handler, date_from, date_to, days, workspace_glob, bot_ids_by_workspace,
@@ -1466,8 +2273,9 @@ def build_monthly_digests(
     catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
     handler=_default_handler,
     profiles_doc: dict | None = None,
+    files_out_sink: list[dict] | None = None,
 ) -> dict[str, dict]:
-    """Same data and same slack-llm-digest-v3 schema as build_digest, but
+    """Same data and same slack-llm-digest-v6 schema as build_digest, but
     split into one document per calendar month (keyed "YYYY-MM") instead of
     one merged document. A thread's replies stay with their parent's
     month even when a reply itself lands in a later month - see
@@ -1475,9 +2283,12 @@ def build_monthly_digests(
     reply that belongs to a thread it started. Each month's channel/
     workspace_activity_index/user_index/mentions are recomputed against
     just that month's message slice; "leadership" is unchanged across
-    months (it reflects current roster roles, not activity)."""
+    months (it reflects current roster roles, not activity). files_out_sink
+    is collected once by the shared gather phase, not per month - a file
+    has no natural month (see build_digest)."""
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
+        files_out_sink=files_out_sink,
     )
     buckets = partition_messages_by_month(messages)
     return {
@@ -1487,6 +2298,98 @@ def build_monthly_digests(
         )
         for month, month_messages in sorted(buckets.items())
     }
+
+
+def write_monthly_digests(
+    channels_file: Path,
+    archive_root: Path,
+    workspace_glob: str,
+    days: int | None,
+    as_of: str,
+    convert_fn: Callable[[Path, Path], None],
+    out_template: str,
+    catalog_cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
+    handler=_default_handler,
+    profiles_doc: dict | None = None,
+    files_out_path: Path | None = None,
+    spill_dir: Path | None = None,
+    resume: bool = False,
+) -> list[Path]:
+    """Streaming, file-writing counterpart to build_monthly_digests (sat-811
+    Phase 2 / sat-svu): shards every channel's messages/file content to disk
+    via gather_and_shard_digest_data instead of holding the whole job's
+    messages and file content in memory at once, then assembles and writes
+    each month's slack-llm-digest-v6 document one at a time (reusing
+    _assemble_digest unchanged - same document, only the memory shape of
+    getting there differs), discarding that month's message slice before
+    moving to the next.
+
+    spill_dir defaults to a fresh temporary directory, removed on success;
+    pass an explicit path (left in place afterwards, success or failure)
+    together with resume=True to recover from an interrupted prior run
+    without redoing already-sharded channels - see
+    gather_and_shard_digest_data. files_out_path, when given, is merged the
+    same way export.py's old _write_files_out did for the non-streaming
+    path, but reads this run's raw file entries back from the spill file
+    one line at a time (merge_files_out itself is unchanged; it only ever
+    needed `entries` to be iterable, not resident in memory) rather than
+    from an in-memory list.
+
+    Returns the list of digest file paths written, one per calendar month.
+    """
+    own_spill = spill_dir is None
+    if spill_dir is None:
+        spill_dir = Path(tempfile.mkdtemp(prefix="slackbackup-digest-spill-"))
+
+    try:
+        channels_meta, months_seen, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = (
+            gather_and_shard_digest_data(
+                channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
+                catalog_cache_dir, handler, profiles_doc, spill_dir, resume=resume,
+            )
+        )
+
+        if files_out_path is not None:
+            previous_sidecar = None
+            if files_out_path.exists():
+                try:
+                    previous_sidecar = json.loads(files_out_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    print(
+                        f"export digest: ignoring unreadable files_out {files_out_path}: {exc}",
+                        file=sys.stderr,
+                    )
+            generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            doc = merge_files_out(_iter_ndjson(_spill_files_path(spill_dir)), previous_sidecar, generated_at)
+            files_out_path.parent.mkdir(parents=True, exist_ok=True)
+            files_out_path.write_text(
+                json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
+            print(f"export digest: {len(doc['files'])} files -> {files_out_path}", file=sys.stderr)
+
+        written: list[Path] = []
+        for month in sorted(months_seen):
+            month_messages = _load_month_messages(spill_dir, month)
+            doc = _assemble_digest(
+                channels_meta, month_messages, profiles_doc, handler, date_from, date_to, days,
+                workspace_glob, bot_ids_by_workspace, month=month,
+            )
+            out_path = resolve_job_out(out_template, as_of, month=month)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            ok = sum(1 for c in doc["channels"] if c["status"] == "ok")
+            missing = sum(1 for c in doc["channels"] if c["status"] == "missing_archive")
+            print(
+                f"export digest: {month}: {len(doc['messages'])} messages from {ok} channels "
+                f"({missing} missing archive) -> {out_path}",
+                file=sys.stderr,
+            )
+            written.append(out_path)
+            del month_messages, doc
+        return written
+    finally:
+        if own_spill:
+            shutil.rmtree(spill_dir, ignore_errors=True)
 
 
 # --- user profiles: the full per-workspace roster (everyone slackdump has
@@ -1570,11 +2473,20 @@ def build_user_profiles(
             continue
 
         channel_dir = archive_root / workspace / archived["name"]
-        with tempfile.TemporaryDirectory() as export_dir:
-            export_dir_path = Path(export_dir)
-            convert_fn(channel_dir, export_dir_path)
-            users_file = export_dir_path / "users.json"
-            raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
+        # sat-7k9: shares the per-channel lock with backup/dedupe - a
+        # locked channel marks this workspace "locked" (soft skip, like
+        # missing_archive above), not a hard failure.
+        try:
+            with channel_lock.channel_lock(channel_dir):
+                with tempfile.TemporaryDirectory() as export_dir:
+                    export_dir_path = Path(export_dir)
+                    convert_fn(channel_dir, export_dir_path)
+                    users_file = export_dir_path / "users.json"
+                    raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
+        except channel_lock.ChannelLockedError as exc:
+            print(f"export users: skipping {workspace} - {exc}", file=sys.stderr)
+            workspaces_out.append({"workspace": workspace, "status": "locked", "profiles": []})
+            continue
 
         profiles = [_clean_user(u) for u in raw_users]
         if handler is not None:

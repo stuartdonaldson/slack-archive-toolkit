@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import export_logic, handlers, selector_logic, slackdump
+from . import channel_lock, export_logic, handlers, selector_logic, slackdump
 
 DEFAULT_ARCHIVE_ROOT = Path.home() / "slack-backups"
 DEFAULT_EXPORTS_DIR = Path.home() / "slack-exports"
@@ -119,6 +119,20 @@ def register(groups: argparse._SubParsersAction) -> None:
         "overriding --channels-file/--workspace/--days/--out for that job",
     )
     p_digest.add_argument(
+        "--spill-dir", default=None,
+        help="month-sharded spill directory used by --split-by-month jobs (also job field "
+        "'spill_dir'); defaults to a fresh temporary directory removed on success. Pass an "
+        "explicit path together with --resume to recover from an interrupted prior run without "
+        "redoing channels it already finished",
+    )
+    p_digest.add_argument(
+        "--resume", action="store_true",
+        help="skip re-converting/re-cleaning a channel whose --spill-dir already holds its "
+        "message shard (also job field 'resume'); an operator recovery tool, not a nightly "
+        "default - only has an effect together with --spill-dir pointing at the interrupted "
+        "run's own spill directory, and only for --split-by-month jobs",
+    )
+    p_digest.add_argument(
         "--leadership-handler", default=None,
         help=f"region-specific leadership/tagging handler ({', '.join(handlers.NAMES)}, or 'none'); "
         "defaults to 'f3' for a plain (non --jobs) run, preserving this project's original "
@@ -168,15 +182,24 @@ def _monthly(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as export_dir:
-        print(f"export monthly: converting {db_path} -> export day files", file=sys.stderr)
-        slackdump.convert_export(channel_dir, Path(export_dir))
+    # sat-7k9: shares the per-channel lock with backup/dedupe. This is a
+    # one-shot manual CLI, not a batch loop, so a lock conflict has nowhere
+    # to skip-and-continue to - report it clearly and exit non-zero rather
+    # than crash or (pre-sat-hh0) potentially hang against a stuck holder.
+    try:
+        with channel_lock.channel_lock(channel_dir):
+            with tempfile.TemporaryDirectory() as export_dir:
+                print(f"export monthly: converting {db_path} -> export day files", file=sys.stderr)
+                slackdump.convert_export(channel_dir, Path(export_dir))
 
-        last_backup_file = channel_dir / ".last_backup"
-        export_logic.export_transform(
-            Path(export_dir), args.workspace, args.channel, args.date_from, args.date_to,
-            out_dir, last_backup_file,
-        )
+                last_backup_file = channel_dir / ".last_backup"
+                export_logic.export_transform(
+                    Path(export_dir), args.workspace, args.channel, args.date_from, args.date_to,
+                    out_dir, last_backup_file,
+                )
+    except channel_lock.ChannelLockedError as exc:
+        print(f"export monthly: {exc}", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -208,22 +231,56 @@ def _write_digest(result: dict, out_path: Path, label: str) -> None:
 
 def _run_digest(channels_file: Path, archive_root: Path, workspace_glob: str, days: int | None,
                  as_of: str, out_template: str, handler, profiles_doc: dict | None = None,
-                 split_by_month: bool = False) -> None:
+                 split_by_month: bool = False, files_out_path: Path | None = None,
+                 spill_dir: Path | None = None, resume: bool = False) -> None:
     if split_by_month:
-        results = export_logic.build_monthly_digests(
+        # sat-811 Phase 2 / sat-svu: month-sharded spill instead of holding
+        # every channel's messages/file content in memory for the whole
+        # job - see export_logic.write_monthly_digests. The non-monthly
+        # (build_digest) path below is unaffected - single-workspace jobs
+        # aren't the OOM risk this addresses.
+        export_logic.write_monthly_digests(
             channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
-            handler=handler, profiles_doc=profiles_doc,
+            out_template, handler=handler, profiles_doc=profiles_doc, files_out_path=files_out_path,
+            spill_dir=spill_dir, resume=resume,
         )
-        for month in sorted(results):
-            out_path = export_logic.resolve_job_out(out_template, as_of, month=month)
-            _write_digest(results[month], out_path, f"{month}: ")
         return
 
+    files_out_sink: list[dict] | None = [] if files_out_path is not None else None
     result = export_logic.build_digest(
         channels_file, archive_root, workspace_glob, days, as_of, slackdump.convert_export,
-        handler=handler, profiles_doc=profiles_doc,
+        handler=handler, profiles_doc=profiles_doc, files_out_sink=files_out_sink,
     )
     _write_digest(result, export_logic.resolve_job_out(out_template, as_of), "")
+    if files_out_sink is not None:
+        _write_files_out(files_out_path, files_out_sink)
+
+
+def _write_files_out(files_out_path: Path, entries: list[dict]) -> None:
+    """Merges this run's raw per-file entries with whatever files_out
+    sidecar already sits at `files_out_path` (sat-811 §8 - cumulative, not
+    window-relative) and rewrites it. A previous file that fails to parse
+    is treated as absent rather than aborting the job - a corrupt sidecar
+    must not block tonight's digest. Only used by the non-monthly
+    (build_digest) path - the monthly/streaming path merges files_out
+    itself, inside export_logic.write_monthly_digests."""
+    previous_sidecar = None
+    if files_out_path.exists():
+        try:
+            previous_sidecar = json.loads(files_out_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"export digest: ignoring unreadable files_out {files_out_path}: {exc}", file=sys.stderr)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    doc = export_logic.merge_files_out(entries, previous_sidecar, generated_at)
+    files_out_path.parent.mkdir(parents=True, exist_ok=True)
+    files_out_path.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    print(f"export digest: {len(doc['files'])} files -> {files_out_path}", file=sys.stderr)
+
+
+def _job_spill_dir(job: dict, args: argparse.Namespace) -> Path | None:
+    raw = job.get("spill_dir", args.spill_dir)
+    return Path(raw).expanduser() if raw else None
 
 
 def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> None:
@@ -242,9 +299,13 @@ def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> 
         users_out_path.write_text(json.dumps(profiles_doc, indent=2))
         print(f"export digest: job {job_file}: user profiles -> {users_out_path}", file=sys.stderr)
 
+    files_out_path = export_logic.resolve_job_out(job["files_out"], as_of) if "files_out" in job else None
+
     _run_digest(
         channels_file, archive_root, workspace_glob, job.get("days", args.days), as_of,
         job["out"], handler, profiles_doc=profiles_doc, split_by_month=split_by_month,
+        files_out_path=files_out_path, spill_dir=_job_spill_dir(job, args),
+        resume=bool(job.get("resume", args.resume)),
     )
 
 
@@ -289,6 +350,7 @@ def _digest(args: argparse.Namespace) -> int:
     _run_digest(
         Path(args.channels_file), Path(args.archive_root), args.workspace_glob, args.days, as_of, out_template,
         handler, split_by_month=args.split_by_month,
+        spill_dir=Path(args.spill_dir).expanduser() if args.spill_dir else None, resume=args.resume,
     )
     return 0
 

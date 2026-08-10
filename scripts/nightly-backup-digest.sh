@@ -27,16 +27,35 @@ export PYTHONUNBUFFERED=1
 mkdir -p "$ARCHIVE_ROOT"
 mkdir -p "$HOME/slack-exports"
 
-# Prompt/context templates for the LLM newsletter workflow (F3 culture notes,
-# ingestion/newsletter/FNG prompts) are canonical in docs/ and git-tracked
-# there; refresh the ~/slack-exports working copies from them each run so
-# manual edits to the operator's copies don't silently diverge from git.
-cp "$REPO_ROOT/docs/f3-culture.md" \
-   "$REPO_ROOT/docs/fng-getting-started-prompt.md" \
-   "$REPO_ROOT/docs/newsletter-prompt.md" \
-   "$REPO_ROOT/docs/slack-ingestion.md" \
-   "$REPO_ROOT/docs/slt-report.md" \
-   "$HOME/slack-exports/"
+# Canonical LLM context pack (docs/llm-context/, sat-ejk migration, decision
+# recorded in docs/adr/0008-llm-context-pack-decomposition.md) is the active
+# upload/copy source. The individually uploadable Project-knowledge files
+# live under uploads/; refresh a curated ~/slack-exports/llm-context/ runtime
+# subtree each run so operator uploads stay in sync with git. Mirror the
+# whole tree EXCEPT planning/review/maintenance material that must not reach
+# the runtime upload area — a deny-list via rsync --exclude, not a per-file
+# allow-list, so a new prompt or augmentation file is picked up automatically
+# without editing this script.
+mkdir -p "$HOME/slack-exports/llm-context"
+rsync -a --delete \
+   --exclude 'README.md' \
+   --exclude 'MIGRATION-PLAN.md' \
+   --exclude 'REVIEW-*.md' \
+   --exclude 'VALIDATION-RESULTS.md' \
+   --exclude 'validation-set.md' \
+    --exclude 'uploads/augmentations/archive/' \
+    --exclude 'uploads/augmentations/sources/' \
+   "$REPO_ROOT/docs/llm-context/" "$HOME/slack-exports/llm-context/"
+# Excluded: this dir's own operator-facing README (assembly/maintenance
+# guide, not upload content), planning/review/validation records, archived
+# superseded augmentation snapshots, and raw source material backing a
+# cumulative augmentation (e.g. sotn-transcripts.md's transcripts) — citation
+# backup, not upload material. The augmentation index is retained under
+# uploads/ because it is individually uploaded with selected augmentations.
+
+# The legacy per-file prompt/context docs (F3 culture notes, ingestion/
+# newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the
+# canonical pack above was validated and integrated — no longer copied here.
 
 {
     echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) nightly backup+digest starting ====="
@@ -52,6 +71,30 @@ cp "$REPO_ROOT/docs/f3-culture.md" \
     # than discovering them channel-by-channel mid-run. Informational only -
     # always exits 0, so it never blocks the backup below.
     "$REPO_ROOT/scripts/preflight-auth.sh" channels.json
+
+    # Pick up newly-created public channels (e.g. "disc-it" was missed for
+    # weeks before someone noticed and registered it by hand) before backing
+    # up, so a channel created since last night's run gets archived in
+    # *this* run instead of waiting for someone to catch it manually.
+    # channel_logic.register_matching() was built for exactly this ("run
+    # nightly" is in its own docstring); it already only *registers*
+    # channels.json-missing ones, skipping private/archived/"shuttered*"/
+    # already-registered regardless of glob - nothing to optimize there.
+    # The cost is the FULL (non-member-only) catalog listing register_matching
+    # does per workspace to even know what's out there to diff against -
+    # docs/references/slackdump-cli-notes.md warns this can run several
+    # minutes and be rate-limit-prone per workspace, and originally motivated
+    # rotating one workspace's scan per night (day-of-year mod workspace
+    # count) instead of scanning all of them. Measured in practice (2026-08-07
+    # f3tundra, 2026-08-08 f3cascades) it's actually ~1.5-2 minutes per
+    # workspace, not "several" - cheap enough across all 9 registered
+    # workspaces that scanning every one nightly (via the 'f3*'/'*'-equivalent
+    # workspace glob register_matching already supports) is worth the ~15-20
+    # min it adds, so newly-created channels show up the very next run instead
+    # of waiting up to a week for their rotation slot.
+    echo "channel register: scanning all registered workspaces tonight"
+    ./slackbackup channel register '*' '*' --channels-file channels.json 2>&1 | grep -v ' — already-registered$'
+    echo "----- channel register exited ${PIPESTATUS[0]} -----"
 
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"

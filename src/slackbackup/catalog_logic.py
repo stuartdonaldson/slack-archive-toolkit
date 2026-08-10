@@ -24,6 +24,17 @@ from . import slackdump
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "slackbackup"
 FAST_TTL_SECONDS = 900
+# 6h: unvalidated since first set. The only empirical basis on record is the
+# very first commit's one-off measurement (2026-06-23, f3pugetsound, 464
+# channels): 4m20s wall-clock, rate-limited twice (docs/references/
+# slackdump-cli-notes.md). Re-run 2026-08-08 on the *same* workspace/channel
+# count: ~59s, zero rate-limit events - a 4-5x speedup with no throttling,
+# for reasons not confirmed (Slack's rate limits are load-dependent, so this
+# could be normal variance rather than a real improvement - one clean run
+# doesn't overturn the original measurement). Revisit this TTL (and the
+# "expensive/throttle-prone" framing below) only after several more
+# back-to-back full-tier runs at different times of day confirm which
+# behavior is typical, not off a single data point either direction.
 FULL_TTL_SECONDS = 21600
 
 
@@ -62,6 +73,7 @@ def _channel_fields(ch: dict, member: bool) -> dict:
         "name": ch["name"],
         "description": description_of(ch),
         "topic": (ch.get("topic") or {}).get("value") or None,
+        "purpose": (ch.get("purpose") or {}).get("value") or None,
         "is_private": ch.get("is_private", False),
         "is_archived": ch.get("is_archived", False),
         "creator": ch.get("creator") or None,
@@ -85,6 +97,52 @@ def merge_full(data: dict, channels: list[dict]) -> dict:
     return data
 
 
+_TRUNCATION_RETRIES = 3  # 1 initial attempt + 2 retries
+
+
+def _is_truncated(new_count: int, existing_count: int) -> bool:
+    """True if `new_count` looks implausibly smaller than what's already
+    cached (< 50%, per sat-dnr). Never flags anything when there's no prior
+    baseline to compare against — a first-ever refresh can't be "truncated"."""
+    return existing_count > 0 and new_count < existing_count * 0.5
+
+
+def _list_channels_guarded(
+    member_only: bool, existing_count: int, tier: str
+) -> tuple[list[dict], bool]:
+    """Calls slackdump.list_channels(), retrying up to `_TRUNCATION_RETRIES`
+    times if the result looks implausibly truncated against `existing_count`
+    (sat-dnr: a cold 'list channels -no-chan-cache' call has been observed
+    intermittently returning ~5 entries instead of the real count, exit 0,
+    nothing on stderr — an immediate retry of the identical command returned
+    the correct count). Returns (channels, still_truncated); still_truncated
+    is True only when every attempt looked truncated, so the caller can avoid
+    silently stamping the refresh timestamp on a bad result."""
+    channels: list[dict] = []
+    for attempt in range(1, _TRUNCATION_RETRIES + 1):
+        channels = slackdump.list_channels(member_only=member_only)
+        if not _is_truncated(len(channels), existing_count):
+            return channels, False
+        if attempt < _TRUNCATION_RETRIES:
+            print(
+                f"catalog: {tier}-tier list_channels returned only "
+                f"{len(channels)} channel(s), implausibly fewer than the "
+                f"{existing_count} already cached (attempt {attempt}/"
+                f"{_TRUNCATION_RETRIES}) — retrying...",
+                file=sys.stderr,
+            )
+    print(
+        f"catalog: WARNING — {tier}-tier list_channels still returned only "
+        f"{len(channels)} channel(s) after {_TRUNCATION_RETRIES} attempts, vs "
+        f"{existing_count} already cached; this looks like a truncated "
+        "response (see sat-dnr). Merging it anyway (a merge can only add "
+        f"channels, never remove one), but NOT stamping {tier}_refreshed_at "
+        "so the next run retries instead of trusting a full TTL cycle.",
+        file=sys.stderr,
+    )
+    return channels, True
+
+
 def refresh_fast(
     workspace: str,
     cache_dir: Path = DEFAULT_CACHE_DIR,
@@ -102,9 +160,13 @@ def refresh_fast(
         file=sys.stderr,
     )
     slackdump.select_workspace_or_die(workspace)
-    channels = slackdump.list_channels(member_only=True)
+    existing_count = sum(1 for ch in data["channels"].values() if ch["member"])
+    channels, truncated = _list_channels_guarded(
+        member_only=True, existing_count=existing_count, tier="fast"
+    )
     data = merge_fast(data, channels)
-    data["fast_refreshed_at"] = now
+    if not truncated:
+        data["fast_refreshed_at"] = now
     save(cache_dir, workspace, data)
     return data
 
@@ -128,9 +190,13 @@ def refresh_full(
         file=sys.stderr,
     )
     slackdump.select_workspace_or_die(workspace)
-    channels = slackdump.list_channels(member_only=False)
+    existing_count = len(data["channels"])
+    channels, truncated = _list_channels_guarded(
+        member_only=False, existing_count=existing_count, tier="full"
+    )
     data = merge_full(data, channels)
-    data["full_refreshed_at"] = now
+    if not truncated:
+        data["full_refreshed_at"] = now
     save(cache_dir, workspace, data)
     return data
 
@@ -150,7 +216,17 @@ def lookup(
 ) -> list[tuple[str, dict]]:
     """Checks the fast tier first; on a miss, triggers a (cached) full-tier
     refresh and retries - the expensive call becomes an explicit, cached
-    fallback instead of an inline call on every lookup."""
+    fallback instead of an inline call on every lookup.
+
+    Deliberate policy (sat-il0): the only caller is channel_logic.register(),
+    which uses this purely for id/name resolution - "does a channel matching
+    this name/id exist, and what's its canonical id" - not for metadata
+    freshness. A fast-tier HIT is trusted as-is and never cross-checked
+    against the full tier, so a member channel's topic/purpose/creator/
+    created can go stale here for up to FULL_TTL_SECONDS even though its
+    id/name (the only fields register() reads) are current. If a future
+    caller needs fresh metadata rather than just existence/id resolution,
+    it should call refresh_full() directly instead of relying on lookup()."""
     data = refresh_fast(workspace, cache_dir)
     member_channels = {cid: ch for cid, ch in data["channels"].items() if ch["member"]}
     matches = match_channels(member_channels, query)

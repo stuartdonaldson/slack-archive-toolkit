@@ -13,7 +13,7 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from . import catalog_logic, channel_logic, selector_logic, slackdump
+from . import bot_images_logic, catalog_logic, channel_lock, channel_logic, selector_logic, slackdump
 
 
 # Tiered backup cadence (SlackBackup-2ut). MODIFIABLE — the whole point is
@@ -137,6 +137,121 @@ def _write_last_backup(target_dir: Path) -> None:
     (target_dir / ".last_backup").write_text(_ts() + "\n")
 
 
+def _dedupe_channel_user_fast(db_path: Path) -> int:
+    """Direct-SQL fast-path dedupe of the CHANNEL_USER table (SlackBackup
+    sat-ece). `slackdump tools dedupe -mode message-key -execute` writes
+    every join NULL-safe (`A.col = B.col OR (A.col IS NULL AND B.col IS
+    NULL)`) so it generically supports entities with nullable key columns -
+    this defeats SQLite's ability to use an index seek. On channels whose
+    CHANNEL_USER table has grown very large (100k+ rows - observed
+    f3nation/3rd-f at 245,975, f3nation/1st-f at 263,310, f3nation/comz-
+    nation at 162,690, 2026-08-09) that query plan pegs the CLI at its
+    DEDUPE_TIMEOUT_SECONDS bound and gets killed. CHANNEL_ID/USER_ID are
+    NOT NULL in our schema (see the CREATE TABLE in this project's own
+    archives), so the NULL-safety is unneeded overhead here - a plain-
+    equality GROUP BY against the same table finished in 85ms against
+    245,975 rows in manual testing, vs. 900s+ via the CLI.
+
+    Semantically equivalent to slackdump's own "by key" dedupe for this
+    table: group by (CHANNEL_ID, USER_ID), keep only the row with
+    MAX(CHUNK_ID) per group, delete the rest. Called *before* the CLI
+    dedupe (see _dedupe_quietly) so that by the time the CLI's own
+    CHANNEL_USER pass runs, the table has already shrunk to its real
+    (non-duplicated) size - keeping that pass fast even though the CLI has
+    no per-table flag to skip CHANNEL_USER outright (checked via `slackdump
+    help tools dedupe` - no such flag exists). We deliberately do NOT
+    reimplement dedupe for MESSAGE/S_USER/CHANNEL/FILE - those have stayed
+    fast via the CLI in every real archive observed so far.
+
+    Not implemented here (sat-ece, optional/cosmetic): slackdump's own
+    dedupe also prunes now-empty CHUNK rows that referenced purely-
+    duplicate CHANNEL_USER rows (`prunableChunkIDs`/`deleteChunksByID` in
+    its Go source). That's table hygiene, not correctness - skipped to keep
+    this fast path minimal; the CLI dedupe that still runs afterward covers
+    CHUNK pruning for the tables it fully owns.
+
+    Returns 0 (no-op) if the file or the CHANNEL_USER table doesn't exist
+    yet - mirrors _max_message_ts's contract of never side-effect-creating
+    the file just by looking."""
+    if not db_path.exists():
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        cur = conn.execute(
+            """
+            DELETE FROM CHANNEL_USER
+            WHERE (CHANNEL_ID, USER_ID, CHUNK_ID) NOT IN (
+                SELECT CHANNEL_ID, USER_ID, MAX(CHUNK_ID)
+                FROM CHANNEL_USER
+                GROUP BY CHANNEL_ID, USER_ID
+            )
+            """
+        )
+        removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        conn.commit()
+    except sqlite3.OperationalError:
+        # No CHANNEL_USER table (e.g. a fresh/empty archive, or a database
+        # produced by a slackdump mode that never creates it) - nothing to
+        # dedupe, not an error.
+        return 0
+    finally:
+        conn.close()
+    return removed
+
+
+def _dedupe_channel_user_fast_quietly(channel_directory: Path) -> None:
+    """Runs _dedupe_channel_user_fast against this channel's archive,
+    swallowing failure the same way _dedupe_quietly does for the CLI
+    dedupe - a housekeeping step must never turn an otherwise-successful
+    resume into a reported channel failure."""
+    db_path = channel_directory / "slackdump.sqlite"
+    try:
+        removed = _dedupe_channel_user_fast(db_path)
+    except sqlite3.Error as exc:
+        _log(f"backup: channel_user dedupe failed for {channel_directory} (non-fatal, continuing): {exc}")
+        return
+    if removed:
+        _log(f"backup: dedupe removed {removed} duplicate channel_user row(s) from {channel_directory}")
+
+
+def _dedupe_quietly(channel_directory: Path) -> None:
+    """Runs the CHANNEL_USER fast path, then slackdump.dedupe() (the CLI's
+    `tools dedupe -mode message-key -execute`) after a resume, each
+    swallowing its own failure - a housekeeping step that trims accumulated
+    duplicate rows (SlackBackup-9hq, sat-ece) must never turn an otherwise-
+    successful resume into a reported channel failure. Logged either way so
+    a persistent dedupe problem is still visible in the nightly log, just
+    not fatal to the run. Fast path runs first - see
+    _dedupe_channel_user_fast's docstring for why running it before the CLI
+    call is what keeps the CLI's own CHANNEL_USER pass from timing out."""
+    _dedupe_channel_user_fast_quietly(channel_directory)
+    try:
+        removed = slackdump.dedupe(channel_directory)
+    except slackdump.SlackdumpError as exc:
+        _log(f"backup: dedupe failed for {channel_directory} (non-fatal, continuing): {exc}")
+        return
+    if removed:
+        _log(f"backup: dedupe removed {removed} duplicate message row(s) from {channel_directory}")
+
+
+def _backfill_bot_images_quietly(channel_directory: Path) -> None:
+    """Downloads any newly-posted F3 bot backblast/preblast images (Block
+    Kit image blocks - see bot_images_logic) after an archive/resume, same
+    non-fatal pattern as _dedupe_quietly: a stalled/failed download must
+    never turn an otherwise-successful backup into a reported failure.
+    Idempotent and cheap (usually 0-1 new image per channel per night), so
+    safe to run on every backup_channel() call rather than gating it behind
+    a separate cadence (SlackBackup sat-i2j)."""
+    try:
+        stats = bot_images_logic.backfill_channel(channel_directory, log=_log)
+    except Exception as exc:  # noqa: BLE001 - network/db step must never fail the backup
+        _log(f"backup: bot-image backfill failed for {channel_directory} (non-fatal, continuing): {exc}")
+        return
+    if stats.downloaded:
+        _log(f"backup: bot-image backfill downloaded {stats.downloaded} new image(s) for {channel_directory}")
+
+
 def backup_channel(
     channel_id: str,
     channel_slug: str,
@@ -146,63 +261,82 @@ def backup_channel(
     cache_dir: Path = catalog_logic.DEFAULT_CACHE_DIR,
 ) -> str:
     """Returns "archive" or "resume" - which path was taken, for the
-    caller's own summary/tally. A full re-sync always counts as "archive"."""
+    caller's own summary/tally. A full re-sync always counts as "archive".
+
+    Raises channel_lock.ChannelLockedError (sat-7k9) if another live
+    process already holds this channel's lock - e.g. a manual mid-day run
+    colliding with a still-running nightly, or vice versa. Callers
+    processing a batch (see run(), below) treat that as skip-and-continue,
+    same as slackdump.SlackdumpError."""
     slackdump.select_workspace_or_die(workspace)
     archive_root.mkdir(parents=True, exist_ok=True)
-
-    if full:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        full_dir = archive_root / workspace / f"{channel_slug}-full-{stamp}"
-        _log(
-            f"backup: full re-sync requested — archiving into fresh dir {full_dir} "
-            "(incremental archive untouched)"
-        )
-        slackdump.archive(channel_id, full_dir)
-        _write_last_backup(full_dir)
-        return "archive"
-
     channel_directory = channel_dir(archive_root, workspace, channel_slug)
-    db_path = channel_directory / "slackdump.sqlite"
 
-    if not db_path.exists():
-        _log(f"backup: no existing archive — running full archive into {channel_directory}")
-        slackdump.archive(channel_id, channel_directory)
+    with channel_lock.channel_lock(channel_directory):
+        if full:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            full_dir = archive_root / workspace / f"{channel_slug}-full-{stamp}"
+            _log(
+                f"backup: full re-sync requested — archiving into fresh dir {full_dir} "
+                "(incremental archive untouched)"
+            )
+            slackdump.archive(channel_id, full_dir)
+            catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(full_dir / "slackdump.sqlite"))
+            _backfill_bot_images_quietly(full_dir)
+            _write_last_backup(full_dir)
+            return "archive"
+
+        db_path = channel_directory / "slackdump.sqlite"
+
+        if not db_path.exists():
+            _log(f"backup: no existing archive — running full archive into {channel_directory}")
+            slackdump.archive(channel_id, channel_directory)
+            catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+            _backfill_bot_images_quietly(channel_directory)
+            _write_last_backup(channel_directory)
+            return "archive"
+
+        try:
+            count = _message_count(db_path)
+        except sqlite3.Error:
+            # Malformed/unreadable local file - treat the same as "empty",
+            # since there's no usable checkpoint for resume either way.
+            count = 0
+
+        if count == 0:
+            # resume reads its continuation point from this file's own
+            # session/chunk bookkeeping; a 0-message archive has none, so
+            # resume always errors before even calling the API (see
+            # SlackBackup-8ew) - it can never self-heal even after the
+            # channel gets real posts. archive is only safe against an
+            # empty/new directory (re-running it over an existing one
+            # duplicates data - slackdump-cli-notes.md), so wipe the stale
+            # empty dir first rather than archiving on top of it. Safe to
+            # do while the lock is held: the lock file itself lives as a
+            # *sibling* of channel_directory (channel_lock.lock_path_for),
+            # not inside it, so this rmtree can't delete our own lock.
+            _log(
+                f"backup: existing archive at {db_path} has 0 messages — resume cannot "
+                "continue from an empty checkpoint; wiping and re-archiving fresh"
+            )
+            shutil.rmtree(channel_directory)
+            slackdump.archive(channel_id, channel_directory)
+            catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+            _backfill_bot_images_quietly(channel_directory)
+            _write_last_backup(channel_directory)
+            return "archive"
+
+        _log(f"backup: existing archive found at {db_path} — resuming")
+        # -dedupe deliberately never passed: confirmed to delete thread-root
+        # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles -
+        # cleaned up immediately below via the separate, verified-safe
+        # `tools dedupe` command instead (SlackBackup-9hq).
+        slackdump.resume(channel_directory)
+        _dedupe_quietly(channel_directory)
         catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+        _backfill_bot_images_quietly(channel_directory)
         _write_last_backup(channel_directory)
-        return "archive"
-
-    try:
-        count = _message_count(db_path)
-    except sqlite3.Error:
-        # Malformed/unreadable local file - treat the same as "empty",
-        # since there's no usable checkpoint for resume either way.
-        count = 0
-
-    if count == 0:
-        # resume reads its continuation point from this file's own session/
-        # chunk bookkeeping; a 0-message archive has none, so resume always
-        # errors before even calling the API (see SlackBackup-8ew) - it can
-        # never self-heal even after the channel gets real posts. archive
-        # is only safe against an empty/new directory (re-running it over an
-        # existing one duplicates data - slackdump-cli-notes.md), so wipe
-        # the stale empty dir first rather than archiving on top of it.
-        _log(
-            f"backup: existing archive at {db_path} has 0 messages — resume cannot "
-            "continue from an empty checkpoint; wiping and re-archiving fresh"
-        )
-        shutil.rmtree(channel_directory)
-        slackdump.archive(channel_id, channel_directory)
-        catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
-        _write_last_backup(channel_directory)
-        return "archive"
-
-    _log(f"backup: existing archive found at {db_path} — resuming")
-    # -dedupe deliberately never passed: confirmed to delete thread-root
-    # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles.
-    slackdump.resume(channel_directory)
-    catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
-    _write_last_backup(channel_directory)
-    return "resume"
+        return "resume"
 
 
 def _interleave_by_workspace(entries: list[dict]) -> list[dict]:
@@ -283,13 +417,19 @@ def run(
             f"no channels in {channels_file} match {' and '.join(parts)}"
         )
 
-    # Warm each workspace's fast-tier catalog, but don't let one workspace with
-    # an expired session abort the whole multi-workspace run - skip it and carry
-    # on with the rest (its channels would only fail downstream anyway).
+    # Warm each workspace's fast- and full-tier catalog, but don't let one
+    # workspace with an expired session abort the whole multi-workspace run -
+    # skip it and carry on with the rest (its channels would only fail
+    # downstream anyway). Fast tier catches newly-joined-as-member channels
+    # (merge_fast is the only path that sets member=True); full tier fills in
+    # metadata (topic/purpose/creator/created) and discovers non-member public
+    # channels. refresh_full has its own TTL so calling it every run is safe -
+    # it no-ops when the cache is fresh.
     skipped_workspaces: dict[str, str] = {}
     for workspace in sorted({entry["workspace"] for entry in entries}):
         try:
             catalog_logic.refresh_fast(workspace, cache_dir=cache_dir)
+            catalog_logic.refresh_full(workspace, cache_dir=cache_dir)
         except slackdump.SlackdumpError as exc:
             _log(
                 f"backup run: skipping workspace '{workspace}' - catalog refresh failed "
@@ -308,7 +448,7 @@ def run(
             catalog_cache[workspace] = catalog_logic.load(cache_dir, workspace)
 
     all_ok = not skipped_workspaces
-    counts = {"archive": 0, "resume": 0, "failed": 0, "skipped": 0}
+    counts = {"archive": 0, "resume": 0, "failed": 0, "skipped": 0, "locked": 0}
     run_start = time.monotonic()
     today = datetime.now(timezone.utc).date() if today is None else today
     today_iso = today.isoformat()
@@ -375,6 +515,21 @@ def run(
             all_ok = False
             counts["failed"] += 1
             catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "failed")
+        except channel_lock.ChannelLockedError as exc:
+            # Another live process already holds this channel's lock (sat-
+            # 7k9) - e.g. a manual mid-day run colliding with a still-
+            # running nightly. Not a real failure, just contention: skip
+            # and continue, same as SlackdumpError, so one busy channel
+            # can't stall the batch.
+            elapsed = time.monotonic() - channel_start
+            _log(
+                f"backup run: skipping {entry['name']} ({entry['id']}) in {workspace} after "
+                f"{elapsed:.1f}s - {exc}",
+                file=sys.stderr,
+            )
+            all_ok = False
+            counts["locked"] += 1
+            catalog_logic.record_check(cache_dir, workspace, entry["id"], today_iso, "locked")
 
     total_elapsed = time.monotonic() - run_start
     skipped_note = (
@@ -383,6 +538,7 @@ def run(
     _log(
         f"backup run: done - {total_entries} channel(s), {counts['archive']} archive(s), "
         f"{counts['resume']} resume(s), {counts['skipped']} not-due skip(s), "
+        f"{counts['locked']} locked skip(s), "
         f"{counts['failed']} failure(s){skipped_note}, {total_elapsed / 60:.1f} min total"
     )
     return all_ok

@@ -10,12 +10,37 @@ import subprocess
 from pathlib import Path
 
 
+# Timeouts (SlackBackup sat-hh0). Observed 2026-08-09: `slackdump tools
+# dedupe -mode message-key -execute` pegged at 100% CPU for 24+ minutes on a
+# 966-message channel (weasel-shakers, similar scale, deduped in 185s for
+# comparison) - a genuine algorithmic hang in slackdump itself, not
+# I/O-blocked or WSL2-host-sleep (a separate, cosmetic wall-clock-gap
+# phenomenon also seen the same night). Nothing bounded it: these calls ran
+# via subprocess.run with no timeout, so one pathological channel could
+# block an entire nightly run indefinitely. dedupe is a local sqlite-only
+# operation (no network) and should always be fast even on large channels,
+# so it gets a tight bound; archive/resume do real network I/O + file
+# downloads and can legitimately run long on a channel's first-ever full
+# archive, so they get generous bounds. All three are MODIFIABLE - tune if
+# a legitimately large channel starts tripping one.
+DEDUPE_TIMEOUT_SECONDS = 900  # 15 min - local-only; should be seconds normally
+RESUME_TIMEOUT_SECONDS = 3600  # 1 hour - incremental, but lookback can be large
+ARCHIVE_TIMEOUT_SECONDS = 7200  # 2 hours - first-ever full history + files
+
+
 class SlackdumpError(RuntimeError):
     pass
 
 
-def _run(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["slackdump", *args], capture_output=True, text=True)
+def _run(args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["slackdump", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run already killed the child before raising this -
+        # nothing left running to clean up.
+        raise SlackdumpError(
+            f"slackdump {' '.join(args)} timed out after {timeout}s (killed)"
+        ) from exc
 
 
 def select_workspace_or_die(workspace: str) -> None:
@@ -87,17 +112,55 @@ def search_messages(query_terms: list[str], out_dir: Path) -> bool:
 
 
 def archive(channel_id: str, out_dir: Path) -> None:
-    result = _run(["archive", "-o", str(out_dir), channel_id])
+    result = _run(["archive", "-o", str(out_dir), channel_id], timeout=ARCHIVE_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump archive failed: {result.stderr}")
 
 
 def resume(channel_dir: Path) -> None:
     # -dedupe deliberately never passed: confirmed to delete thread-root
-    # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles.
-    result = _run(["resume", str(channel_dir)])
+    # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles -
+    # dedupe(), below, cleans them up as a separate, verified-safe step.
+    result = _run(["resume", str(channel_dir)], timeout=RESUME_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump resume failed: {result.stderr}")
+
+
+def dedupe(channel_dir: Path) -> int:
+    """Removes duplicate MESSAGE/CHANNEL/CHANNEL_USER/FILE rows that
+    `resume`'s lookback window re-inserts every cycle (SlackBackup-9hq).
+    Returns the number of message rows removed.
+
+    This is the standalone `slackdump tools dedupe` command, NOT the buggy
+    `resume -dedupe` flag `resume()` above deliberately avoids - confirmed
+    (2026-08-08, sat-9hq) on a real archive that `-mode message-key -execute`
+    here collapses duplicate rows down to one per distinct message `ts`
+    while leaving IS_PARENT=1 thread-root rows intact, unlike the inline
+    flag's confirmed thread-root-deletion bug. `-mode message-key` (vs.
+    the default `exact`) collapses by (channel, ts) even if Slack-regenerated
+    fields differ between fetches, keeping the latest copy.
+    """
+    result = _run(
+        ["tools", "dedupe", "-mode", "message-key", "-execute", str(channel_dir)],
+        timeout=DEDUPE_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise SlackdumpError(f"slackdump tools dedupe failed: {result.stderr}")
+    for line in result.stdout.splitlines():
+        if line.startswith("Removed messages:"):
+            count_text = line.split(":", 1)[1].strip()
+            try:
+                return int(count_text)
+            except ValueError:
+                # A future/different slackdump build changing this line's
+                # format (e.g. adding a trailing annotation) must not abort
+                # the whole nightly batch over one channel's dedupe count -
+                # treat as SlackdumpError so every existing caller's
+                # except-and-skip handling covers it too.
+                raise SlackdumpError(
+                    f"slackdump tools dedupe: unparseable 'Removed messages' line: {line!r}"
+                )
+    return 0
 
 
 def convert_export(channel_dir: Path, out_dir: Path) -> None:

@@ -12,6 +12,10 @@ modifies the archive or makes a Slack API call; all three are implemented in
 | `export digest` | §Digest Export | Many workspaces, trailing 180 days by default (or a different N), one merged chronological document |
 | `export users` | §User Profiles Export | Full per-workspace user roster, not just digest posters |
 
+A digest run driven by a report job (`--jobs`) can additionally emit two companion documents
+alongside its digest: a user roster (`users_out`) and the **`files_out` sidecar** that, since
+schema v4, carries the extracted file/Canvas text the digest itself no longer embeds.
+
 ---
 
 ## Monthly Export (`export monthly`)
@@ -19,9 +23,9 @@ modifies the archive or makes a Slack API call; all three are implemented in
 ### Solution Strategy
 
 The backup system already commits one `slackdump.sqlite` per channel at
-`<archive-root>/<workspace>/<channel-slug>/slackdump.sqlite` (see `docs/DESIGN.md` §State
-Management). That database is the single source of truth — the exporter is a **read-only
-consumer** of it and writes a separate output tree. It never calls the Slack API.
+`<archive-root>/<workspace>/<channel-slug>/slackdump.sqlite` (see `docs/DESIGN.md` §Building
+Block View, Level 2 — Local storage). That database is the single source of truth — the exporter
+is a **read-only consumer** of it and writes a separate output tree. It never calls the Slack API.
 
 slackdump's own `convert` command already renders an archive to the **Slack Export** format —
 a documented, version-stable structure of per-day JSON files (`YYYY-MM-DD.json`) carrying thread
@@ -277,11 +281,20 @@ un-archived channel in a 100-channel workspace glob must not block the whole dig
 
 ### Channel context — catalog, not a live call
 
-Each channel's entry under `channels` is enriched with `description`/`creator`/`created_at`,
-read **read-only from the already-cached catalog** (`catalog_logic.load`, never `refresh_*`) —
-the digest stays purely local and never triggers a Slack API call of its own; if the cache was
-never warmed for a channel (e.g. a fresh checkout with no `~/.cache/slackbackup/`), those fields
-are simply `null` rather than blocking on a live fetch.
+Each channel's entry under `channels` is enriched with
+`topic`/`description`/`creator`/`created_at`, read **read-only from the already-cached
+catalog** (`catalog_logic.load`, never `refresh_*`) — the digest stays purely local and never
+triggers a Slack API call of its own; if the cache was never warmed for a channel (e.g. a fresh
+checkout with no `~/.cache/slackbackup/`), those fields are simply `null` rather than blocking on
+a live fetch.
+
+`topic` and `description` are Slack's own two raw values, kept distinct so a query over the digest
+can use either signal independently — e.g. a channel whose topic is logistical ("read the pinned
+FAQ") but whose description states its actual charter (a site-Q channel, a leadership channel's
+remit). `description` here carries Slack's `purpose` field, renamed to match what Slack's own UI
+calls it — its channel-details panel labels this "Description", not "Purpose" (v6, see
+`docs/adr/0007-digest-v6-drop-merged-description.md`; prior to v6 this field was a
+topic-falls-back-to-purpose merge that could silently drop one or the other).
 
 ### Files & Canvases (all types, including images) — read from the archive's own `FILE` table, not `convert`
 
@@ -310,6 +323,155 @@ or downstream tool can open it directly even without extracted text. A survey of
 and images/video dominant by volume (5,539 images/12.3 GB, 243 videos/6.8 GB) — extraction was
 scoped to the former; the latter get no OCR/transcription (out of scope, would need a vision/audio
 model, not a parser).
+
+`_load_channel_files` also stamps three change-detection fields onto every entry (sat-811 §8),
+none of which appear in the digest itself — they exist for the `files_out` sidecar below:
+`content_sha256` (sha256 of extracted `content`, `null` when there's no content), `blob_captured_at`
+(the blob's on-disk mtime — capture/refresh time, **not** an edit time), and `archive_status`
+(`content_extracted` / `no_blob` / `unsupported_type` / `tombstone`, the last from Slack's own
+`mode: "tombstone"` on a deleted file's `FILE` row).
+
+#### `files_out` sidecar and the digest's `content` removal (schema v4)
+
+Measured against a real digest (2026-08, f3-nation, 52 channels/1 workspace/1 month): `channels[]`
+was 5.74 MB of an 8.44 MB document, and `files[].content` alone was 4.61 MB of that — 55% of the
+whole file, duplicated verbatim into **every** monthly file since a file has no natural month (see
+§Monthly digest splitting). For `f3-pugetsound` (383 channels/7 workspaces), this made
+`channels_meta` the single largest resident structure in `export digest`'s process and a
+contributing cause of an OOM kill (sat-811).
+
+v4's fix: `channels[].files[]` in the digest keeps every v3 field **except** `content` (and the
+three change-detection fields above), and gains `has_content: true|false`. The extracted text
+itself moves to a companion **`files_out`** sidecar document, written per job alongside the digest
+(see §Report jobs). Join key is `(workspace, channel_id, id)`.
+
+The sidecar is written **only on the `--jobs` path**, and only for a job that sets `files_out` —
+there is no `--files-out` command-line flag. A plain `export digest` run still extracts file
+content (the digest's `has_content` depends on it) but simply discards it when the process exits.
+A job that wants the text must declare `files_out`.
+
+##### Digest `archive_status` and the sidecar's routine-media exclusion (schema v5, sat-4uf)
+
+A live sidecar accumulates thousands of `no_blob`/`unsupported_type` records for ordinary image
+and video attachments — JPG/PNG/GIF/HEIC/MP4/MOV and the like — that never had extractable text
+and never will. None of that carries diagnostic value: v4 already told a consumer `has_content:
+false`, but explaining *why* required opening the sidecar and reading `archive_status` there
+regardless, and the record existed forever once written (the merge is additive).
+
+v5 makes two changes:
+
+- **`archive_status` moves into the digest itself** — `channels[].files[]` now carries
+  `archive_status` (`content_extracted` / `no_blob` / `unsupported_type` / `tombstone`) alongside
+  `has_content`, so `has_content: false` is self-explanatory from the digest alone. The sidecar
+  join is only ever needed to *read* extracted text, never to learn why there isn't any.
+- **The sidecar drops routine unsupported-media records.** `export_logic.merge_files_out` (schema
+  `slack-llm-files-v2`) keeps every `content_extracted` record (its whole reason to exist) and
+  every `tombstone` record (deletion evidence a later run can't recover) unconditionally. A
+  `no_blob`/`unsupported_type` record is kept only when the file **isn't** ordinary image/video/audio
+  media (`export_logic._is_ordinary_unsupported_media`, by mimetype prefix with a `filetype`
+  fallback) — e.g. a PDF whose blob never downloaded, or a mimetype nothing recognizes at all,
+  stays as a genuine diagnostic record. The rule applies to **both** this run's fresh entries and
+  the previously-carried sidecar contents, so a pre-v5 sidecar's accumulated media cruft prunes
+  itself away over successive merges rather than merely stopping its growth.
+
+This changes the sidecar-asymmetry rule from v4's "any `has_content: false` file may lack a
+sidecar record" to a precise one: **a missing sidecar record is only a gap when
+`has_content: true`.** For `has_content: false`, a sidecar record now exists only for the
+exceptional cases above — its absence for routine unsupported media is expected, not a defect. See
+`docs/llm-context/uploads/ingestion-contract.md` for the consumer-facing restatement.
+
+```jsonc
+{
+  "schema_version": "slack-llm-files-v2",
+  "generated_at": "2026-08-06T09:00:00Z",
+  "files": [
+    { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
+      "id": "F05KESM0B7C", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q Schedule",
+      "filetype": "quip", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
+      "creator": "U...", "created_at": "2023-07-30T22:40:54Z", "size": 2776,
+      "permalink": "https://...", "local_path": "f3pugetsound/.../__uploads/F.../Upcoming_Q_Schedule",
+      "content": "Q | Date | AO\n...", "content_sha256": "a1b2...", "archive_status": "content_extracted",
+      "blob_captured_at": "2026-08-05T09:12:00Z",
+      "first_seen_at": "2026-03-01T09:00:00Z", "content_changed_at": "2026-07-26T09:00:00Z",
+      "modification_history": [
+        { "at": "2026-07-05T14:03:00Z", "editor_name": "Daniel Hüsch", "editor_user_id": "U...",
+          "editor_match_confidence": "high", "channel": "ao-active-book-club", "channel_id": "C...",
+          "message_ts": "1783...53" }
+      ],
+      "modification_history_completeness": "partial", "last_modified_at": "2026-07-26T09:00:00Z" },
+    { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
+      "id": "F09ZZZ111AA", "name": "region-charter.pdf", "filetype": "pdf", "mimetype": "application/pdf",
+      "pretty_type": "PDF", "creator": "U...", "created_at": "2024-02-01T00:00:00Z", "size": 190442,
+      "permalink": "https://...", "local_path": null, "content": null, "content_sha256": null,
+      "archive_status": "no_blob", "blob_captured_at": null,
+      "first_seen_at": "2026-05-01T09:00:00Z", "content_changed_at": null }
+  ]
+}
+```
+
+The second entry above illustrates the exception: a PDF (an extractable type) whose blob was never
+downloaded is a genuine diagnostic gap, so it stays in the sidecar even with `content: null` — an
+ordinary JPG in the same state would not appear here at all.
+
+Unlike the digest, `files_out` is **cumulative across runs, not `days`-window-relative** — the
+same as `_load_channel_files` itself, which already reads the whole archive's `FILE` table every
+run regardless of `--days`. Each run merges its freshly-read entries into whatever `files_out`
+already sits at that path (`export_logic.merge_files_out`), keyed by `(workspace, channel_id,
+id)`:
+
+- `first_seen_at` is stamped once, on the run a file id first appears, and carried forward
+  unchanged after that.
+- `content_changed_at` is re-stamped with the current run's timestamp only when `content_sha256`
+  actually differs from the previous snapshot; otherwise it carries forward whatever it already
+  was (`null` if never observed to change).
+- `last_modified_at`, present only when `modification_history` is non-empty, is the max of that
+  history's `at` values.
+
+The merge is **additive, not a rebuild from this run's scan alone**, for every record that passes
+the v5 retention rule above: a kept file recorded in a prior run's `files_out` but absent from this
+run's freshly-read entries — its channel fell outside a `--workspace`/`--channel` selector, its
+90-day Slack retention window expired, or its archive is transiently missing — is carried forward
+into the merged sidecar unchanged rather than dropped. Slack's own retention already destroys the
+source; `files_out` must not additionally destroy its own record of a file it saw while that file
+still existed on Slack. A routine-media record is the one exception to "additive": it is pruned on
+sight regardless of whether this run's scan reproduced it, per the self-cleaning behavior above.
+
+##### Canvas edit history from `tabbed_canvas_updated` (sat-811 §9 / sat-2s9)
+
+Slack posts a `tabbed_canvas_updated` system message into a channel whenever a Canvas tab is
+edited (`user: "USLACKBOT"`, no `text`; the real editor's display name and the canvas's `file_id`
+are only recoverable from the message's Block Kit payload). `_extract_canvas_modification_events`
+parses these (defensively — the block shape is reverse-engineered from the archive, not Slack
+documentation) into per-file edit events, which land in that file's `modification_history` in the
+sidecar above. The notices themselves are then **stripped from `messages[]`** before range
+filtering/counting — left in, they inflated `root_message_count`/`participant_count` for the
+`USLACKBOT` account (a real counting bug fixed by this same change; see the digest manifest's
+`has_content` entry for the visible note).
+
+Editor-name → user-id resolution (`_resolve_canvas_editor`) matches the notice's raw display
+string against the workspace roster's normalized `real_name`, and only ever emits
+`editor_user_id`/`editor_match_confidence` for an unambiguous single match — a compound editor
+("Daniel Hüsch and Justin Kinney") is detected (so it isn't mistaken for one person) but never
+guessed at; `editor_name` (the raw string) is always emitted regardless.
+
+**This signal is positively authoritative, negatively meaningless**: presence of an event proves
+an edit happened at that time by that person; absence proves nothing, because these notices are
+sometimes manually deleted from the channel by members who find them cluttering (confirmed by the
+archive owner). Every canvas's sidecar entry therefore carries `modification_history_completeness:
+"partial"` unconditionally — never read a canvas with no history, or an old one, as evidence it's
+unmaintained. `content_sha256`/`content_changed_at` are the independent cross-check that survives
+a deleted notice (derived from bytes on disk, not a channel message), and neither signal replaces
+the other. Currency ranking, best to worst: `modification_history[].at` (via `last_modified_at`) >
+`content_changed_at` > a file's own `shared_message_ts`/reshare evidence (not yet captured) >
+`created_at`.
+
+This directly narrows sat-2s9 ("canvas edits after first capture are invisible"): a canvas's
+*blob* is in fact refreshed by `slackdump resume` on every backup cycle (its `FILE` metadata row
+is not, and never carries a real `updated` field) — so canvas content was never as stale as that
+issue originally assumed, and it is now independently detectable via `content_changed_at` and,
+when the notice survives, `modification_history`. Forcing a proactive re-fetch or checking the
+Slack API's own `updated` field (sat-2s9's other options) remain open, separate follow-ups if
+still wanted.
 
 Cross-referencing a post to a file it mentions needs no extra index: Slack embeds the literal
 permalink in a message's raw text (e.g. `<https://f3pugetsound.slack.com/docs/T.../F...|Q
@@ -361,7 +523,7 @@ export engine. Handler selection:
 
 ### Output shape
 
-`schema_version: "slack-llm-digest-v3"`. v2 evolved v1 **additively** — every v1 field/shape
+`schema_version: "slack-llm-digest-v6"`. v2 evolved v1 **additively** — every v1 field/shape
 still held; v2 only added fields (see `docs/adr/0001-digest-v2-additive-evidence.md` for that
 decision). v3 makes three changes:
 
@@ -381,14 +543,33 @@ decision). v3 makes three changes:
   *PAX*: line lives in a section block while `text` is a narrative-only fallback) no longer lose
   their PAX list (SlackBackup-rie).
 
+v4 (sat-811, `docs/adr/0004-digest-v4-files-sidecar.md`) makes one further change: each channel file's extracted `content` moves out of this
+document into a companion `files_out` sidecar, replaced by `has_content: true|false` — see
+§`files_out` sidecar above for why and its schema. `tabbed_canvas_updated` system messages
+(Slack's Canvas-edit notices) are also stripped from `messages[]` in v4, fixing a real counting
+bug where they inflated `root_message_count`/`participant_count` for the `USLACKBOT` account; the
+edit events they carried now live in the sidecar's per-file `modification_history` instead.
+
+v5 (sat-4uf, `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) adds `archive_status`
+(`content_extracted`/`no_blob`/`unsupported_type`/`tombstone`) alongside `has_content` on every
+`files[]` entry, so `has_content: false` is self-explanatory without a sidecar lookup — see
+§`files_out` sidecar → "Digest `archive_status` and the sidecar's routine-media exclusion" above.
+
+v6 (`docs/adr/0007-digest-v6-drop-merged-description.md`) renames the per-channel `purpose` field
+to `description`, matching what Slack's own UI calls it (its channel-details panel labels this
+"Description"; Slack's API name for it is `purpose`). The prior `description` field — a
+topic-falls-back-to-purpose merge that could silently drop one or the other — is dropped. `topic`
+is unchanged.
+
 ```jsonc
 {
-  "schema_version": "slack-llm-digest-v3",
+  "schema_version": "slack-llm-digest-v6",
   "generated_at": "2026-06-23T18:00:00Z",
   "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
     "workspaces_included": 7,
     "counting_rules": {
+      "has_content": "v4: a channel file's extracted text moved to a companion files_out sidecar (same job, same as_of) - join on (workspace, channel_id, id). v5: this file's own archive_status field explains has_content: false directly, no sidecar lookup needed. A sidecar record is only guaranteed for has_content: true; for has_content: false it exists only for an exceptional archive_status (tombstone, or no_blob/unsupported_type on a non-media file) - its absence for routine unsupported media (JPG/PNG/MP4/...) is expected, not a gap.",
       "root_message_count": "top-level messages only",
       "reply_count": "nested replies under root messages",
       "total_message_count": "root_message_count plus reply_count",
@@ -408,13 +589,13 @@ decision). v3 makes three changes:
   },
   "channels": [
     { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
-      "status": "ok", "channel_url": "https://f3pugetsound.slack.com/archives/C...",
-      "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
+      "status": "ok", "channel_url": "https://app.slack.com/client/T.../C...",
+      "topic": "...", "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
       "files": [ { "id": "F...", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q Schedule",
                    "filetype": "canvas", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
                    "creator": "U...", "created_at": "2026-01-05T00:00:00Z", "size": 4096,
                    "permalink": "https://...", "message_ts": "1718...", "local_path": "f3pugetsound/ao-active-book-club/__uploads/F.../Upcoming_Q_Schedule",
-                   "content": "Q | Date | AO\n..." } ],
+                   "has_content": true, "archive_status": "content_extracted" } ],
       "root_message_count": 12, "reply_count": 28, "total_message_count": 40, "participant_count": 8,
       "first_message_utc": "2026-04-01T12:00:00Z", "last_message_utc": "2026-06-20T08:00:00Z",
       "activity_status": "active", "activity_status_basis": "has messages during export_scope" },
@@ -475,7 +656,15 @@ decision). v3 makes three changes:
       }
     }
   },
-  "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] }
+  "leadership": { "profile_role_matches": [ ... ], "by_region": [ ... ] },
+  "consistency": {
+    "channel_id_duplicate_count": 0, "file_reference_count": 1, "file_has_content_true_count": 1,
+    "file_has_content_false_count": 0, "file_archive_status_counts": { "content_extracted": 1 },
+    "file_message_ts_present_count": 1, "file_message_ts_matched_count": 1,
+    "file_message_ts_unmatched_count": 0, "mention_unresolved_count": 0, "in_scope_false_orphan_count": 0,
+    "notes": { "scope": "...", "file_archive_status_counts": "...", "file_message_ts_unmatched_count": "...",
+               "mention_unresolved_count": "...", "in_scope_false_orphan_count": "..." }
+  }
 }
 ```
 
@@ -505,9 +694,16 @@ emitted as `true`) — its presence is itself the false-only signal.
 
 #### Message anchors and channel/file linking
 
-Every message and reply carries `message_url` (`https://<workspace>.slack.com/archives/<channel_id>/p<ts-no-dot>`)
-and every channel entry carries `channel_url` (`https://<workspace>.slack.com/archives/<channel_id>`),
-so a consumer can cite a specific post or channel without reconstructing Slack's URL scheme itself.
+Every message and reply carries `message_url` (`https://<workspace>.slack.com/archives/<channel_id>/p<ts-no-dot>`
+- the format Slack's own `chat.getPermalink`/"Copy link" on a message generates, which resolves
+correctly across sessions) and every channel entry carries `channel_url`. Unlike a message link,
+the workspace-subdomain form doesn't reliably route to the right workspace for a channel-only link
+in every browser/app session, so `channel_url` instead uses `https://app.slack.com/client/<team_id>/
+<channel_id>` - what Slack's own "Copy link" on a channel actually generates - with `team_id` read
+from the channel's local `slackdump.sqlite` `WORKSPACE.TEAM_ID` (`export_logic._load_team_id`).
+A `status: "missing_archive"` channel has no local archive to read a team id from, so its
+`channel_url` falls back to the workspace-subdomain form instead. Either way, a consumer can cite
+a specific post or channel without reconstructing Slack's URL scheme itself.
 A file's `id` plus, when the file is a reply/message attachment, its `message_ts` (the id of the
 message it was attached to) let a consumer anchor a channel-level file back to the conversation
 that posted it, the same way `message_url` anchors a message. `mentions`/`links`/`unfurls` on a
@@ -551,6 +747,27 @@ with the unmerged clusters listed under `identities[]`. A mentioned id with no r
 keeps an entry keyed by its raw id at confidence `unknown`. Raw email addresses are never
 persisted anywhere — `email_hash` (truncated SHA-256 of the lowercased address, added to the
 user-profiles export) is the only email-derived value in any output.
+
+#### Consistency block (sat-ejk.6)
+
+The top-level `consistency` key is a deterministic referential-integrity report over this
+document's own `channels`/`messages`/`user_index`, computed by `_compute_consistency` in
+`_assemble_digest` from data already gathered for this same document — no extra pass over the
+archive. It replaces the interim manual checklist that `docs/llm-context/uploads/ingestion-contract.md`
+used to carry as a "run this by hand" section (§Consistency and drift checks): `channel_id`
+duplicates per workspace, the digest's own file-reference/`has_content` split (and, since v5, that
+split's `archive_status` breakdown — `file_archive_status_counts`), how many `message_ts`-carrying
+files resolve to a real message in the same workspace/channel within this document, mentioned ids
+absent from `user_index`, and `in_scope: false` parents with no replies
+(an invariant that should always read `0`). Each count's `notes` entry restates how to interpret
+it, so the LLM ingestion side doesn't need this design doc to read the block correctly.
+
+Deliberately **not** covered here, since this build has no access to either: cross-source
+consistency against a manual augmentation document, and drift versus a prior upload — both stay
+consumer-side checks (see the ingestion contract). `file_message_ts_unmatched_count` in
+particular is expected to be nonzero on a `--split-by-month` digest, since a channel's files
+attach to every month it appears in rather than just the month containing the file's own
+`message_ts` — see §Monthly digest splitting.
 
 ---
 
@@ -620,20 +837,31 @@ unsupported type) can specify:
 | `days` | Trailing-day window (`null` = no lower bound / all history) | `--days` |
 | `out` | Output path; supports an `{as_of}` template placeholder | — (required) |
 | `users_out` | Companion user-profiles JSON path (also `{as_of}`-templated) | none — no roster written |
+| `files_out` | Companion `files_out` sidecar path (also `{as_of}`-templated; see §`files_out` sidecar) - cumulative, merged with whatever already sits at that path | none — no sidecar written, and each channel file's `content` simply never leaves the process |
 | `leadership_handler` | Handler name for tagging/leadership (see §Pluggable leadership handlers) | `none` (opt-in per job) |
 | `split_by_month` | Write one digest document per calendar month instead of one merged document (see §Monthly digest splitting) | `false` |
+| `spill_dir` | Directory for the month-sharded spill (see §Scalability — month-sharded spill); only applies when `split_by_month` is set | `--spill-dir`, else a fresh temporary directory removed on success |
+| `resume` | Skip re-converting/re-cleaning a channel whose `spill_dir` already holds its message shard from an interrupted prior run; only applies when `split_by_month` is set | `--resume` |
 
 Path handling: `expand_job_path` does `~`/`$VAR` expansion on any path read from a job file, and
 `resolve_job_out` applies `{as_of}` (and, when splitting by month, `{month}`) templating before
 that expansion. When `users_out` is set, the companion roster is written from **one shared**
 `build_user_profiles` call also used to build the digest, avoiding converting every workspace's
-archive twice. All job-file parsing lives in Python, not bash/jq. The nightly script
-(`scripts/nightly-backup-digest.sh`) forwards `--jobs "$REPO_ROOT/jobs/*.json"` after its blanket
-digest/users export.
+archive twice. Similarly, when `files_out` is set, `_run_job` passes a `files_out_sink` list into
+the same `build_digest`/`build_monthly_digests` call that builds the digest - the sidecar's raw
+per-file entries (content included) are collected from the gather phase already running, not from
+a second pass over every channel's archive. `export._write_files_out` then reads whatever
+`files_out` document already exists at that path (if any), merges via `merge_files_out`, and
+rewrites it - a corrupt or unreadable previous sidecar is treated as absent rather than aborting
+the job. All job-file parsing lives in Python, not bash/jq. The nightly script
+(`scripts/nightly-backup-digest.sh`) runs **only** the job path — `export digest --archive-root
+"$ARCHIVE_ROOT" --jobs "$REPO_ROOT/jobs/*.json"`. The blanket (non-`--jobs`) digest and `export
+users` runs it used to do first were dropped: every real recipient is now described by a job file,
+and the blanket run duplicated their work at full cost. Both remain available as manual commands.
 
 ### Monthly digest splitting (`split_by_month` / `--split-by-month`)
 
-`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v3` schema as
+`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v6` schema as
 `build_digest`, but as a `{month: document}` mapping instead of one merged document — one file per
 calendar month (`export_scope.month` is stamped on each). It shares `build_digest`'s first phase
 (`_gather_digest_data`: converts every matched channel's archive once, range-bounds, and
@@ -657,6 +885,75 @@ overwriting one file every month. The direct path's default `--out`
 (`~/slack-exports/f3-digest-<as_of>.json`) gains a `-{month}` suffix automatically when
 `--split-by-month` is given without an explicit `--out`.
 
+### Scalability — month-sharded spill (sat-811 Phase 2 / sat-svu)
+
+`build_monthly_digests`/`build_digest`'s shared `_gather_digest_data` phase accumulates every
+matched channel's cleaned messages (and, when `files_out` is requested, every channel's raw file
+entries with extracted content) into one in-memory list/sink for the whole job before any assembly
+runs. That is fine at `f3-nation`'s scale (52 channels/1 workspace) but does not bound: measured
+against `f3-pugetsound` (383 channels/7 workspaces), it OOM-killed the process at ~2.3 GB RSS
+before the v4 `files_out` sidecar shipped, and **still OOM-killed it at ~4.5 GB RSS afterwards** —
+moving `content` out of the digest's own `channels[]` (ADR-0004) did not fix the underlying
+accumulation, since `files_out_sink` held the exact same per-file content resident for the whole
+job that `channels_meta` used to.
+
+For a `split_by_month` job, `export_logic.write_monthly_digests` (used automatically by
+`export.py:_run_digest` whenever `split_by_month` is set — replacing the old
+`build_monthly_digests` + write-to-file sequence for that path) fixes this structurally rather than
+by moving the content around again:
+
+- **Pass 1 — gather and shard** (`gather_and_shard_digest_data`): per channel, unchanged up to
+  message cleaning/range-filtering, then each channel's messages are partitioned by month
+  (`partition_messages_by_month`, applied per channel — equivalent to job-wide partitioning since
+  the bucketing rule is per root message) and appended to
+  `<spill_dir>/months/<YYYY-MM>/<workspace>__<channel_id>.ndjson`. Each channel's file entries
+  (with content) are streamed straight to `<spill_dir>/files.ndjson` instead of an in-memory sink.
+  Both are dropped from memory immediately after writing; only `channels_meta` (bounded by channel
+  count, content-stripped) and a `months_seen` set stay resident for the whole gather.
+- **Pass 2 — assemble and emit, one month at a time**: for each month, `_load_month_messages` reads
+  back just that month's shard files (glob + concatenate + re-sort by `ts` — cheap, since a single
+  month is a fraction of the whole job), then the existing unmodified `_assemble_digest` produces
+  that month's document exactly as `build_monthly_digests` would. The month's message slice and
+  document are discarded before moving to the next month.
+- **`files_out` sidecar**: `merge_files_out` (unchanged) is called with a generator that reads
+  `<spill_dir>/files.ndjson` back one line at a time instead of an in-memory list — it only ever
+  needed `entries` to be iterable, not resident all at once.
+- **Crash durability**: `--spill-dir <path>` (also job field `spill_dir`) points the spill at a
+  durable location instead of a temporary directory that is otherwise created fresh and removed on
+  success; `--resume` (also job field `resume`) then skips re-converting/re-cleaning a channel whose
+  `<spill_dir>/done/<workspace>__<channel_id>` marker already exists from an interrupted prior run.
+  A resumed (skipped) channel contributes no fresh `files_out` entries this run — `merge_files_out`'s
+  existing "absent from this run's scan → carried forward unchanged" behavior (ADR-0004) already
+  covers it, rather than re-deriving canvas modification history from a conversion `--resume` is
+  meant to avoid. `--resume` is an operator recovery tool, not a nightly default, and only applies to
+  `split_by_month` jobs.
+
+The spill alone did not clear the OOM: re-measured against the same job, it still died at the exact
+same channel (`f3cascades/ao-stray-balls`, 50/383) across three separate runs regardless of which
+whole-job accumulation was fixed around it - a single-channel spike, not cross-channel accumulation.
+Root cause: `_extract_file_content`'s fallback branch called `path.read_text()` on every file whose
+mimetype it has no dedicated extractor for (images, video, ...) before checking whether the mimetype
+was even text-shaped, discarding the result anyway for anything non-text - that channel's archive
+holds a 503 MB `.MOV`. Fixed by checking the mimetype up front (see ADR-0005); behaviorally identical
+(an unsupported mimetype already returned `None`), purely a memory fix.
+
+Verified against real production data: `export digest --jobs jobs/f3-pugetsound.json` (the job that
+OOM-killed on both the v3 baseline and the v4 sidecar - most recently at 4.5 GB RSS, then 2.9 GB RSS
+after the spill alone) completed cleanly under the streaming path plus the `_extract_file_content`
+fix, all 383 channels / 4,726 files / 6 monthly digests, peak RSS **164 MB** (`/usr/bin/time -v`,
+2026-08-07) — well under the 800 MB acceptance target. See ADR-0005 for the full before/after.
+`write_monthly_
+digests` produces byte-identical documents (aside from `generated_at`) to `build_monthly_digests` on
+a fixture spanning 3 channels × 3 months (`tests/test_export_digest_logic.py`'s
+`test_write_monthly_digests_matches_build_monthly_digests`), and a separate test proves the gather
+phase never holds more than one channel's messages resident at a time by spying on `convert_fn` and
+asserting each prior channel's shard files are already on disk before the next channel converts
+(`test_gather_and_shard_flushes_each_channel_before_converting_the_next`).
+
+The non-monthly `build_digest`/`_gather_digest_data` path is unchanged — single-merged-document jobs
+are not the scale this addresses, and every current job that spans enough channels to be at risk
+already uses `split_by_month`.
+
 ---
 
 ## Known Gaps & Recommendations
@@ -672,6 +969,9 @@ overwriting one file every month. The direct path's default `--out`
 | v2 digest was needlessly large — `indent=2` whitespace measured at ~26% of a real digest file, and `posted_at_utc` (redundant with `posted_at_local`/`ts`) added ~1.0 MB | A real v2 digest was ~22.6 MB. | **Resolved** by `slack-llm-digest-v3` (see `docs/adr/0002-digest-v3-condensation.md`) — `posted_at_utc` dropped, digest file written compact (`separators=(",", ":")`, no `indent`). `message_url` is kept despite being derivable, since the LLM must never construct a `p<ts>` link itself (ADR-0001). Measured ~15.7 MB post-condensation, parsed content identical minus `posted_at_utc`. |
 | Bot-posted Block Kit backblasts lost their PAX list — `mentions[]` extraction read only `msg.text`, but the *PAX*: line with its `<@U...>` mentions lives in `blocks[].text.text` while `text` is a narrative-only fallback | Confirmed on f3kirkland/ao-heritage-park ts=1783887179.871339: 14 PAX mentions existed only in blocks. Most backblasts in this deployment are bot-posted, so structured PAX data was silently missing digest-wide (SlackBackup-rie). | **Resolved** in v3 — `_clean`'s evidence path extracts mentions/links from top-level `text` plus every Block Kit block's `text.text`, deduped in first-appearance order across both sources. |
 | Cross-workspace mention tracking left wholly to the LLM — "where is this PAX mentioned" required a full-digest scan plus ad-hoc identity merging in every prompt | ADR-0001 deliberately deferred all identity merging, including the deterministic subset (same email, same F3 name + real name). | **Resolved** in v3 by the top-level `mentions` index (`docs/adr/0003-mentions-index-deterministic-identity.md`) — deterministic unification with confidence flags; ambiguous collisions flagged, never merged; ts-only locations, everything else derived downstream. |
+| `f3-pugetsound`'s digest job (383 channels/7 workspaces) OOM-killed mid-run (sat-811) — `_gather_digest_data` accumulates every channel's messages **and** every channel file's extracted `content` into one in-memory `channels_meta`/`messages` for the whole job before anything is written to disk | Measured: `channels_meta`'s file content was 55% of a real digest and month-invariant (duplicated into every monthly file); scaled to 383 channels this plausibly accounts for the bulk of the ~2.3 GB RSS observed at the OOM kill. | **Phase 1 resolved** (this change) — `content` moved out of the digest into the `files_out` sidecar (§`files_out` sidecar above), so it's no longer held for the job's full duration nor duplicated per month. Re-run `f3-pugetsound` under `/usr/bin/time -v` to confirm this alone clears the OOM before committing to **Phase 2** (deferred, sat-811 design doc §4): a month-sharded spill-to-disk rewrite of `_gather_digest_data`/`build_monthly_digests` so no phase ever holds more than one channel's messages, plus `--spill-dir`/`--resume` crash durability. |
+| `files_out` sidecar accumulated a permanent, ever-growing record for every ordinary image/video attachment (JPG/PNG/GIF/HEIC/MP4/MOV, ...) with no extracted text and never any prospect of some — the additive merge kept every one forever (sat-4uf) | Thousands of such files in a real archive; `has_content: false` in v4 already told a consumer this, but explaining *why* still required opening the sidecar for `archive_status`, and the record persisted regardless of diagnostic value. | **Resolved** by `slack-llm-digest-v5`/`slack-llm-files-v2` (see `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) — `archive_status` moves into the digest so `has_content: false` is self-explanatory without the sidecar; the sidecar keeps `content_extracted`/`tombstone` unconditionally and `no_blob`/`unsupported_type` only for non-media files, pruning routine-media records from a pre-v5 sidecar on merge rather than just halting their growth. |
+| Per-channel `description`/`topic`/`purpose` gave the LLM three overlapping fields, one (`description`) a synthesized merge with no Slack UI counterpart and a name that collided with Slack's own "Description" label (which is actually the `purpose` field) | The merge was pure passthrough — `catalog_logic.description_of()` computed once for the catalog cache, re-surfaced as-is by the digest, with no digest logic reading it. | **Resolved** by `slack-llm-digest-v6` (see `docs/adr/0007-digest-v6-drop-merged-description.md`) — `purpose` renamed to `description` (matching Slack's own UI label), the prior merged `description` field dropped; `topic` unchanged. |
 
 ---
 
@@ -680,7 +980,7 @@ overwriting one file every month. The direct path's default `--out`
 | Document | Location | Covers |
 |----------|----------|--------|
 | Backup system design | `docs/DESIGN.md` | Archive layout, `slackdump.sqlite` state, dedupe/archive footguns |
-| Channel catalog | `docs/DESIGN-files.md` | `catalog_logic.py` schema — `description`/`creator`/`created`/`registered_at`/`last_posted` consumed read-only by `export digest` |
+| Channel catalog | `docs/DESIGN-files.md` | `catalog_logic.py` schema — `description`/`topic`/`purpose`/`creator`/`created`/`registered_at`/`last_posted` consumed read-only by `export digest` |
 | slackdump convert | `slackdump help convert` | Export-format conversion from an archive |
 | Slack export format | `slackdump help chunk`, Slack docs | Day-file layout and thread fields |
 | Original digest feature request | `docs/llm-export-suggestion.md` | External feedback that motivated `export digest`'s one-document, embedded-metadata, no-merged-identity design |
