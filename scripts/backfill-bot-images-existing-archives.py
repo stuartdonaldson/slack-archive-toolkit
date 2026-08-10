@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from slackbackup import bot_images_logic, channel_lock, channel_logic  # noqa: E402
+from slackbackup import bot_images_logic, channel_lock, channel_logic, selector_logic  # noqa: E402
 
 
 def main() -> int:
@@ -43,7 +43,7 @@ def main() -> int:
     entries = channel_logic.validate(args.channels_file)
 
     if args.only is not None:
-        wanted = {pair.strip() for pair in args.only.split(",") if pair.strip()}
+        wanted = set(selector_logic.split_selector_list(args.only))
         entries = [e for e in entries if f"{e['workspace']}/{e['name']}" in wanted]
         found = {f"{e['workspace']}/{e['name']}" for e in entries}
         missing = wanted - found

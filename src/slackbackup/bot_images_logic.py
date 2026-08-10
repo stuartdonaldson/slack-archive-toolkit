@@ -17,6 +17,7 @@ Two URL flavors observed in practice:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import urllib.error
@@ -81,8 +82,14 @@ def date_prefix(ts: str) -> str:
 
 
 def target_filename(ts: str, url: str) -> str:
+    """Deterministic per-(message, url) filename - the digest date prefix
+    alone isn't unique (two different posts the same day can share a CDN
+    URL's generic basename, e.g. a thumbnail), so an 8-hex digest of the
+    full (ts, url) pair disambiguates while staying stable/idempotent
+    across runs of the same message."""
     basename = Path(urlparse(url).path).name or "image"
-    return f"{date_prefix(ts)}_{basename}"
+    disambiguator = hashlib.sha1(f"{ts}|{url}".encode()).hexdigest()[:8]
+    return f"{date_prefix(ts)}_{disambiguator}_{basename}"
 
 
 def backfill_channel(
@@ -123,8 +130,15 @@ def backfill_channel(
             log(f"bot-images: skipped (needs auth, not downloaded): {fname} <- {url}")
             continue
 
+        # Downloaded to a sibling .part path and renamed into place only on
+        # full success - urlretrieve leaves a truncated file at `dest` if
+        # the connection drops mid-transfer, which the dest.exists() check
+        # above would otherwise mistake for an already-downloaded image on
+        # every future run and never retry.
+        tmp_dest = dest.with_name(dest.name + ".part")
         try:
-            urllib.request.urlretrieve(url, dest)
+            urllib.request.urlretrieve(url, tmp_dest)
+            tmp_dest.rename(dest)
             stats.downloaded += 1
             log(f"bot-images: wrote {fname}")
         except urllib.error.HTTPError as exc:
@@ -138,5 +152,7 @@ def backfill_channel(
         except (urllib.error.URLError, OSError) as exc:
             stats.failed += 1
             log(f"bot-images: failed {fname} <- {url} ({exc})")
+        finally:
+            tmp_dest.unlink(missing_ok=True)
 
     return stats

@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from slackbackup import slackdump  # noqa: E402
+from slackbackup import channel_lock, slackdump  # noqa: E402
 
 DEFAULT_ARCHIVE_ROOT = Path.home() / "slack-backups"
 
@@ -43,11 +43,15 @@ def load_users(workspace: str, archive_root: Path) -> list[dict]:
     if channel_dir is None:
         raise SystemExit(f"no archived channel found for workspace {workspace!r} under {archive_root}")
 
-    with tempfile.TemporaryDirectory() as export_dir:
-        export_dir_path = Path(export_dir)
-        slackdump.convert_export(channel_dir, export_dir_path)
-        users_file = export_dir_path / "users.json"
-        return json.loads(users_file.read_text()) if users_file.exists() else []
+    try:
+        with channel_lock.channel_lock(channel_dir):
+            with tempfile.TemporaryDirectory() as export_dir:
+                export_dir_path = Path(export_dir)
+                slackdump.convert_export(channel_dir, export_dir_path)
+                users_file = export_dir_path / "users.json"
+                return json.loads(users_file.read_text()) if users_file.exists() else []
+    except channel_lock.ChannelLockedError as exc:
+        raise SystemExit(f"{workspace}: channel busy (backup/dedupe in progress) - {exc}")
 
 
 def flatten(user: dict) -> dict:

@@ -47,10 +47,24 @@ def test_iter_image_blocks_dedupes_duplicate_ts_rows(tmp_path):
 
 
 def test_target_filename_prefixes_date_from_ts():
-    fname = bot_images_logic.target_filename(
-        "1784304534.058099", "https://storage.googleapis.com/f3-public-images/event_instance_images/663445_low_res.png"
-    )
-    assert fname == "2026-07-17_663445_low_res.png"
+    ts = "1784304534.058099"
+    url = "https://storage.googleapis.com/f3-public-images/event_instance_images/663445_low_res.png"
+    fname = bot_images_logic.target_filename(ts, url)
+    assert fname.startswith("2026-07-17_")
+    assert fname.endswith("_663445_low_res.png")
+    # Deterministic - same (ts, url) always produces the same filename, so
+    # idempotency (skip-if-exists) keeps working across runs.
+    assert fname == bot_images_logic.target_filename(ts, url)
+
+
+def test_target_filename_disambiguates_same_day_same_basename():
+    """Two different messages the same day whose URLs share a generic CDN
+    basename must not collide onto the same on-disk filename (would
+    silently drop the second image as "already downloaded")."""
+    url = "https://storage.googleapis.com/f3-public-images/thumb.png"
+    fname_a = bot_images_logic.target_filename("1700000000.000001", url)
+    fname_b = bot_images_logic.target_filename("1700000001.000002", url)
+    assert fname_a != fname_b
 
 
 def test_backfill_channel_no_db_returns_zero_stats(tmp_path):
@@ -75,7 +89,8 @@ def test_backfill_channel_skips_auth_required_host(tmp_path, monkeypatch):
     assert stats.found == 1
     assert stats.skipped_auth == 1
     assert stats.downloaded == 0
-    assert not (tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / "2023-11-14_img.png").exists()
+    fname = bot_images_logic.target_filename("1700000000.000001", "https://files.slack.com/files-pri/T0-F0/img.png")
+    assert not (tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / fname).exists()
 
 
 def test_backfill_channel_downloads_and_is_idempotent(tmp_path, monkeypatch):
@@ -96,7 +111,8 @@ def test_backfill_channel_downloads_and_is_idempotent(tmp_path, monkeypatch):
     assert stats.downloaded == 1
     assert len(calls) == 1
 
-    out_file = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / "2023-11-14_x.png"
+    fname = bot_images_logic.target_filename("1700000000.000001", url)
+    out_file = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / fname
     assert out_file.exists()
 
     # Second run: already on disk, must not re-download.
@@ -128,7 +144,8 @@ def test_backfill_channel_404_writes_gone_marker_and_does_not_retry(tmp_path, mo
     assert stats.failed == 0
     assert len(calls) == 1
 
-    marker = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / ("2023-11-14_x.png" + bot_images_logic.GONE_MARKER_SUFFIX)
+    fname = bot_images_logic.target_filename("1700000000.000001", url)
+    marker = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / (fname + bot_images_logic.GONE_MARKER_SUFFIX)
     assert marker.exists()
 
     # Second run must not retry the dead URL at all.
@@ -152,7 +169,8 @@ def test_backfill_channel_non_404_error_still_retries(tmp_path, monkeypatch):
     stats = bot_images_logic.backfill_channel(tmp_path)
     assert stats.failed == 1
     assert stats.skipped_gone == 0
-    marker = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / ("2023-11-14_x.png" + bot_images_logic.GONE_MARKER_SUFFIX)
+    fname = bot_images_logic.target_filename("1700000000.000001", url)
+    marker = tmp_path / bot_images_logic.DEFAULT_OUT_SUBDIR / (fname + bot_images_logic.GONE_MARKER_SUFFIX)
     assert not marker.exists()
 
 

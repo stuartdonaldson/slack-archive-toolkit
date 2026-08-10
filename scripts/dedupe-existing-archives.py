@@ -29,7 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from slackbackup import channel_logic, slackdump  # noqa: E402
+from slackbackup import channel_lock, channel_logic, selector_logic, slackdump  # noqa: E402
 
 
 def _dry_run_report(channel_dir: Path) -> str | None:
@@ -60,7 +60,7 @@ def main() -> int:
     entries = channel_logic.validate(args.channels_file)
 
     if args.only is not None:
-        wanted = {pair.strip() for pair in args.only.split(",") if pair.strip()}
+        wanted = set(selector_logic.split_selector_list(args.only))
         entries = [e for e in entries if f"{e['workspace']}/{e['name']}" in wanted]
         found = {f"{e['workspace']}/{e['name']}" for e in entries}
         missing = wanted - found
@@ -85,7 +85,11 @@ def main() -> int:
             continue
 
         try:
-            removed = slackdump.dedupe(channel_dir)
+            with channel_lock.channel_lock(channel_dir):
+                removed = slackdump.dedupe(channel_dir)
+        except channel_lock.ChannelLockedError as exc:
+            print(f"{label}: skipping - {exc}", file=sys.stderr)
+            continue
         except slackdump.SlackdumpError as exc:
             print(f"{label}: FAILED - {exc}", file=sys.stderr)
             channels_failed += 1

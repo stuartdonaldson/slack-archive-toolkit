@@ -500,7 +500,16 @@ def _channel_context(catalog: dict, channel_id: str) -> dict:
     created = channel.get("created")
     return {
         "topic": channel.get("topic") or None,
-        "description": channel.get("purpose") or None,
+        # `.get("purpose", channel.get("description"))`, not a plain
+        # `.get("purpose")`: a catalog.json cache written before sat-hkd
+        # added the raw `purpose` key has no such key at all, and would
+        # otherwise report `description: None` for every channel until its
+        # next refresh cycle (full-tier TTL is 6h) even though the cache's
+        # pre-v6 merged `description` value was already correct. Falls back
+        # only when `purpose` is truly absent (missing key) - a channel
+        # with a `purpose` key present but empty still reports None, per
+        # v6/ADR-0007's dropped-merge semantics.
+        "description": channel.get("purpose", channel.get("description")) or None,
         "creator": channel.get("creator") or None,
         "created_at": (
             datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created else None
@@ -1479,6 +1488,10 @@ def _gather_digest_data(
         # backfill - a channel mid-resume/dedupe must not be read here, and
         # a lock conflict is a soft skip (like missing_archive above), not
         # a hard failure - one busy channel must not abort the whole digest.
+        # _load_channel_files/_load_team_id read slackdump.sqlite too, so
+        # they must stay inside the lock alongside convert_fn - releasing it
+        # first would let a concurrent resume/dedupe rewrite the FILE table
+        # out from under this read (see code-review finding on PR #6).
         try:
             with channel_lock.channel_lock(channel_dir):
                 with tempfile.TemporaryDirectory() as export_dir:
@@ -1486,6 +1499,8 @@ def _gather_digest_data(
                     convert_fn(channel_dir, export_dir_path)
                     all_messages = _load_all_messages(export_dir_path)
                     users_map = _load_users_map(export_dir_path)
+                files_full = _load_channel_files(channel_dir)
+                team_id = _load_team_id(channel_dir)
         except channel_lock.ChannelLockedError as exc:
             print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
             channels_meta.append(
@@ -1512,7 +1527,6 @@ def _gather_digest_data(
             _enrich_for_digest(msg, workspace, channel, channel_id)
         _assign_digest_seq(cleaned)
         messages.extend(cleaned)
-        files_full = _load_channel_files(channel_dir)
         if files_out_sink is not None:
             profiles = profiles_by_workspace.get(workspace, {})
             for f in files_full:
@@ -1527,7 +1541,7 @@ def _gather_digest_data(
         channels_meta.append(
             {
                 "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, _load_team_id(channel_dir)),
+                "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, team_id),
                 "files": [_digest_file_view(f) for f in files_full], **channel_info,
             }
         )
@@ -1692,10 +1706,33 @@ def gather_and_shard_digest_data(
 
             if resumed:
                 months_seen.update(_channel_months_on_disk(spill_dir, workspace, channel_id))
+                # Still reads slackdump.sqlite (files[] view, team_id for
+                # channel_url) below, so it still needs the lock even though
+                # convert_fn/dedupe is skipped - see the non-resumed branch's
+                # note on why these reads share the lock.
+                try:
+                    with channel_lock.channel_lock(channel_dir):
+                        files_full = _load_channel_files(channel_dir)
+                        team_id = _load_team_id(channel_dir)
+                except channel_lock.ChannelLockedError as exc:
+                    print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
+                    channels_meta.append(
+                        {
+                            "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                            "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                            "files": [], **channel_info,
+                        }
+                    )
+                    continue
             else:
                 # sat-7k9: shares the per-channel lock with backup/dedupe -
                 # a lock conflict is a soft skip (like missing_archive
-                # above), not a hard failure.
+                # above), not a hard failure. _load_channel_files/
+                # _load_team_id read slackdump.sqlite too, so they stay
+                # inside the lock alongside convert_fn - releasing it first
+                # would let a concurrent resume/dedupe rewrite the FILE
+                # table out from under this read (see code-review finding
+                # on PR #6).
                 try:
                     with channel_lock.channel_lock(channel_dir):
                         with tempfile.TemporaryDirectory() as export_dir:
@@ -1703,6 +1740,8 @@ def gather_and_shard_digest_data(
                             convert_fn(channel_dir, export_dir_path)
                             all_messages = _load_all_messages(export_dir_path)
                             users_map = _load_users_map(export_dir_path)
+                        files_full = _load_channel_files(channel_dir)
+                        team_id = _load_team_id(channel_dir)
                 except channel_lock.ChannelLockedError as exc:
                     print(f"export digest: skipping {workspace}/{channel} - {exc}", file=sys.stderr)
                     channels_meta.append(
@@ -1731,7 +1770,6 @@ def gather_and_shard_digest_data(
                         for msg in month_messages:
                             _write_ndjson_line(shard_fp, msg)
 
-                files_full = _load_channel_files(channel_dir)
                 profiles = profiles_by_workspace.get(workspace, {})
                 for f in files_full:
                     file_entry = {**f, "workspace": workspace, "channel": channel, "channel_id": channel_id}
@@ -1747,14 +1785,12 @@ def gather_and_shard_digest_data(
                 done_marker.touch()
 
             # channels_meta's own files[] view (has_content only, no content)
-            # is cheap (sqlite-only, no convert_fn) and always recomputed
-            # regardless of resume - files_full above is reused when this
-            # channel was freshly processed to avoid extracting twice.
-            files_full = files_full if not resumed else _load_channel_files(channel_dir)
+            # is cheap (sqlite-only, no convert_fn) and reused from whichever
+            # branch above (fresh or resumed) already loaded it under lock.
             channels_meta.append(
                 {
                     "workspace": workspace, "channel": channel, "channel_id": channel_id,
-                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, _load_team_id(channel_dir)),
+                    "status": "ok", "channel_url": digest_channel_url(workspace, channel_id, team_id),
                     "files": [_digest_file_view(f) for f in files_full], **channel_info,
                 }
             )

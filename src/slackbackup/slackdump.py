@@ -148,7 +148,18 @@ def dedupe(channel_dir: Path) -> int:
         raise SlackdumpError(f"slackdump tools dedupe failed: {result.stderr}")
     for line in result.stdout.splitlines():
         if line.startswith("Removed messages:"):
-            return int(line.split(":", 1)[1].strip())
+            count_text = line.split(":", 1)[1].strip()
+            try:
+                return int(count_text)
+            except ValueError:
+                # A future/different slackdump build changing this line's
+                # format (e.g. adding a trailing annotation) must not abort
+                # the whole nightly batch over one channel's dedupe count -
+                # treat as SlackdumpError so every existing caller's
+                # except-and-skip handling covers it too.
+                raise SlackdumpError(
+                    f"slackdump tools dedupe: unparseable 'Removed messages' line: {line!r}"
+                )
     return 0
 
 

@@ -175,7 +175,7 @@ A Canvas or file's own currency (whether its content reflects a recent edit or a
 
 1. `modification_history[].at` (surfaced as `last_modified_at`) — a real edit event: Slack's own "X made updates to a canvas tab" notice, with the editor's name and a link back to that message via `message_ts`.
 2. `content_changed_at` — the extracted text's own sha256 changed between two backup runs. This survives even if the edit notice above was deleted from the channel (see the asymmetry below).
-3. `last_shared_ts` / a re-share of the file in a later message — evidence the document is still in active use, weaker than an actual content change.
+3. `shared_message_ts` / a re-share of the file in a later message — evidence the document is still in active use, weaker than an actual content change.
 4. `created_at` — Slack's original creation time. **For a Canvas this is a creation date, not a currency date** — a Canvas is edited in place, so an old `created_at` does not imply the content is stale.
 
 **Critical asymmetry — do not invert this:** presence of a `modification_history` event is fully authoritative (trust it). Absence of one is **not** evidence the file was never edited — these notices are sometimes manually deleted by channel members because they clutter the channel for human readers. Every Canvas entry carries `modification_history_completeness: "partial"` unconditionally for this reason. If asked "which canvases are out of date," never answer from an empty or old `modification_history` alone — check `content_changed_at` too, and if both are uninformative, say the currency is unknown rather than assuming staleness.

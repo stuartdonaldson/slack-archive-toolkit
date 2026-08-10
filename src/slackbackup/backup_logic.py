@@ -281,6 +281,7 @@ def backup_channel(
                 "(incremental archive untouched)"
             )
             slackdump.archive(channel_id, full_dir)
+            catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(full_dir / "slackdump.sqlite"))
             _backfill_bot_images_quietly(full_dir)
             _write_last_backup(full_dir)
             return "archive"
