@@ -63,6 +63,7 @@ Output a concise Markdown newsletter.
 * For every event, include date, time, location, and signup/contact link when available.
 * Convert timestamps to Pacific time if needed for readable newsletter copy.
 * Be careful with relative dates like "tomorrow," "next week," or "this Friday." Resolve them using the post date when possible. If not possible, leave the detail uncertain.
+* Do not state the day of the week for a date unless a source message states it. Weekday-from-date arithmetic is unreliable and a wrong weekday reads as authoritative — write "August 6" rather than "Wednesday, August 6" when no source said "Wednesday." (The automated render chain solves this differently; see `newsletter-postprocessed.md`.)
 * For cross-region events, identify the canonical/original event post when possible.
 * If other regions reference the same event, merge those references into one event item and cite the canonical source first.
 * Include the event under the host/canonical region. Also mention it in a short "Cross-region events to know" section if it is broadly relevant to Puget Sound PAX.

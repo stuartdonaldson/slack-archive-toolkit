@@ -73,7 +73,7 @@ One role is not evidence of another. Current maintained Slack evidence outranks 
 | Location | Purpose | Upload by default? |
 | --- | --- | --- |
 | [uploads](uploads) | Individually uploadable knowledge documents and augmentations. | Yes, select individual files. |
-| [prompts](prompts) | Specialized operator templates for a newsletter or FNG guide. | No; paste or attach one only when needed. |
+| [prompts](prompts) | Specialized operator templates for a newsletter or FNG guide. `newsletter-postprocessed.md` is an overlay on `newsletter.md` for the automated render chain only — it assumes `scripts/postprocess_dates.py` runs on the output. | No; paste or attach one only when needed. |
 | [project-instructions.md](project-instructions.md) | Paste-ready ChatGPT Project instructions. | No; paste into the instruction box. |
 | [session-preamble.md](session-preamble.md) | First message for a one-off chat. | No; paste as the first message. |
 | [validation-set.md](validation-set.md) | Maintainer test specification. | No; use during validation. |
