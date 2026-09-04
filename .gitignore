@@ -31,6 +31,14 @@ search-results.html
 # being backed up. Not source; never committed.
 channels.json
 
+# Operator's real tracked-DM list - grows via `dm register-matching`. Higher
+# PII sensitivity than channels.json: a 1:1 entry's name embeds the other
+# participant's user id, and a group-DM entry's Slack-given name embeds every
+# participant's username (see slackdump.py's list_channels() docstring for
+# why this project already filters these out of every channel listing). Not
+# source; never committed.
+dms.json
+
 # DM channel-id -> user-id maps (mild PII). The repo's git history was squashed
 # once already to purge these; ignore defensively so they can never be
 # re-published from the working tree.

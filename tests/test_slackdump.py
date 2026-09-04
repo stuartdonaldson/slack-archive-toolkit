@@ -44,6 +44,49 @@ def test_list_channels_empty_output_returns_empty_list(monkeypatch):
     assert slackdump.list_channels(member_only=True) == []
 
 
+def test_list_dms_returns_plain_and_group_dms(monkeypatch):
+    raw = [
+        {"id": "C1", "name": "general", "is_channel": True},
+        {"id": "D1", "name": "", "is_channel": False, "is_im": True, "user": "U1"},
+        {"id": "C2", "name": "mpdm-alice--bob--carol-1", "is_channel": True, "is_mpim": True},
+    ]
+    monkeypatch.setattr(slackdump, "_run", lambda args, timeout=None: _fake_completed(json.dumps(raw)))
+
+    result = slackdump.list_dms()
+
+    assert [d["id"] for d in result] == ["D1", "C2"]
+
+
+def test_list_dms_excludes_group_dms_when_not_requested(monkeypatch):
+    raw = [
+        {"id": "D1", "name": "", "is_channel": False, "is_im": True, "user": "U1"},
+        {"id": "C2", "name": "mpdm-alice--bob--carol-1", "is_channel": True, "is_mpim": True},
+    ]
+    monkeypatch.setattr(slackdump, "_run", lambda args, timeout=None: _fake_completed(json.dumps(raw)))
+
+    result = slackdump.list_dms(include_group=False)
+
+    assert [d["id"] for d in result] == ["D1"]
+
+
+def test_list_dms_uses_member_only_listing(monkeypatch):
+    seen_args = []
+
+    def fake_run(args, timeout=None):
+        seen_args.append(args)
+        return _fake_completed("[]")
+
+    monkeypatch.setattr(slackdump, "_run", fake_run)
+    slackdump.list_dms()
+
+    assert "-member-only" in seen_args[0]
+
+
+def test_list_dms_empty_output_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(slackdump, "_run", lambda args, timeout=None: _fake_completed(""))
+    assert slackdump.list_dms() == []
+
+
 def test_list_channels_failure_raises(monkeypatch):
     monkeypatch.setattr(
         slackdump, "_run",
@@ -180,3 +223,38 @@ def test_archive_timeout_propagates_as_slackdump_error(monkeypatch, tmp_path):
         assert False, "expected SlackdumpError"
     except slackdump.SlackdumpError as exc:
         assert "timed out" in str(exc)
+
+
+def test_convert_export_passes_files_false(monkeypatch, tmp_path):
+    # sat-tdv: convert -f export copies attachment blobs by default and
+    # aborts the whole channel if one referenced blob is missing on disk
+    # (e.g. manually deleted to reclaim space). The digest pipeline never
+    # reads convert's copied attachments - -files=false must always be
+    # passed so a missing blob can't fail conversion.
+    captured = {}
+
+    def _run(args, timeout=None):
+        captured["args"] = args
+        return _fake_completed("")
+
+    monkeypatch.setattr(slackdump, "_run", _run)
+
+    channel_dir = tmp_path / "f3test" / "general"
+    out_dir = tmp_path / "out"
+    slackdump.convert_export(channel_dir, out_dir)
+
+    assert captured["args"] == [
+        "convert", "-f", "export", "-files=false", "-o", str(out_dir), str(channel_dir),
+    ]
+
+
+def test_convert_export_failure_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        slackdump, "_run",
+        lambda args, timeout=None: subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
+    )
+    try:
+        slackdump.convert_export(tmp_path, tmp_path / "out")
+        assert False, "expected SlackdumpError"
+    except slackdump.SlackdumpError as exc:
+        assert "boom" in str(exc)

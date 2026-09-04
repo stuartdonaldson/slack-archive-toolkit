@@ -73,15 +73,20 @@ def workspace_import(env_file: Path) -> None:
         raise SlackdumpError(f"slackdump workspace import failed: {result.stderr}")
 
 
-def list_channels(member_only: bool) -> list[dict]:
-    """`list channels [-member-only] -format JSON`. Always passes
-    -no-chan-cache: slackdump's own internal channel-list cache (20-minute
-    default, shared across every workspace under the same cache-dir) was
-    observed returning another, recently-queried workspace's stale result
-    right after switching workspaces. We maintain our own catalog cache
-    already, so slackdump's internal one is pure redundant risk - always
-    disabled. Always passes -no-json so it doesn't also drop a
-    `channels-<team>.json` file into the current directory as a side effect.
+def _list_raw(member_only: bool) -> list[dict]:
+    """`list channels [-member-only] -format JSON`, unfiltered. Always
+    passes -no-chan-cache: slackdump's own internal channel-list cache
+    (20-minute default, shared across every workspace under the same
+    cache-dir) was observed returning another, recently-queried workspace's
+    stale result right after switching workspaces. We maintain our own
+    catalog cache already, so slackdump's internal one is pure redundant
+    risk - always disabled. Always passes -no-json so it doesn't also drop
+    a `channels-<team>.json` file into the current directory as a side
+    effect.
+
+    Shared by list_channels() (which filters DMs OUT) and list_dms() (which
+    filters everything else out) - one subprocess call, two views of the
+    same raw listing, so neither caller pays for a second API round trip.
     """
     args = ["list", "channels", "-format", "JSON", "-no-json", "-no-chan-cache"]
     if member_only:
@@ -90,17 +95,41 @@ def list_channels(member_only: bool) -> list[dict]:
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump list channels failed: {result.stderr}")
     text = result.stdout.strip()
-    entries = json.loads(text) if text else []
-    # Confirmed empirically (even with -member-only): this also returns DM
-    # conversations - is_channel:false, blank name, id prefixed D instead of
-    # C. Multi-person DMs (group chats) are sneakier: Slack reports
-    # is_channel:true for them too, with a C-prefixed id - the only
-    # reliable signal is the name, which Slack always prefixes "mpdm-" and
-    # embeds the real usernames of every participant in (a privacy leak,
-    # not just noise, if these slip into channels.json). Filter both out
-    # here so no caller (catalog/channel registration) ever sees them, on
-    # either tier.
+    return json.loads(text) if text else []
+
+
+def list_channels(member_only: bool) -> list[dict]:
+    """Real channels only - never a DM. Confirmed empirically (even with
+    -member-only): the raw listing also returns DM conversations -
+    is_channel:false, blank name, id prefixed D instead of C. Multi-person
+    DMs (group chats) are sneakier: Slack reports is_channel:true for them
+    too, with a C-prefixed id - the only reliable signal is the name, which
+    Slack always prefixes "mpdm-" and embeds the real usernames of every
+    participant in (a privacy leak, not just noise, if these slip into
+    channels.json). Filter both out here so no caller (catalog/channel
+    registration) ever sees them, on either tier. See list_dms() for the
+    complementary view that surfaces exactly what this filters out.
+    """
+    entries = _list_raw(member_only)
     return [e for e in entries if e.get("is_channel") and not e.get("name", "").startswith("mpdm-")]
+
+
+def list_dms(include_group: bool = True) -> list[dict]:
+    """Plain (`is_im`) and, unless `include_group` is False, group
+    (`is_mpim`/`mpdm-`-named) DM conversations - the complement of
+    list_channels()'s filter, see there for the raw-shape details. Always
+    uses the cheap member-only tier: a DM/group-DM conversation only
+    appears in a listing you're a member of by definition (there is no
+    "public DM" to discover via the expensive full-tier scan), so there is
+    never a reason to pay list_channels'/register_matching's full-scan cost
+    here.
+    """
+    entries = _list_raw(member_only=True)
+    ims = [e for e in entries if e.get("is_im")]
+    if not include_group:
+        return ims
+    mpims = [e for e in entries if e.get("is_mpim") or e.get("name", "").startswith("mpdm-")]
+    return ims + mpims
 
 
 def search_files(term: str, out_dir: Path) -> bool:
@@ -165,7 +194,16 @@ def dedupe(channel_dir: Path) -> int:
 
 def convert_export(channel_dir: Path, out_dir: Path) -> None:
     """`convert -f export` takes the archive *directory* (containing
-    slackdump.sqlite) as its source, not the .sqlite file path itself."""
-    result = _run(["convert", "-f", "export", "-o", str(out_dir), str(channel_dir)])
+    slackdump.sqlite) as its source, not the .sqlite file path itself.
+
+    -files=false: the digest pipeline is text-only and never reads the
+    export's copied attachments - export_logic reads file blobs straight
+    from the archive's own __uploads/ + FILE table (_load_channel_files),
+    independent of convert. Without this flag, convert copies every
+    attachment and aborts the whole channel (exit 006) the moment one
+    referenced blob is missing on disk (e.g. manually deleted to reclaim
+    space) - "copy error: file ID=...: file does not exist" - even though
+    file *metadata* in the message JSON is unaffected either way (sat-tdv)."""
+    result = _run(["convert", "-f", "export", "-files=false", "-o", str(out_dir), str(channel_dir)])
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump convert -f export failed: {result.stderr}")

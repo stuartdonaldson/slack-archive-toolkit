@@ -34,24 +34,33 @@ mkdir -p "$HOME/slack-exports"
 # subtree each run so operator uploads stay in sync with git. Mirror the
 # whole tree EXCEPT planning/review/maintenance material that must not reach
 # the runtime upload area — a deny-list via rsync --exclude, not a per-file
-# allow-list, so a new prompt or augmentation file is picked up automatically
+# allow-list, so a new prompt or supplemental file is picked up automatically
 # without editing this script.
+#
+# rsync --delete alone is not a full replace: files matching an --exclude
+# pattern are also, by default, protected from deletion on the receiving
+# side. A file that was copied here under an older/looser exclude list (or
+# hand-copied in) would then persist forever instead of being replaced by
+# this run's version of the tree. Wipe the destination first so every run
+# reproduces docs/llm-context/ (filtered) from scratch, not "current dest
+# plus whatever changed".
+rm -rf "$HOME/slack-exports/llm-context"
 mkdir -p "$HOME/slack-exports/llm-context"
-rsync -a --delete \
+rsync -a \
    --exclude 'README.md' \
    --exclude 'MIGRATION-PLAN.md' \
    --exclude 'REVIEW-*.md' \
    --exclude 'VALIDATION-RESULTS.md' \
    --exclude 'validation-set.md' \
-    --exclude 'uploads/augmentations/archive/' \
-    --exclude 'uploads/augmentations/sources/' \
+    --exclude 'uploads/supplemental/archive/' \
+    --exclude 'uploads/supplemental/sources/' \
    "$REPO_ROOT/docs/llm-context/" "$HOME/slack-exports/llm-context/"
 # Excluded: this dir's own operator-facing README (assembly/maintenance
 # guide, not upload content), planning/review/validation records, archived
-# superseded augmentation snapshots, and raw source material backing a
-# cumulative augmentation (e.g. sotn-transcripts.md's transcripts) — citation
-# backup, not upload material. The augmentation index is retained under
-# uploads/ because it is individually uploaded with selected augmentations.
+# superseded supplemental snapshots, and raw source material backing a
+# cumulative supplemental file (e.g. sotn-summaries.md's raw transcript) — citation
+# backup, not upload material. The supplemental index is retained under
+# uploads/ because it is individually uploaded with selected supplemental files.
 
 # The legacy per-file prompt/context docs (F3 culture notes, ingestion/
 # newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the
@@ -98,6 +107,21 @@ rsync -a --delete \
 
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"
+
+    # DM/group-DM counterpart of the channel register+backup pair above -
+    # dm_logic.register_matching() discovers/prunes dms.json the same way,
+    # cheaply (member-only tier only, no full-scan cost - see dm_logic.py),
+    # then backup_logic.run() (via `backup run`) archives them exactly like
+    # channels.json entries since the two files share one {id,name,workspace}
+    # shape. jobs/f3-dm-digest.json (gitignored, like every other real job
+    # file) is picked up automatically by the --jobs glob below - no separate
+    # digest command needed here.
+    echo "dm register-matching: scanning all registered workspaces tonight"
+    ./slackbackup dm register-matching '*' --dms-file dms.json
+    echo "----- dm register-matching exited $? -----"
+
+    ./slackbackup backup run dms.json "$ARCHIVE_ROOT"
+    echo "----- dm backup run exited $? -----"
 
     # Per-recipient report jobs (jobs/*.json, gitignored - see .gitignore's
     # comment on that pattern): each job file names its own workspace
