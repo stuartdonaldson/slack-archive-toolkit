@@ -63,6 +63,7 @@ monolithic file — check all of these, not just `docs/DESIGN.md`:
 | docs/DESIGN.md | Per-channel message backup (archive/resume, channels.json) |
 | docs/DESIGN-export.md | Monthly JSON export of an archived channel |
 | docs/DESIGN-files.md | Channel catalog + canvas/file harvesting — **designed, not yet implemented** |
+| docs/DESIGN-dms.md | DM/group-DM tracking, backup, and the cross-workspace `f3-dm-digest` |
 | docs/references/slackdump-cli-notes.md | slackdump CLI behavior/cost/gotchas — check before re-deriving anything about how slackdump itself behaves |
 
 A digest/profile/sidecar schema change (docs/DESIGN-export.md is the schema authority) requires

@@ -36,8 +36,17 @@ mkdir -p "$HOME/slack-exports"
 # the runtime upload area — a deny-list via rsync --exclude, not a per-file
 # allow-list, so a new prompt or supplemental file is picked up automatically
 # without editing this script.
+#
+# rsync --delete alone is not a full replace: files matching an --exclude
+# pattern are also, by default, protected from deletion on the receiving
+# side. A file that was copied here under an older/looser exclude list (or
+# hand-copied in) would then persist forever instead of being replaced by
+# this run's version of the tree. Wipe the destination first so every run
+# reproduces docs/llm-context/ (filtered) from scratch, not "current dest
+# plus whatever changed".
+rm -rf "$HOME/slack-exports/llm-context"
 mkdir -p "$HOME/slack-exports/llm-context"
-rsync -a --delete \
+rsync -a \
    --exclude 'README.md' \
    --exclude 'MIGRATION-PLAN.md' \
    --exclude 'REVIEW-*.md' \
@@ -49,7 +58,7 @@ rsync -a --delete \
 # Excluded: this dir's own operator-facing README (assembly/maintenance
 # guide, not upload content), planning/review/validation records, archived
 # superseded supplemental snapshots, and raw source material backing a
-# cumulative supplemental file (e.g. sotn-summaries.md's transcripts) — citation
+# cumulative supplemental file (e.g. sotn-summaries.md's raw transcript) — citation
 # backup, not upload material. The supplemental index is retained under
 # uploads/ because it is individually uploaded with selected supplemental files.
 
@@ -98,6 +107,21 @@ rsync -a --delete \
 
     ./slackbackup backup run channels.json "$ARCHIVE_ROOT"
     echo "----- backup run exited $? -----"
+
+    # DM/group-DM counterpart of the channel register+backup pair above -
+    # dm_logic.register_matching() discovers/prunes dms.json the same way,
+    # cheaply (member-only tier only, no full-scan cost - see dm_logic.py),
+    # then backup_logic.run() (via `backup run`) archives them exactly like
+    # channels.json entries since the two files share one {id,name,workspace}
+    # shape. jobs/f3-dm-digest.json (gitignored, like every other real job
+    # file) is picked up automatically by the --jobs glob below - no separate
+    # digest command needed here.
+    echo "dm register-matching: scanning all registered workspaces tonight"
+    ./slackbackup dm register-matching '*' --dms-file dms.json
+    echo "----- dm register-matching exited $? -----"
+
+    ./slackbackup backup run dms.json "$ARCHIVE_ROOT"
+    echo "----- dm backup run exited $? -----"
 
     # Per-recipient report jobs (jobs/*.json, gitignored - see .gitignore's
     # comment on that pattern): each job file names its own workspace

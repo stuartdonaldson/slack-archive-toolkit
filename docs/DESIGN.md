@@ -39,8 +39,8 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
   bulk-discover every new public channel matching a glob across a workspace glob
   (`register_matching`), filtering out private/archived/`shuttered*`-named channels. The same
   call also prunes already-tracked channels that have since become archived or dropped out of a
-  complete full-tier scan entirely (`shuttered*` exempt) — see
-  `docs/DESIGN-files.md` §Pruning archived/missing channels.
+  complete full-tier scan entirely (`shuttered*` exempt) — see `docs/DESIGN-files.md` §Pruning
+  archived/missing channels.
 - **DM tracking** (`dm_logic.py`) — the DM/group-DM counterpart, in a deliberately *separate*
   file (`dms.json`, same `{id, name, workspace}` shape) rather than a flag inside `channels.json`
   — see `docs/DESIGN-dms.md`.
