@@ -2,8 +2,8 @@
 
 | Field | Value |
 | --- | --- |
-| `collected:` | 2026-08-10 |
-| `source:` | Manual review of `/f3-nation-settings` and F3-Nation Slack bot behavior; org.f3nation.com/map.f3nation.com/pax-vault.f3nation.com entries added from source-code review of the `f3-nation`, `f3-org-map`, and `pax-vault` repos (data-fetch queries, API routers, permission checks) — see `f3-nation-data-model.md` in the reviewer's workspace for the underlying trace; tool details added by the project maintainer |
+| `collected:` | 2026-08-12 |
+| `source:` | Manual review of `/f3-nation-settings` and F3-Nation Slack bot behavior; org.f3nation.com/map.f3nation.com/pax-vault.f3nation.com entries added from source-code review of the `f3-nation`, `f3-org-map`, and `pax-vault` repos (data-fetch queries, API routers, permission checks) — see `f3-nation-data-model.md` in the reviewer's workspace for the underlying trace; tool details added by the project maintainer; field-level display reference (AO/Location/Event/PAX, `locationId` URL param, inactive-Location behavior, PAX Calendar-name edit path) added 2026-08-12 from the project maintainer's own map/calendar reference notes; AO/`locationId`/inactive-Location claims cross-checked 2026-08-12 against `f3-nation` source (`calendar_images.py`, map `location.ts`/`initial-location-provider.tsx`) and confirmed — see `f3-nation-data-model.md`'s 2026-08-12 addendum; PAX F3-Name edit-path claim was corrected the same pass (also self-service in Slack, not admin-app-only) |
 | `collected_by:` | Project maintainer (manual extraction + code review) |
 | `fidelity:` | `hand-compiled` |
 | `coverage:` | F3-Nation tool reference (including org.f3nation.com, map.f3nation.com, pax-vault.f3nation.com data sources and edit paths), Slack bot feature list, region-vs-infrastructure-vs-workspace ownership split, diagnostic routing |
@@ -11,14 +11,14 @@
 | `refresh_trigger:` | A covered F3-Nation tool adds/removes a major feature, or ownership of an infrastructure item changes |
 | `refresh_owner:` | Project maintainer |
 
-Apply the `fidelity` value above using the table in [query-policy.md](../query-policy.md#dated-augmentation-evidence): `hand-compiled` supports `Medium` at best, and resolves as `Contested` (both sides stated, neither asserted) against conflicting dated Slack evidence.
+Apply the `fidelity` value above using the table in [query-policy.md](../query-policy.md#dated-supplemental-evidence): `hand-compiled` supports `Medium` at best, and resolves as `Contested` (both sides stated, neither asserted) against conflicting dated Slack evidence.
 
 ## Purpose
 
 The Slack digest and user profile exports are strong for visible Slack activity,
 channel metadata, profile data, and Slack workspace roles. They do **not**
 describe the F3-Nation tool ecosystem, the app's internal regional admin list,
-or the bot-configuration ownership model. This augmentation fills those gaps.
+or the bot-configuration ownership model. This supplemental file fills those gaps.
 
 Use it when answering questions about:
 
@@ -87,6 +87,44 @@ from `api.f3nation.com` in `f3-nation-pugetsound.md` — treat that file as
 the current instance of this table's "where to correct it" column, not this
 static reference.
 
+### Field-level display reference (AO / Location / Event / PAX)
+
+Record-level detail behind the quick-routing table above — which record type
+carries which field, and where each is required for something else to render.
+
+- **AO**
+  - Required for an Event to exist (every Event belongs to an AO).
+  - The AO description is what appears on the weekly auto-generated Calendar
+    graphic (see the bot's "calendar image posts" feature, above).
+
+- **Location**
+  - Required for an Event to appear on Calendar graphics — an Event without a
+    Location does not render on the weekly graphic even if it otherwise has a
+    valid AO and schedule.
+  - The Location description is what appears under **Where** on
+    `map.f3nation.com`.
+  - The map is driven by `locationId`: a specific Location can be opened
+    directly at `https://map.f3nation.com/?locationId=<LOCATION_ID>`.
+  - A Location's page lists every Event associated with that Location.
+  - **Inactive Locations** are excluded from map search results, but remain
+    directly viewable via their `locationId` URL — the map gives no visual
+    indication on that page that the Location is inactive. Do not assume a
+    Location found by `locationId` is currently active.
+
+- **Event**
+  - Recurring Events (the standing weekly schedule) appear on
+    `map.f3nation.com`, consistent with the routing table above.
+  - The Event description is what appears under **Notes** on the map.
+  - Event day/time appear on both the Calendar graphic and on
+    `map.f3nation.com`.
+
+- **PAX**
+  - The F3 Name shown on the Calendar graphic is editable at
+    `admin.f3nation.com` under **My Users**, or by the PAX themselves in
+    Slack via `/f3-nation-settings` → User Settings (self-service; writes
+    the same `f3_name` field — `f3-nation/apps/slackbot/features/user.py`).
+    Not admin-only, and not admin-app-only.
+
 ### org.f3nation.com
 
 - **Purpose:** Visualize the F3 org hierarchy (sector → area → region → AO) as map boundary polygons, and show each org's filled leadership positions on hover/click.
@@ -141,8 +179,8 @@ Slack-visible version (channel topic/purpose, pinned messages, casual
 mentions) are **not the same data and are not kept in sync automatically** —
 one is admin/database-maintained, the other is community-maintained, and
 either can be stale. Report both when they disagree rather than picking one;
-see [f3-augmentation-index.md §Deliberate dual-sourcing](f3-augmentation-index.md#deliberate-dual-sourcing-f3-nation-app-data-vs-slack)
-and [query-policy.md](../query-policy.md#dated-augmentation-evidence) for how
+see [f3-supplemental-index.md §Deliberate dual-sourcing](f3-supplemental-index.md#deliberate-dual-sourcing-f3-nation-app-data-vs-slack)
+and [query-policy.md](../query-policy.md#dated-supplemental-evidence) for how
 to rank and present the conflict.
 
 Key rule: **F3-Nation app admin ≠ Slack workspace admin ≠ Site Q.**

@@ -7,7 +7,7 @@
 > transcription errors — especially in names. Cite
 > [sotn-summaries.md](../sotn-summaries.md) for the fact; cite this file only for the wording.
 
-`collected:` 2026-07-30 · `source:` audio transcript of the July 2026 F3 Nation State of the Nation call · `fidelity:` `system-extracted` (verbatim machine transcript; the derived augmentation entry is `hand-compiled`)
+`collected:` 2026-07-30 · `source:` audio transcript of the July 2026 F3 Nation State of the Nation call · `fidelity:` `system-extracted` (verbatim machine transcript; the derived supplemental entry is `hand-compiled`)
 
 ---
 

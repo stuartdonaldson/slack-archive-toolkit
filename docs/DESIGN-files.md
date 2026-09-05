@@ -275,6 +275,27 @@ A bulk run against real data initially picked up ~720 channels including private
 leaks above before these fixes landed; after fixing all three, a clean re-run against the same
 workspace produced the expected ~380 legitimate public channels.
 
+#### Pruning archived/missing channels (sat-21k)
+
+`register_matching` also prunes, using the same per-workspace full-tier scan it already does to
+find new channels — no extra API cost. For each already-tracked channel matching the call's
+workspace/channel globs, it's removed from `channels.json` (reported under `"removed"`, never
+`"skipped"`) when either:
+
+- it's now `is_archived` in the catalog (reason `"archived"`), or
+- it's entirely absent from the workspace's full-tier catalog (reason `"missing"`) — **only**
+  when that workspace's scan this run is `catalog["full_scan_complete"]`. `refresh_full` sets this
+  `False` whenever `slackdump list_channels` came back looking implausibly truncated after all
+  retries (sat-dnr: an intermittent cold-cache call has been observed returning a handful of
+  channels instead of the real count) — that flag is the only signal pruning trusts; a truncated
+  scan must never be read as proof a channel is gone, so nothing is pruned as `"missing"` for that
+  workspace on a truncated run.
+
+`shuttered*`-named channels are exempt from both reasons, same rationale as their registration
+exemption above. Pruning only edits `channels.json` — it never touches the channel's local
+archive directory under `~/slack-backups/<workspace>/<slug>/`, so re-registering a pruned channel
+later (e.g. it gets un-archived) resumes from the same archive rather than starting over.
+
 ## Open items — resolved during implementation
 
 - `slackdump tools merge` was verified empirically and turned out **not usable**:

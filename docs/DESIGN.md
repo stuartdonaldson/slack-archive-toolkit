@@ -37,7 +37,13 @@ on `slackdump`'s output and on small JSON files this app maintains itself:
 - **Channel tracking** (`channel_logic.py`) — `channels.json` is a deliberately minimal join-key
   list (`{id, name, workspace}`); decides whether to register one channel by exact name, or to
   bulk-discover every new public channel matching a glob across a workspace glob
-  (`register_matching`), filtering out private/archived/`shuttered*`-named channels.
+  (`register_matching`), filtering out private/archived/`shuttered*`-named channels. The same
+  call also prunes already-tracked channels that have since become archived or dropped out of a
+  complete full-tier scan entirely (`shuttered*` exempt) — see
+  `docs/DESIGN-files.md` §Pruning archived/missing channels.
+- **DM tracking** (`dm_logic.py`) — the DM/group-DM counterpart, in a deliberately *separate*
+  file (`dms.json`, same `{id, name, workspace}` shape) rather than a flag inside `channels.json`
+  — see `docs/DESIGN-dms.md`.
 - **Catalog** (`catalog_logic.py`) — a persistent, refreshable cache over `slackdump list
   channels`, two-tier (cheap member-only vs. expensive full), storing both Slack-mirrored fields
   (description — topic-else-purpose — plus raw `topic`/`purpose`, creator, created, is_private,
@@ -97,6 +103,7 @@ flowchart LR
         SDPY["slackdump.py\n(the only subprocess boundary)"]
         WSL["workspace_logic.py"]
         CHL["channel_logic.py"]
+        DML["dm_logic.py"]
         CATL["catalog_logic.py"]
         BKL["backup_logic.py"]
         EXPL["export_logic.py"]
@@ -106,6 +113,7 @@ flowchart LR
     subgraph Disk["Local files this app reads/writes"]
         TOK["~/.slackdump-tokens.json\n(xoxc- tokens, gitignored)"]
         CHJSON["channels.json\n(repo root — tracked-channel list)"]
+        DMJSON["dms.json\n(repo root — tracked-DM list, gitignored)"]
         CACHE["~/.cache/slackbackup/\n&lt;workspace&gt;.catalog.json"]
         ARCH["~/slack-backups/&lt;workspace&gt;/&lt;channel&gt;/\nslackdump.sqlite + __uploads/"]
         OUT["~/slack-exports/*.json\n(digest · files_out sidecar · user roster)\nsearch-results.html"]
@@ -116,6 +124,7 @@ flowchart LR
 
     SDPY --> WSL
     SDPY --> CHL
+    SDPY --> DML
     SDPY --> CATL
     SDPY --> BKL
     SDPY --> EXPL
@@ -124,11 +133,14 @@ flowchart LR
     WSL <--> TOK
     CHL <--> CHJSON
     CHL --> CATL
+    DML <--> DMJSON
     CATL <--> CACHE
     BKL --> CHJSON
+    BKL --> DMJSON
     BKL --> CATL
     BKL <--> ARCH
     EXPL --> CHJSON
+    EXPL --> DMJSON
     EXPL --> CATL
     EXPL <--> ARCH
     EXPL --> OUT
@@ -214,7 +226,8 @@ night's cron fire):
 | `slackdump.py` | Sole subprocess boundary to the `slackdump` binary. Every other module calls *this*, never `subprocess` directly. `archive`/`resume`/`tools dedupe` each pass a bounded timeout (see Concurrency, above) - a stuck subprocess is killed and raises `SlackdumpError` rather than hanging forever. | — (is the boundary) |
 | `channel_lock.py` | Exclusive per-channel pidfile lock shared by every tool that touches a channel directory (see Concurrency, above). | No |
 | `workspace_logic.py` | Registers a workspace session: looks up its `xoxc-` token in `~/.slackdump-tokens.json`, combines with a freshly-pasted `xoxd-` cookie, hands both to `slackdump workspace import`. | Yes |
-| `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob- or comma-list-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked. | No (via `catalog_logic`) |
+| `channel_logic.py` | `channels.json` load/save/validate; single-channel registration by exact name (via the catalog); bulk glob- or comma-list-based discovery of new public channels (`register_matching`) with private/archived/`shuttered*` filtering; stamps `registered_at` in the catalog the moment a channel is first tracked; the same call also prunes already-tracked channels that are now archived or missing from a complete full-tier scan (`shuttered*` exempt, truncated scans never trigger a missing-prune — sat-21k). | No (via `catalog_logic`) |
+| `dm_logic.py` | `dms.json` (DM/group-DM counterpart of `channels.json`, same shape and reusing `channel_logic.load`/`save`/`validate` directly) — bulk discovery/pruning of tracked DM conversations per workspace glob via `slackdump.list_dms()`. No catalog involved (DM discovery is always the cheap member-only tier, nothing to cache). See `docs/DESIGN-dms.md`. | Yes (`list_dms`, `select_workspace_or_die`) |
 | `catalog_logic.py` | Owns the only call site for `slackdump.list_channels()`. Two-tier cache (fast member-only / expensive full) persisted to `~/.cache/slackbackup/<workspace>.catalog.json`. Also owns `registered_at`/`last_posted`/`effective_recency` — fields with no Slack-API source at all, purely this app's own bookkeeping. | Yes |
 | `backup_logic.py` | Per-channel `archive`-vs-`resume` decision from local archive state; empty-archive auto-heal; updates `last_posted` and writes the `.last_backup` seal stamp after a successful backup; optional `--workspace`/`--channel` subset selectors; orders a multi-channel run by `effective_recency` within a workspace and interleaves across workspaces (`_interleave_by_workspace`) to spread per-workspace rate-limit pressure; tiered cadence filter (`should_check_tonight`) that skips not-due dormant/empty channels and records `last_checked`/`last_action`; `sync_catalog_from_local` (CLI `backup sync-catalog`) backfills `last_posted`/`registered_at` from local archives only, no API calls, for use after an interrupted run; timestamped logging + per-workspace progress + run summary. `backup_channel` acquires `channel_lock` for the whole archive/resume/dedupe/bot-image-backfill sequence; `run`'s per-channel loop treats a lock conflict as a soft skip, same as `SlackdumpError` (see Concurrency, above). `_dedupe_quietly` runs a direct-SQL `CHANNEL_USER` fast-path dedupe (`_dedupe_channel_user_fast`, sat-ece) before the CLI's `tools dedupe` call — see Concurrency, above. | Yes |
 | `export_logic.py` | Read-only derived products from the archive + catalog (see `docs/DESIGN-export.md`): bounded monthly export, cross-workspace digest, user-profile roster, and report-job (`--jobs`) loading/path-templating. General-purpose: all F3-specific leadership logic is delegated to a pluggable handler (`handlers/`), not inline. Reads `slackdump.sqlite` directly only for the `FILE` table (channel-level files/Canvases have no message anchor and never appear in the message-export); everything else goes through the documented `convert -f export` boundary. Also owns the `files_out` sidecar's build/merge (`merge_files_out`), which keeps extracted file text out of the digest document itself. Every `convert_export` call site acquires `channel_lock` first and treats a conflict as a soft skip (`"locked"` channel/workspace status, alongside the existing `"missing_archive"`) - see Concurrency, above. | Yes (`convert_export` only) |
@@ -231,6 +244,7 @@ night's cron fire):
 |----------|-------|----------|-------------|
 | `~/.slackdump-tokens.json` | Operator (manual) | `{workspace: xoxc-token}` — gitignored, lives outside the repo | No — re-acquiring a token is a manual browser step |
 | `channels.json` (repo root) | `channel_logic.py` | `[{id, name, workspace}, ...]` — the tracked-channel list, intentionally minimal | No — this *is* the configuration |
+| `dms.json` (repo root) | `dm_logic.py` | `[{id, name, workspace}, ...]` — tracked DM/group-DM conversations, same shape as `channels.json`, kept in a separate file/gitignore entry given its higher PII sensitivity (see `docs/DESIGN-dms.md`) | No — this *is* the configuration |
 | `~/.cache/slackbackup/<workspace>.catalog.json` | `catalog_logic.py` | Per-channel: member/name/description/topic/purpose/is_private/is_archived/creator/created (Slack-mirrored; `description` is topic-else-purpose, `topic`/`purpose` are also kept raw) + registered_at/last_posted/last_checked/last_action (this app's own) | **Yes** — deleting it just forces a rebuild via `list channels` on next use; `registered_at`/`last_posted`/`last_checked` history is lost (cadence resets to "check everything once"), not catastrophic |
 | `~/slack-backups/<workspace>/<channel>/slackdump.sqlite` (+`__uploads/`) | `slackdump` binary, orchestrated by `backup_logic.py` | The durable source of truth — full message history + downloaded file blobs | **No** — this is the actual backup; nothing else replaces it |
 | `~/slack-exports/*.json`, `search-results.html` | `export_logic.py` / `search_logic.py` | Digests, the `files_out` sidecar, user rosters, monthly exports, search reports — all derived from the archive + catalog | Mostly — the digest/roster/search outputs are pure output. The **`files_out` sidecar is the one exception**: each run merges into the existing document and carries forward files whose source has since aged out of Slack's retention, so deleting it loses history the archive can no longer reproduce (see `docs/DESIGN-export.md` §`files_out` sidecar) |
@@ -256,5 +270,6 @@ night's cron fire):
 | `docs/OPERATIONS.md` | Auth/session lifecycle, the nightly job's exact step sequence, cadence and catalog recovery |
 | `docs/adr/` | Digest schema decisions — v2 additive evidence (0001), v3 condensation (0002), deterministic mentions identity (0003), v4 files sidecar (0004) |
 | `docs/DESIGN-files.md` | Channel catalog (implemented) + Canvas/file harvesting (designed, not yet ported) |
+| `docs/DESIGN-dms.md` | DM/group-DM tracking, backup, and the cross-workspace `f3-dm-digest` |
 | `docs/references/slackdump-cli-notes.md` | slackdump CLI behavior/cost/gotchas confirmed empirically — read before re-deriving anything about how slackdump itself behaves |
 | slackdump | https://github.com/rusq/slackdump — CLI flags, auth, output formats |

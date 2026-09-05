@@ -28,7 +28,7 @@ Context material is decomposed by how it changes, under `docs/llm-context/`:
   vocabulary, authority boundaries, and report formats.
 - `uploads/f3-domain-context.md` — culture and vocabulary, background only, with attributed source
   notes kept separate from generalized guidance.
-- `uploads/augmentations/` — dated, hand-maintained facts the Slack export cannot express. Stable
+- `uploads/supplemental/` — dated, hand-maintained facts the Slack export cannot express. Stable
   filenames (not dated filenames), with a required header block (`collected:`, `source:`,
   `collected_by:`, `fidelity:`, `coverage:`, `known_gaps:`, `refresh_trigger:`, `refresh_owner:`)
   so currency is a lookup, not a judgment call. A recurring source (e.g. a periodic call) uses one
@@ -77,3 +77,12 @@ confidence an augmentation can support and how a conflict with dated Slack evide
   as an emitted `consistency` block (`sat-ejk.6`) rather than left to ad hoc LLM-side arithmetic;
   the pack's job is to read and report that block plus the cross-source semantic judgments code has
   no basis to make.
+
+## Addendum (2026-08-19)
+
+`uploads/augmentations/` was renamed to `uploads/supplemental/` (and its index file
+`f3-augmentation-index.md` to `f3-supplemental-index.md`) — terminology only, not a decision
+change. "Supplemental" was chosen over the alternative "enrichment" as plainer English with no
+data-engineering/ML jargon collision. Every path reference across this pack was updated to match;
+the general English term "augmentation" (a dated manual fact supplementing the Slack record)
+remains in prose where it refers to the concept, not the directory.

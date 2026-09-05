@@ -135,7 +135,9 @@ appending everything to `~/slack-backups/nightly.log`. In order, each run:
 | 2 | `scripts/preflight-auth.sh channels.json` — stale-session banner (§2) | Informational, always exits 0 |
 | 3 | `./slackbackup channel register <one workspace> '*'` — pick up newly-created public channels | **One workspace per night**, rotating — see below |
 | 4 | `./slackbackup backup run channels.json ~/slack-backups` | Subject to the tiered cadence filter, below |
-| 5 | `./slackbackup export digest --jobs jobs/*.json` — one digest (plus optional user roster and `files_out` sidecar) per report job | Job files are gitignored; see `docs/DESIGN-export.md` §Report jobs |
+| 5 | `./slackbackup dm register-matching '*' --dms-file dms.json` — discover/prune tracked DM conversations | Cheap member-only tier only; see `docs/DESIGN-dms.md` |
+| 6 | `./slackbackup backup run dms.json ~/slack-backups` | Same `backup_logic.run()` as step 4, pointed at `dms.json` |
+| 7 | `./slackbackup export digest --jobs jobs/*.json` — one digest (plus optional user roster and `files_out` sidecar) per report job, including `jobs/f3-dm-digest.json` | Job files are gitignored; see `docs/DESIGN-export.md` §Report jobs and `docs/DESIGN-dms.md` |
 
 There is deliberately **no blanket `export digest` / `export users` step** any more: every real
 recipient is described by a job file in `jobs/`, and the blanket run duplicated that work at full
@@ -149,8 +151,14 @@ log (`----- <step> exited N -----`) rather than acted on.
 
 Step 3 exists because a newly-created public channel is otherwise invisible to the backup until a
 human notices and registers it by hand (the motivating case: `disc-it` went un-backed-up for weeks
-in `f3pugetsound`). `channel_logic.register_matching` already skips private, archived,
-`shuttered*`-named, and already-registered channels, so it only ever *adds*.
+in `f3pugetsound`). `channel_logic.register_matching` skips private, archived,
+`shuttered*`-named, and already-registered channels when deciding what to *add*. It also *prunes*
+`channels.json` (sat-21k): an already-tracked channel that's now archived, or missing entirely
+from that workspace's full-tier scan (only when the scan came back complete, not truncated), is
+removed and reported as `channel register: removed ... — archived|missing`. `shuttered*`-named
+channels are exempt from pruning (deliberate manual retention). Pruning never deletes or touches
+the channel's local archive on disk — only its `channels.json` entry, so it stops being backed up
+nightly but its history stays put.
 
 The cost is the **full** (non-`-member-only`) catalog listing it must do per workspace to know
 what exists — flagged in `docs/references/slackdump-cli-notes.md` as potentially minutes per

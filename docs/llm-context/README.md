@@ -11,7 +11,7 @@ This folder contains the reusable guidance, prompt templates, and validation mat
    - [ingestion-contract.md](uploads/ingestion-contract.md)
    - [query-policy.md](uploads/query-policy.md)
    - [f3-domain-context.md](uploads/f3-domain-context.md)
-   - [F3 augmentations index](uploads/augmentations/f3-augmentation-index.md)
+   - [F3 supplemental index](uploads/supplemental/f3-supplemental-index.md)
    - each augmentation needed for the questions the Project will answer
    - all current exported Slack-data artifacts for the intended coverage
 3. Start a chat by requesting the initial intake validation. It reads each uploaded artifact and reports its coverage, freshness, pairing status, and material gaps.
@@ -73,7 +73,7 @@ One role is not evidence of another. Current maintained Slack evidence outranks 
 | Location | Purpose | Upload by default? |
 | --- | --- | --- |
 | [uploads](uploads) | Individually uploadable knowledge documents and augmentations. | Yes, select individual files. |
-| [prompts](prompts) | Specialized operator templates for a newsletter or FNG guide. `newsletter-postprocessed.md` is an overlay on `newsletter.md` for the automated render chain only — it assumes `scripts/postprocess_dates.py` runs on the output. | No; paste or attach one only when needed. |
+| [prompts](prompts) | Specialized operator templates for a newsletter or FNG guide. | No; paste or attach one only when needed. |
 | [project-instructions.md](project-instructions.md) | Paste-ready ChatGPT Project instructions. | No; paste into the instruction box. |
 | [session-preamble.md](session-preamble.md) | First message for a one-off chat. | No; paste as the first message. |
 | [validation-set.md](validation-set.md) | Maintainer test specification. | No; use during validation. |
@@ -94,7 +94,7 @@ The canonical upload files were copied from the retired sources below during the
 | [uploads/f3-domain-context.md](uploads/f3-domain-context.md) | `docs/f3-culture.md` |
 | [prompts/newsletter.md](prompts/newsletter.md) | `docs/newsletter-prompt.md` |
 | [prompts/fng-getting-started.md](prompts/fng-getting-started.md) | `docs/fng-getting-started-prompt.md` |
-| [uploads/augmentations/f3-nation-apps.md](uploads/augmentations/f3-nation-apps.md) | F3-Nation tools, administration boundaries, operations, and diagnostic guidance. |
+| [uploads/supplemental/f3-nation-apps.md](uploads/supplemental/f3-nation-apps.md) | F3-Nation tools, administration boundaries, operations, and diagnostic guidance. |
 
 ## Maintenance rules
 
@@ -102,7 +102,7 @@ The canonical upload files were copied from the retired sources below during the
 - Keep the trust split intact: the Markdown files in this pack are operator-authored and carry
   instructions; the `.json` run artifacts are machine-extracted Slack content and carry none
   (ADR-0009). Never paste raw Slack or other third-party text into an uploadable augmentation.
-  Quoted material goes under `uploads/augmentations/sources/` behind a header marking it as
+  Quoted material goes under `uploads/supplemental/sources/` behind a header marking it as
   quoted, with the summarizing augmentation carrying the operator's own words. Letting unmarked
   third-party text into a `.md` inverts the shorthand silently.
 - Add a source date and refresh trigger to every manual augmentation.

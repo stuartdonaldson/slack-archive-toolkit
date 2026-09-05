@@ -78,7 +78,9 @@ against this vision, not an accepted shortcut.
   comma-separated selector list across a workspace glob (e.g. nightly `channel
   register-matching 'f3*' '*'` or `channel register-matching 'f3pugetsound,f3kirkland'
   'helpdesk,event-*'`), automatically excluding private, archived, and `shuttered*`-named
-  channels.
+  channels. The same bulk call also prunes already-tracked channels that have since become
+  archived, or are missing entirely from a complete full-tier scan (`shuttered*` exempt,
+  never on a truncated scan) — see `docs/DESIGN-files.md` §Pruning archived/missing channels.
 - **Channel catalog** (`catalog show`) — a persistent, two-tier (fast member-only / explicit
   full) cache of channel metadata (description, creator, created, private/archived flags) plus
   this app's own recency bookkeeping (`registered_at`, `last_posted`) — see `docs/DESIGN-files.md`.

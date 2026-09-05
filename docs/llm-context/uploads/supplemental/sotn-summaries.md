@@ -1,16 +1,16 @@
 # F3 State of the Nation call summaries
 
-Cumulative, dated augmentation. This file is **not** a verbatim transcript. It
+Cumulative, dated supplemental file. This file is **not** a verbatim transcript. It
 is a hand-compiled summary of each SLT-hosted State of the Nation (SOTN) call.
 The raw machine transcript for a call is retained separately under `sources/`.
 
-Unlike the single-snapshot roster/operations augmentations, this file grows by
+Unlike the single-snapshot roster/operations supplemental files, this file grows by
 **appending a new dated entry each time a SOTN call is held** — it does not
 describe a single point-in-time state and is never fully superseded by a later
 entry. Earlier entries remain valid for the facts and dates they carry even
 after a newer call happens.
 
-See [query-policy.md §Dated augmentation evidence](../query-policy.md#dated-augmentation-evidence)
+See [query-policy.md §Dated supplemental evidence](../query-policy.md#dated-supplemental-evidence)
 for how each entry ranks against Slack evidence. Apply `fidelity` per entry,
 not once for the whole file.
 
@@ -21,7 +21,7 @@ role/roster changes, tech-stack and tool updates, growth and membership
 figures, safety-practice guidance, and named initiatives that are not otherwise
 captured in Slack messages, channel topics, or the digest export. These are
 nation-level leadership updates that may affect regions or PAX; they are not
-reports about a specific region or individual PAX. Use this augmentation when a
+reports about a specific region or individual PAX. Use this supplemental file when a
 question needs a fact the SLT stated directly on a call — a role holder, a
 stated headcount, a program name — and Slack evidence doesn't already answer
 it.

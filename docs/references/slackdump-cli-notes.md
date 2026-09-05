@@ -82,6 +82,19 @@ file/canvas harvesting) for how this project uses these facts.
 - Always writes a `users.json` (id → name/real_name/profile.display_name mapping) and a
   `channels.json` alongside the per-day message files — useful for resolving ids to
   human-readable names without a separate API call.
+- Copies attachment blobs by default (same as `archive`/`resume`), and treats a missing
+  blob as **fatal for the whole invocation** — `error processing message ... copy error:
+  file ID=...: file does not exist` followed by exit `006 (Application Error)` — even
+  though the message JSON's `files[]` metadata (id/name/mimetype/size) is written
+  regardless. A blob goes missing whenever it's deleted from the archive's `__uploads/`
+  directory after the fact (e.g. manually removed to reclaim disk space) while the
+  `FILE` table row and empty `__uploads/<id>/` directory remain — `resume` doesn't
+  self-heal this. This project's digest pipeline never reads convert's copied
+  attachments (`export_logic._load_channel_files` reads blobs straight from the
+  archive's own `__uploads/` + `slackdump.sqlite` `FILE` table), so
+  `slackbackup.slackdump.convert_export()` always passes `-files=false` — confirmed
+  2026-08-27 (sat-tdv) that this fixes conversion against three archives with
+  known-missing blobs while leaving `files[]` metadata in the output unchanged.
 
 ## `search files <query>` / `search messages` / `search all`
 

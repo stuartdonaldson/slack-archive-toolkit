@@ -18,6 +18,10 @@ For each AO, compare:
 * Address / meeting location
 * Day and time
 * Description
+* Include **all F3-Nation AOs** for the region, even when no corresponding Slack channel is found; identify the Slack channel as **Not found**.
+* Include **apparent workout/AO Slack channels** with a fixed schedule and location, (especially `ao-*`, `otb-*`, and other clearly workout-related channels) even when no corresponding F3-Nation AO is found; identify the F3-Nation AO as **Not found**.
+* Treat these missing cross-system counterparts as material discrepancies requiring validation
+
 
 Use the strongest current Slack evidence available, prioritizing **channel topic**, then **description**, then **message evidence**.
 
@@ -33,7 +37,7 @@ Requirements:
 * Do not flag harmless wording differences
 * Do not call a missing Site Q **Vacant** unless a source explicitly says the role is open
 * If sources conflict, identify the best-supported current working value; use **Unresolved** when it cannot be determined
-* For **Slack Info** use the **channel topic** and **description**.
+* For **Slack Info** include the **channel topic** and **description**.
 * For **F3 Nation Info** use the **AO** **Location** and **Event** information without duplicating information within those fields.
 
 ## Material Discrepancies Requiring Action

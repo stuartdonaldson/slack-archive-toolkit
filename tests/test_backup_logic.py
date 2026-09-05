@@ -2,6 +2,7 @@ import json
 import sqlite3
 import re
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,87 @@ def _make_db(path, message_count):
     conn.execute("CREATE TABLE MESSAGE (ts TEXT)")
     for i in range(message_count):
         conn.execute("INSERT INTO MESSAGE (ts) VALUES (?)", (f"170000000{i}.000000",))
+    conn.commit()
+    conn.close()
+
+
+_REAL_SCHEMA_SQL = """
+CREATE TABLE SESSION (
+    ID INTEGER PRIMARY KEY,
+    MODE TEXT NOT NULL,
+    ARGS TEXT,
+    FINISHED SMALLINT NOT NULL DEFAULT FALSE
+);
+CREATE TABLE CHUNK (
+    ID INTEGER PRIMARY KEY,
+    UNIX_TS INTEGER NOT NULL,
+    SESSION_ID INTEGER NOT NULL,
+    TYPE_ID SMALLINT NOT NULL,
+    NUM_REC INTEGER NOT NULL DEFAULT 0,
+    FINAL SMALLINT NOT NULL DEFAULT FALSE,
+    CHANNEL_ID TEXT,
+    FOREIGN KEY (SESSION_ID) REFERENCES SESSION (ID)
+);
+CREATE TABLE MESSAGE (
+    ID INTEGER NOT NULL,
+    CHUNK_ID INTEGER NOT NULL,
+    CHANNEL_ID TEXT NOT NULL,
+    TS TEXT NOT NULL,
+    PARENT_ID INTEGER,
+    THREAD_TS TEXT,
+    LATEST_REPLY TEXT,
+    IS_PARENT SMALLINT NOT NULL DEFAULT FALSE,
+    IDX INTEGER NOT NULL,
+    NUM_FILES INTEGER NOT NULL DEFAULT 0,
+    TXT TEXT,
+    DATA BLOB NOT NULL,
+    PRIMARY KEY (ID, CHUNK_ID),
+    FOREIGN KEY (CHUNK_ID) REFERENCES CHUNK (ID)
+);
+CREATE TABLE FILE (
+    ID TEXT NOT NULL,
+    CHUNK_ID INTEGER NOT NULL,
+    CHANNEL_ID TEXT NOT NULL,
+    MESSAGE_ID INTEGER,
+    THREAD_ID INTEGER,
+    IDX INTEGER NOT NULL,
+    MODE TEXT NOT NULL,
+    FILENAME TEXT,
+    URL TEXT,
+    DATA BLOB NOT NULL,
+    SIZE INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (ID, CHUNK_ID)
+);
+"""
+
+
+def _make_real_archive_db(path, messages):
+    """Builds a MESSAGE/CHUNK/SESSION/FILE schema matching the real
+    slackdump.sqlite DDL (confirmed via `.schema` against a real archive,
+    sat-zg9) - trimmed of comments/indexes, but column-shape-identical,
+    since _has_resume_checkpoint/_copy_new_messages read real column names
+    (CHUNK_ID join, TYPE_ID, CHANNEL_ID/TS key) that the older minimal
+    `_make_db`/`_make_channel_user_db` fixtures don't provide.
+
+    `messages`: list of (msg_id, channel_id, ts, type_id) tuples; one CHUNK
+    per distinct type_id is created automatically, one SESSION for all of
+    them."""
+    conn = sqlite3.connect(path)
+    conn.executescript(_REAL_SCHEMA_SQL)
+    conn.execute("INSERT INTO SESSION (ID, MODE, FINISHED) VALUES (1, 'archive', 1)")
+    chunk_by_type = {}
+    for idx, (msg_id, channel_id, ts, type_id) in enumerate(messages):
+        if type_id not in chunk_by_type:
+            cur = conn.execute(
+                "INSERT INTO CHUNK (UNIX_TS, SESSION_ID, TYPE_ID, CHANNEL_ID) VALUES (0, 1, ?, ?)",
+                (type_id, channel_id),
+            )
+            chunk_by_type[type_id] = cur.lastrowid
+        conn.execute(
+            "INSERT INTO MESSAGE (ID, CHUNK_ID, CHANNEL_ID, TS, IS_PARENT, IDX, DATA) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (msg_id, chunk_by_type[type_id], channel_id, ts, idx, b"{}"),
+        )
     conn.commit()
     conn.close()
 
@@ -638,8 +720,8 @@ def test_run_logs_a_final_summary(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert (
-        "done - 1 channel(s), 0 archive(s), 1 resume(s), 0 not-due skip(s), "
-        "0 locked skip(s), 0 failure(s)"
+        "done - 1 channel(s), 0 archive(s), 1 resume(s), 0 reconciled (no resume checkpoint), "
+        "0 not-due skip(s), 0 locked skip(s), 0 failure(s)"
     ) in out
 
 
@@ -977,3 +1059,155 @@ def test_run_no_selectors_backs_up_everything(tmp_path, monkeypatch):
     backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
 
     assert len(attempted) == 4
+
+
+# --- sat-zg9: resume-checkpoint-dead channels -> archive+diff fallback ---
+
+def test_has_resume_checkpoint_true_when_type0_linked_message_exists(tmp_path):
+    db = tmp_path / "slackdump.sqlite"
+    _make_real_archive_db(db, [(1, "C1", "1700000000.000001", 0)])
+    assert backup_logic._has_resume_checkpoint(db) is True
+
+
+def test_has_resume_checkpoint_false_when_only_thread_reply_chunks(tmp_path):
+    db = tmp_path / "slackdump.sqlite"
+    # Real shape of the 8 broken channels this was built for (e.g.
+    # f3nation-dev/codex): every MESSAGE row joins only to a TYPE_ID=1
+    # (thread-reply) chunk, none to TYPE_ID=0.
+    _make_real_archive_db(db, [(1, "C1", "1700000000.000001", 1), (2, "C1", "1700000001.000001", 1)])
+    assert backup_logic._has_resume_checkpoint(db) is False
+
+
+def test_has_resume_checkpoint_fails_open_on_missing_file(tmp_path):
+    assert backup_logic._has_resume_checkpoint(tmp_path / "missing.sqlite") is True
+
+
+def test_copy_new_messages_copies_only_genuinely_new_rows(tmp_path):
+    target = tmp_path / "target.sqlite"
+    scratch = tmp_path / "scratch.sqlite"
+    _make_real_archive_db(target, [(i, "C1", f"170000000{i}.000001", 1) for i in range(5)])
+    # Scratch "fresh archive" result: 3 of the 5 old ones aged out of Slack's
+    # visible window, plus 1 genuinely new top-level post (type 0).
+    _make_real_archive_db(scratch, [
+        (2, "C1", "1700000002.000001", 1),
+        (3, "C1", "1700000003.000001", 1),
+        (4, "C1", "1700000004.000001", 1),
+        (99, "C1", "1700000099.000001", 0),
+    ])
+
+    copied = backup_logic._copy_new_messages(scratch, target, "C1")
+
+    assert copied == 1
+    conn = sqlite3.connect(target)
+    try:
+        ts_values = {row[0] for row in conn.execute("SELECT TS FROM MESSAGE WHERE CHANNEL_ID = 'C1'")}
+    finally:
+        conn.close()
+    assert "1700000099.000001" in ts_values
+    assert len(ts_values) == 6  # original 5 untouched, plus the 1 new one
+
+
+def test_copy_new_messages_preserves_original_type_id(tmp_path):
+    target = tmp_path / "target.sqlite"
+    scratch = tmp_path / "scratch.sqlite"
+    _make_real_archive_db(target, [(1, "C1", "1700000001.000001", 1)])
+    _make_real_archive_db(scratch, [
+        (1, "C1", "1700000001.000001", 1),
+        (2, "C1", "1700000002.000001", 0),  # new top-level post -> real checkpoint
+    ])
+
+    backup_logic._copy_new_messages(scratch, target, "C1")
+
+    assert backup_logic._has_resume_checkpoint(target) is True
+
+
+def test_copy_new_messages_no_new_rows_returns_zero_and_untouched(tmp_path):
+    target = tmp_path / "target.sqlite"
+    scratch = tmp_path / "scratch.sqlite"
+    _make_real_archive_db(target, [(1, "C1", "1700000001.000001", 1)])
+    _make_real_archive_db(scratch, [(1, "C1", "1700000001.000001", 1)])
+
+    copied = backup_logic._copy_new_messages(scratch, target, "C1")
+
+    assert copied == 0
+    conn = sqlite3.connect(target)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM MESSAGE").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_backup_channel_routes_to_reconcile_when_no_checkpoint(tmp_path, monkeypatch):
+    archive_root = tmp_path / "archive"
+    channel_directory = archive_root / "f3test" / "codex"
+    channel_directory.mkdir(parents=True)
+    db_path = channel_directory / "slackdump.sqlite"
+    _make_real_archive_db(db_path, [(1, "C1", "1700000001.000001", 1)])
+
+    monkeypatch.setattr(backup_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+
+    def fake_archive(cid, out_dir):
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        _make_real_archive_db(
+            Path(out_dir) / "slackdump.sqlite",
+            [(1, "C1", "1700000001.000001", 1), (2, "C1", "1700000002.000001", 1)],
+        )
+
+    monkeypatch.setattr(backup_logic.slackdump, "archive", fake_archive)
+    resume_calls = []
+    monkeypatch.setattr(backup_logic.slackdump, "resume", lambda d: resume_calls.append(d))
+
+    kind = backup_logic.backup_channel("C1", "codex", "f3test", archive_root, cache_dir=tmp_path / "cache")
+
+    assert kind == "reconciled"
+    assert resume_calls == []
+    conn = sqlite3.connect(db_path)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM MESSAGE").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 2
+
+
+def test_backup_channel_self_heals_back_to_resume_after_reconcile(tmp_path, monkeypatch):
+    """Once a reconcile run copies in a genuine new top-level post, the
+    channel gets a real TYPE_ID=0-linked row - the very next backup_channel
+    call should detect that checkpoint and go back to plain resume() on its
+    own, no separate flag or state needed (sat-zg9 AC4)."""
+    archive_root = tmp_path / "archive"
+    channel_directory = archive_root / "f3test" / "codex"
+    channel_directory.mkdir(parents=True)
+    db_path = channel_directory / "slackdump.sqlite"
+    # Simulate the post-reconcile state directly: a real type-0-linked row now exists.
+    _make_real_archive_db(db_path, [
+        (1, "C1", "1700000001.000001", 1),
+        (2, "C1", "1700000002.000001", 0),
+    ])
+
+    monkeypatch.setattr(backup_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(backup_logic.slackdump, "archive", lambda cid, out: (_ for _ in ()).throw(AssertionError("archive should not be called")))
+    resume_calls = []
+    monkeypatch.setattr(backup_logic.slackdump, "resume", lambda d: resume_calls.append(d))
+    monkeypatch.setattr(backup_logic.slackdump, "dedupe", lambda d: 0)
+
+    kind = backup_logic.backup_channel("C1", "codex", "f3test", archive_root, cache_dir=tmp_path / "cache")
+
+    assert kind == "resume"
+    assert resume_calls == [channel_directory]
+
+
+def test_run_counts_reconciled_separately_from_failures(tmp_path, monkeypatch, capsys):
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([{"id": "C1", "name": "codex", "workspace": "f3a"}]))
+
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_fast", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic.catalog_logic, "refresh_full", lambda ws, cache_dir=None: None)
+    monkeypatch.setattr(backup_logic, "backup_channel", lambda *a, **kw: "reconciled")
+
+    all_ok = backup_logic.run(channels_file, tmp_path / "archive", cache_dir=tmp_path / "cache")
+
+    assert all_ok is True
+    out = capsys.readouterr().out
+    assert "1 reconciled (no resume checkpoint)" in out
+    assert "0 failure(s)" in out

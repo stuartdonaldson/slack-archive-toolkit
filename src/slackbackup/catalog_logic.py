@@ -197,6 +197,11 @@ def refresh_full(
     data = merge_full(data, channels)
     if not truncated:
         data["full_refreshed_at"] = now
+    # sat-21k: lets a caller (register_matching's missing-channel pruning)
+    # tell "this workspace's full channel list is trustworthy" from "some
+    # channels may be silently absent from data['channels'] because the
+    # scan was truncated" - without re-deriving the truncation check itself.
+    data["full_scan_complete"] = not truncated
     save(cache_dir, workspace, data)
     return data
 

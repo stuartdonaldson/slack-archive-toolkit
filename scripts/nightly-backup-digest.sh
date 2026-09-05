@@ -34,7 +34,7 @@ mkdir -p "$HOME/slack-exports"
 # subtree each run so operator uploads stay in sync with git. Mirror the
 # whole tree EXCEPT planning/review/maintenance material that must not reach
 # the runtime upload area — a deny-list via rsync --exclude, not a per-file
-# allow-list, so a new prompt or augmentation file is picked up automatically
+# allow-list, so a new prompt or supplemental file is picked up automatically
 # without editing this script.
 mkdir -p "$HOME/slack-exports/llm-context"
 rsync -a --delete \
@@ -43,15 +43,15 @@ rsync -a --delete \
    --exclude 'REVIEW-*.md' \
    --exclude 'VALIDATION-RESULTS.md' \
    --exclude 'validation-set.md' \
-    --exclude 'uploads/augmentations/archive/' \
-    --exclude 'uploads/augmentations/sources/' \
+    --exclude 'uploads/supplemental/archive/' \
+    --exclude 'uploads/supplemental/sources/' \
    "$REPO_ROOT/docs/llm-context/" "$HOME/slack-exports/llm-context/"
 # Excluded: this dir's own operator-facing README (assembly/maintenance
 # guide, not upload content), planning/review/validation records, archived
-# superseded augmentation snapshots, and raw source material backing a
-# cumulative augmentation (e.g. sotn-transcripts.md's transcripts) — citation
-# backup, not upload material. The augmentation index is retained under
-# uploads/ because it is individually uploaded with selected augmentations.
+# superseded supplemental snapshots, and raw source material backing a
+# cumulative supplemental file (e.g. sotn-summaries.md's transcripts) — citation
+# backup, not upload material. The supplemental index is retained under
+# uploads/ because it is individually uploaded with selected supplemental files.
 
 # The legacy per-file prompt/context docs (F3 culture notes, ingestion/
 # newsletter/FNG/report-query prompts) were retired in sat-ejk.5 once the

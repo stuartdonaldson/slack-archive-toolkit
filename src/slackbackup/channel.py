@@ -102,9 +102,15 @@ def _register(args: argparse.Namespace) -> int:
             f"{entry['workspace']} — {entry['reason']}"
         )
 
+    for entry in result["removed"]:
+        print(
+            f"channel register: removed {entry['name']} ({entry['id']}) from "
+            f"{entry['workspace']} — {entry['reason']}"
+        )
+
     print(
         f"channel register: {len(result['added'])} new channel(s), "
-        f"{len(result['skipped'])} skipped, across "
+        f"{len(result['skipped'])} skipped, {len(result['removed'])} removed, across "
         f"{len(result['workspaces_checked'])} workspace(s)"
     )
     return 0

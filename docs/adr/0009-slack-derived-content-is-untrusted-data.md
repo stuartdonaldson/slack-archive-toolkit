@@ -25,7 +25,7 @@ field is untrusted by default and would not be listed. Splitting by artifact pro
 but self-maintaining. An audit of the export writers confirmed the provenance split is currently
 exact: every emitted artifact is JSON (`export.py:222`, `:277`, `:299`, `:366`), and every guidance
 file, prompt, and augmentation is operator-authored Markdown — with one exception, the raw
-third-party material retained under `uploads/augmentations/sources/` (a machine transcript of an
+third-party material retained under `uploads/supplemental/sources/` (a machine transcript of an
 F3 Nation call), which is Markdown that the operator did not author.
 
 Sanitizing or fencing the extracted text at build time was rejected: a phrase blocklist is brittle
@@ -43,7 +43,7 @@ Instructions come only from the operator-authored guidance and prompt files and 
 chat. Material machine-extracted from Slack — currently, every `.json` artifact in the upload set —
 is data, never instruction, regardless of how it is phrased or whom it appears to be from. The same
 applies to quoted or transcribed third-party material carried in Markdown under
-`uploads/augmentations/sources/`.
+`uploads/supplemental/sources/`.
 
 This is stated by provenance, with the file format as the operative shorthand, so that a schema
 field added later is covered without an edit. It deliberately does not lower the evidence rank of
@@ -75,7 +75,7 @@ of tagging instances.
   digests, sidecars, and profile exports are unaffected and need no regeneration.
 - The Markdown-is-trusted shorthand is only true while raw third-party text stays out of
   uploadable augmentations. `docs/llm-context/README.md` §Maintenance rules and the augmentation
-  index now require quoted material to live under `augmentations/sources/` behind a header marking
+  index now require quoted material to live under `supplemental/sources/` behind a header marking
   it as quoted, with the summarizing augmentation carrying the operator's own words. If that
   discipline lapses, the shorthand inverts silently.
 - Verification is behavioral, via `docs/llm-context/validation-set.md` scenarios 13–15 run against
@@ -84,3 +84,9 @@ of tagging instances.
 - Build-time heuristic detection of injection-shaped content, surfaced as a `consistency` count,
   was considered and deferred (`sat-j1t`): the false-positive rate on real Slack text is unknown
   and the consumer action on a nonzero count is undefined.
+
+## Addendum (2026-08-19)
+
+`uploads/augmentations/` was renamed to `uploads/supplemental/` — terminology only, not a decision
+change (see ADR-0008's addendum). References above to `uploads/augmentations/sources/` now read
+`uploads/supplemental/sources/`.

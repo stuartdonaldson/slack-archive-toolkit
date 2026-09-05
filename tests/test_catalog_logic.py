@@ -194,6 +194,29 @@ def test_is_truncated_helper():
     assert catalog_logic._is_truncated(0, 0) is False
 
 
+def test_refresh_full_persists_full_scan_complete_true_when_not_truncated(tmp_path, monkeypatch):
+    _seed_full_catalog(tmp_path, "f3test", 2)
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: [CH1, CH2, CH3])
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["full_scan_complete"] is True
+
+
+def test_refresh_full_persists_full_scan_complete_false_when_truncated(tmp_path, monkeypatch):
+    _seed_full_catalog(tmp_path, "f3test", 60)
+    monkeypatch.setattr(catalog_logic.slackdump, "select_workspace_or_die", lambda ws: None)
+    monkeypatch.setattr(catalog_logic.slackdump, "list_channels", lambda member_only: [CH1])
+
+    data = catalog_logic.refresh_full("f3test", cache_dir=tmp_path, ttl=0, now=2000.0)
+    assert data["full_scan_complete"] is False
+
+
+def test_load_absent_full_scan_complete_defaults_to_untrustworthy(tmp_path):
+    data = catalog_logic.load(tmp_path, "f3test")
+    assert data.get("full_scan_complete", False) is False
+
+
 def test_lookup_falls_back_to_full_tier_on_fast_miss(tmp_path, monkeypatch):
     calls = []
 

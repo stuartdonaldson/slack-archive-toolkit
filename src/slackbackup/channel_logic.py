@@ -126,7 +126,24 @@ def register_matching(
     "archived", "shuttered-name", or "already-registered", in that priority
     order (a channel that's both private and archived reports "private").
     Channels that don't match `channel_glob` at all are not reported in
-    either list. Returns {"added": [...], "skipped": [...],
+    either list.
+
+    Also prunes (sat-21k): for the same matched-workspace/matched-channel-glob
+    scope, an ALREADY-tracked channel is removed from channels.json - reported
+    under "removed", never "skipped" - when either:
+      - it's now archived in the catalog ("archived"), or
+      - it's entirely absent from this workspace's full-tier catalog
+        ("missing") - but ONLY when this run's full-tier scan for that
+        workspace came back complete (catalog["full_scan_complete"]); a
+        truncated/untrustworthy scan (see sat-dnr) must never be read as
+        proof a channel is gone, so nothing is pruned as "missing" for that
+        workspace this run.
+    shuttered*-named channels are exempt from both prune reasons - same
+    manual-retention rationale as their registration exemption above.
+    Pruning never touches the channel's local backup data on disk, only
+    this channels.json entry.
+
+    Returns {"added": [...], "skipped": [...], "removed": [...],
     "workspaces_checked": [...], "workspaces_skipped_unregistered": [...]}.
     """
     status = workspace_logic.status()
@@ -138,11 +155,13 @@ def register_matching(
     existing = {(e["id"], e["workspace"]) for e in entries}
     added = []
     skipped = []
+    removed = []
     now = _now_iso()
 
     for workspace in workspaces_checked:
         catalog = catalog_logic.refresh_full(workspace, cache_dir=cache_dir)
-        for channel_id, channel in catalog["channels"].items():
+        catalog_channels = catalog["channels"]
+        for channel_id, channel in catalog_channels.items():
             if not selector_logic.matches_selector(channel_glob, channel["name"]):
                 continue
 
@@ -165,12 +184,46 @@ def register_matching(
             added.append({"id": channel_id, "name": channel["name"], "workspace": workspace})
             catalog_logic.set_registered_at(cache_dir, workspace, channel_id, now)
 
-    if added:
+        scan_complete = catalog.get("full_scan_complete", False)
+        kept_entries = []
+        for entry in entries:
+            if entry["workspace"] != workspace or not selector_logic.matches_selector(channel_glob, entry["name"]):
+                kept_entries.append(entry)
+                continue
+            if entry["name"].lower().startswith("shuttered"):
+                kept_entries.append(entry)
+                continue
+
+            channel = catalog_channels.get(entry["id"])
+            reason = None
+            if channel is not None and channel.get("is_archived"):
+                reason = "archived"
+            elif channel is None and scan_complete:
+                reason = "missing"
+
+            if reason is None:
+                kept_entries.append(entry)
+                continue
+            removed.append({"id": entry["id"], "name": entry["name"], "workspace": workspace, "reason": reason})
+            existing.discard((entry["id"], workspace))
+        entries = kept_entries
+
+        # An already-tracked archived channel matches the add-loop's own
+        # "archived" skip check above (that check doesn't know about tracking
+        # status - it also fires for never-tracked archived channels, where
+        # "skipped" is the only correct outcome). Once it's in `removed`,
+        # drop the redundant `skipped` entry - "removed" is the more specific
+        # and accurate outcome for a channel that was actually being tracked.
+        removed_this_workspace = {(r["id"], r["workspace"]) for r in removed if r["workspace"] == workspace}
+        skipped = [s for s in skipped if (s["id"], s["workspace"]) not in removed_this_workspace]
+
+    if added or removed:
         save(channels_file, entries)
 
     return {
         "added": added,
         "skipped": skipped,
+        "removed": removed,
         "workspaces_checked": workspaces_checked,
         "workspaces_skipped_unregistered": workspaces_skipped,
     }

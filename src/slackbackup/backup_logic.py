@@ -9,6 +9,7 @@ import heapq
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -326,6 +327,42 @@ def backup_channel(
             _write_last_backup(channel_directory)
             return "archive"
 
+        if not _has_resume_checkpoint(db_path):
+            # sat-zg9: real local messages exist, but none are linked to a
+            # TYPE_ID=0 (channel-timeline) chunk - resume derives its
+            # continuation checkpoint only from that chunk type, so it
+            # errors "003 (Invalid Parameters): the archive does not contain
+            # any data" before ever calling the Slack API, forever, on every
+            # future run (confirmed: an empty type-0 chunk is not enough:
+            # resume needs a MESSAGE row actually linked to one). This
+            # happens when a channel's only surviving messages are thread
+            # replies (TYPE_ID=1) - e.g. its channel-timeline history aged
+            # out of Slack's retention while thread replies to it did not.
+            # Rather than resume (which can never work here) or the
+            # existing wipe-and-re-archive self-heal (which would destroy
+            # real history a fresh archive might come back shorter than -
+            # Slack's 90-day window shrinking over time is normal, not a
+            # sign the local copy is wrong), archive fresh into a scratch
+            # dir and copy over only genuinely new rows, never touching or
+            # replacing anything already on disk.
+            _log(
+                f"backup: {db_path} has real messages but no resume checkpoint "
+                "(no TYPE_ID=0-linked row) — reconciling via a scratch archive + diff "
+                "instead of resume"
+            )
+            with tempfile.TemporaryDirectory() as scratch:
+                scratch_dir = Path(scratch) / "scratch"
+                slackdump.archive(channel_id, scratch_dir)
+                copied = _copy_new_messages(scratch_dir / "slackdump.sqlite", db_path, channel_id)
+            _log(
+                f"backup: reconciled {copied} new message(s) for {channel_id} via archive+diff "
+                "fallback (no resume checkpoint)"
+            )
+            catalog_logic.update_last_posted(cache_dir, workspace, channel_id, _max_message_ts(db_path))
+            _backfill_bot_images_quietly(channel_directory)
+            _write_last_backup(channel_directory)
+            return "reconciled"
+
         _log(f"backup: existing archive found at {db_path} — resuming")
         # -dedupe deliberately never passed: confirmed to delete thread-root
         # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles -
@@ -448,7 +485,7 @@ def run(
             catalog_cache[workspace] = catalog_logic.load(cache_dir, workspace)
 
     all_ok = not skipped_workspaces
-    counts = {"archive": 0, "resume": 0, "failed": 0, "skipped": 0, "locked": 0}
+    counts = {"archive": 0, "resume": 0, "reconciled": 0, "failed": 0, "skipped": 0, "locked": 0}
     run_start = time.monotonic()
     today = datetime.now(timezone.utc).date() if today is None else today
     today_iso = today.isoformat()
@@ -537,7 +574,8 @@ def run(
     )
     _log(
         f"backup run: done - {total_entries} channel(s), {counts['archive']} archive(s), "
-        f"{counts['resume']} resume(s), {counts['skipped']} not-due skip(s), "
+        f"{counts['resume']} resume(s), {counts['reconciled']} reconciled (no resume checkpoint), "
+        f"{counts['skipped']} not-due skip(s), "
         f"{counts['locked']} locked skip(s), "
         f"{counts['failed']} failure(s){skipped_note}, {total_elapsed / 60:.1f} min total"
     )
@@ -550,6 +588,143 @@ def _message_count(db_path: Path) -> int:
         return conn.execute("SELECT COUNT(*) FROM MESSAGE").fetchone()[0]
     finally:
         conn.close()
+
+
+def _has_resume_checkpoint(db_path: Path) -> bool:
+    """True iff at least one MESSAGE row is linked (via CHUNK_ID) to a CHUNK
+    with TYPE_ID=0 - Slack's channel-timeline chunk type, and the one
+    `slackdump resume` reads its continuation checkpoint from (sat-zg9).
+    Confirmed against real production archives: a healthy channel has
+    MESSAGE rows joined to TYPE_ID=0 chunks; the 8 broken channels this was
+    built for (e.g. f3nation-dev/codex) have none - every surviving row
+    joins only to TYPE_ID=1 (thread-reply) chunks, because their
+    channel-timeline history aged out of Slack's retention while thread
+    replies to it did not. An empty TYPE_ID=0 chunk (no MESSAGE row linked)
+    is NOT sufficient - confirmed by direct test, resume still rejects it.
+    Fails open (True) on any schema surprise or missing file, so an
+    unexpected DB shape falls back to the existing plain resume() path
+    rather than silently rerouting into the fallback."""
+    if not db_path.exists():
+        return True
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM MESSAGE JOIN CHUNK ON MESSAGE.CHUNK_ID = CHUNK.ID "
+                "WHERE CHUNK.TYPE_ID = 0"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True
+    return bool(row and row[0] > 0)
+
+
+def _copy_new_messages(scratch_db: Path, target_db: Path, channel_id: str) -> int:
+    """Diffs `scratch_db` (a fresh, checkpoint-free `archive` of `channel_id`
+    into a scratch dir) against `target_db` (the real on-disk archive) by
+    (CHANNEL_ID, TS) - Slack's own natural per-channel message key, the same
+    key `tools dedupe -mode message-key` already trusts - and copies over
+    ONLY the MESSAGE rows not already present in `target_db`. Copied rows
+    land in a brand-new SESSION + CHUNK(s) in `target_db`, one CHUNK per
+    distinct original TYPE_ID, so a genuine new top-level post (TYPE_ID=0)
+    restores a real resume checkpoint while a new thread reply (TYPE_ID=1)
+    stays correctly typed. Never deletes or replaces anything already on
+    disk - this is purely additive, matching the shape of every other
+    reconciliation step in this pipeline (resume, dedupe, bot-image
+    backfill: diff what's new, append it, never compare-and-replace).
+    Also copies any FILE rows newly referenced by copied messages (INSERT
+    OR IGNORE, keyed by FILE id, consistent with FILE ids being treated as
+    globally unique elsewhere in this pipeline). Returns the number of
+    MESSAGE rows copied."""
+    if not scratch_db.exists():
+        return 0
+
+    scratch = sqlite3.connect(scratch_db)
+    target = sqlite3.connect(target_db)
+    try:
+        existing_ts = {
+            row[0]
+            for row in target.execute("SELECT TS FROM MESSAGE WHERE CHANNEL_ID = ?", (channel_id,))
+        }
+        rows = scratch.execute(
+            """
+            SELECT m.ID, m.CHANNEL_ID, m.TS, m.PARENT_ID, m.THREAD_TS, m.LATEST_REPLY,
+                   m.IS_PARENT, m.IDX, m.NUM_FILES, m.TXT, m.DATA, c.TYPE_ID
+            FROM MESSAGE m JOIN CHUNK c ON m.CHUNK_ID = c.ID
+            WHERE m.CHANNEL_ID = ?
+            """,
+            (channel_id,),
+        ).fetchall()
+        new_rows = [r for r in rows if r[2] not in existing_ts]
+        if not new_rows:
+            return 0
+
+        now_unix_ns = int(time.time() * 1_000_000_000)
+        session_cur = target.execute(
+            "INSERT INTO SESSION (MODE, ARGS, FINISHED) VALUES ('reconcile', ?, 1)",
+            (f"sat-zg9 archive+diff fallback for {channel_id}",),
+        )
+        session_id = session_cur.lastrowid
+
+        chunk_id_by_type: dict[int, int] = {}
+        copied = 0
+        new_ids = []
+        for (mid, chan, ts, parent_id, thread_ts, latest_reply, is_parent, idx, num_files, txt, data, type_id) in new_rows:
+            if type_id not in chunk_id_by_type:
+                chunk_cur = target.execute(
+                    "INSERT INTO CHUNK (UNIX_TS, SESSION_ID, TYPE_ID, NUM_REC, FINAL, CHANNEL_ID) "
+                    "VALUES (?, ?, ?, 0, 1, ?)",
+                    (now_unix_ns, session_id, type_id, chan),
+                )
+                chunk_id_by_type[type_id] = chunk_cur.lastrowid
+            chunk_id = chunk_id_by_type[type_id]
+            target.execute(
+                """
+                INSERT OR IGNORE INTO MESSAGE
+                    (ID, CHUNK_ID, CHANNEL_ID, TS, PARENT_ID, THREAD_TS, LATEST_REPLY,
+                     IS_PARENT, IDX, NUM_FILES, TXT, DATA)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (mid, chunk_id, chan, ts, parent_id, thread_ts, latest_reply, is_parent, idx, num_files, txt, data),
+            )
+            target.execute("UPDATE CHUNK SET NUM_REC = NUM_REC + 1 WHERE ID = ?", (chunk_id,))
+            copied += 1
+            new_ids.append(mid)
+
+        if new_ids:
+            placeholders = ",".join("?" * len(new_ids))
+            file_rows = scratch.execute(
+                f"""
+                SELECT ID, CHANNEL_ID, MESSAGE_ID, THREAD_ID, IDX, MODE, FILENAME, URL, DATA, SIZE
+                FROM FILE WHERE MESSAGE_ID IN ({placeholders})
+                """,
+                new_ids,
+            ).fetchall()
+            file_chunk_id = None
+            for (fid, chan, message_id, thread_id, idx, mode, filename, url, data, size) in file_rows:
+                if file_chunk_id is None:
+                    file_chunk_cur = target.execute(
+                        "INSERT INTO CHUNK (UNIX_TS, SESSION_ID, TYPE_ID, NUM_REC, FINAL, CHANNEL_ID) "
+                        "VALUES (?, ?, 2, 0, 1, ?)",
+                        (now_unix_ns, session_id, chan),
+                    )
+                    file_chunk_id = file_chunk_cur.lastrowid
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO FILE
+                        (ID, CHUNK_ID, CHANNEL_ID, MESSAGE_ID, THREAD_ID, IDX, MODE, FILENAME, URL, DATA, SIZE)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (fid, file_chunk_id, chan, message_id, thread_id, idx, mode, filename, url, data, size),
+                )
+                target.execute("UPDATE CHUNK SET NUM_REC = NUM_REC + 1 WHERE ID = ?", (file_chunk_id,))
+
+        target.commit()
+    finally:
+        scratch.close()
+        target.close()
+    return copied
 
 
 def _local_status(db_path: Path) -> dict:

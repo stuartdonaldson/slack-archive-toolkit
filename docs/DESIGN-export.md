@@ -282,19 +282,17 @@ un-archived channel in a 100-channel workspace glob must not block the whole dig
 ### Channel context — catalog, not a live call
 
 Each channel's entry under `channels` is enriched with
-`topic`/`description`/`creator`/`created_at`, read **read-only from the already-cached
+`description`/`topic`/`purpose`/`creator`/`created_at`, read **read-only from the already-cached
 catalog** (`catalog_logic.load`, never `refresh_*`) — the digest stays purely local and never
 triggers a Slack API call of its own; if the cache was never warmed for a channel (e.g. a fresh
 checkout with no `~/.cache/slackbackup/`), those fields are simply `null` rather than blocking on
 a live fetch.
 
-`topic` and `description` are Slack's own two raw values, kept distinct so a query over the digest
-can use either signal independently — e.g. a channel whose topic is logistical ("read the pinned
-FAQ") but whose description states its actual charter (a site-Q channel, a leadership channel's
-remit). `description` here carries Slack's `purpose` field, renamed to match what Slack's own UI
-calls it — its channel-details panel labels this "Description", not "Purpose" (v6, see
-`docs/adr/0007-digest-v6-drop-merged-description.md`; prior to v6 this field was a
-topic-falls-back-to-purpose merge that could silently drop one or the other).
+`description` is `catalog_logic.description_of()`'s merge — topic if set, else purpose, so it can
+silently drop one or the other. `topic` and `purpose` are the raw Slack values kept alongside it
+(additive, sat-hkd) so a query over the digest can use either signal independently — e.g. a
+channel whose topic is logistical ("read the pinned FAQ") but whose purpose states its actual
+charter (a site-Q channel, a leadership channel's remit).
 
 ### Files & Canvases (all types, including images) — read from the archive's own `FILE` table, not `convert`
 
@@ -523,7 +521,7 @@ export engine. Handler selection:
 
 ### Output shape
 
-`schema_version: "slack-llm-digest-v6"`. v2 evolved v1 **additively** — every v1 field/shape
+`schema_version: "slack-llm-digest-v5"`. v2 evolved v1 **additively** — every v1 field/shape
 still held; v2 only added fields (see `docs/adr/0001-digest-v2-additive-evidence.md` for that
 decision). v3 makes three changes:
 
@@ -555,15 +553,9 @@ v5 (sat-4uf, `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) adds `arc
 `files[]` entry, so `has_content: false` is self-explanatory without a sidecar lookup — see
 §`files_out` sidecar → "Digest `archive_status` and the sidecar's routine-media exclusion" above.
 
-v6 (`docs/adr/0007-digest-v6-drop-merged-description.md`) renames the per-channel `purpose` field
-to `description`, matching what Slack's own UI calls it (its channel-details panel labels this
-"Description"; Slack's API name for it is `purpose`). The prior `description` field — a
-topic-falls-back-to-purpose merge that could silently drop one or the other — is dropped. `topic`
-is unchanged.
-
 ```jsonc
 {
-  "schema_version": "slack-llm-digest-v6",
+  "schema_version": "slack-llm-digest-v5",
   "generated_at": "2026-06-23T18:00:00Z",
   "export_scope": { "from": "2026-04-01", "to": "2026-06-23", "days": 180, "workspace_glob": "f3*" },
   "manifest": {
@@ -589,8 +581,8 @@ is unchanged.
   },
   "channels": [
     { "workspace": "f3pugetsound", "channel": "ao-active-book-club", "channel_id": "C...",
-      "status": "ok", "channel_url": "https://app.slack.com/client/T.../C...",
-      "topic": "...", "description": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
+      "status": "ok", "channel_url": "https://f3pugetsound.slack.com/archives/C...",
+      "description": "...", "topic": "...", "purpose": "...", "creator": "U...", "created_at": "2024-01-01T00:00:00Z",
       "files": [ { "id": "F...", "name": "Upcoming_Q_Schedule", "title": "Upcoming Q Schedule",
                    "filetype": "canvas", "mimetype": "application/vnd.slack-docs", "pretty_type": "Canvas",
                    "creator": "U...", "created_at": "2026-01-05T00:00:00Z", "size": 4096,
@@ -694,16 +686,9 @@ emitted as `true`) — its presence is itself the false-only signal.
 
 #### Message anchors and channel/file linking
 
-Every message and reply carries `message_url` (`https://<workspace>.slack.com/archives/<channel_id>/p<ts-no-dot>`
-- the format Slack's own `chat.getPermalink`/"Copy link" on a message generates, which resolves
-correctly across sessions) and every channel entry carries `channel_url`. Unlike a message link,
-the workspace-subdomain form doesn't reliably route to the right workspace for a channel-only link
-in every browser/app session, so `channel_url` instead uses `https://app.slack.com/client/<team_id>/
-<channel_id>` - what Slack's own "Copy link" on a channel actually generates - with `team_id` read
-from the channel's local `slackdump.sqlite` `WORKSPACE.TEAM_ID` (`export_logic._load_team_id`).
-A `status: "missing_archive"` channel has no local archive to read a team id from, so its
-`channel_url` falls back to the workspace-subdomain form instead. Either way, a consumer can cite
-a specific post or channel without reconstructing Slack's URL scheme itself.
+Every message and reply carries `message_url` (`https://<workspace>.slack.com/archives/<channel_id>/p<ts-no-dot>`)
+and every channel entry carries `channel_url` (`https://<workspace>.slack.com/archives/<channel_id>`),
+so a consumer can cite a specific post or channel without reconstructing Slack's URL scheme itself.
 A file's `id` plus, when the file is a reply/message attachment, its `message_ts` (the id of the
 message it was attached to) let a consumer anchor a channel-level file back to the conversation
 that posted it, the same way `message_url` anchors a message. `mentions`/`links`/`unfurls` on a
@@ -861,7 +846,7 @@ and the blanket run duplicated their work at full cost. Both remain available as
 
 ### Monthly digest splitting (`split_by_month` / `--split-by-month`)
 
-`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v6` schema as
+`build_monthly_digests` (`export_logic.py`) produces the same `slack-llm-digest-v5` schema as
 `build_digest`, but as a `{month: document}` mapping instead of one merged document — one file per
 calendar month (`export_scope.month` is stamped on each). It shares `build_digest`'s first phase
 (`_gather_digest_data`: converts every matched channel's archive once, range-bounds, and
@@ -971,7 +956,6 @@ already uses `split_by_month`.
 | Cross-workspace mention tracking left wholly to the LLM — "where is this PAX mentioned" required a full-digest scan plus ad-hoc identity merging in every prompt | ADR-0001 deliberately deferred all identity merging, including the deterministic subset (same email, same F3 name + real name). | **Resolved** in v3 by the top-level `mentions` index (`docs/adr/0003-mentions-index-deterministic-identity.md`) — deterministic unification with confidence flags; ambiguous collisions flagged, never merged; ts-only locations, everything else derived downstream. |
 | `f3-pugetsound`'s digest job (383 channels/7 workspaces) OOM-killed mid-run (sat-811) — `_gather_digest_data` accumulates every channel's messages **and** every channel file's extracted `content` into one in-memory `channels_meta`/`messages` for the whole job before anything is written to disk | Measured: `channels_meta`'s file content was 55% of a real digest and month-invariant (duplicated into every monthly file); scaled to 383 channels this plausibly accounts for the bulk of the ~2.3 GB RSS observed at the OOM kill. | **Phase 1 resolved** (this change) — `content` moved out of the digest into the `files_out` sidecar (§`files_out` sidecar above), so it's no longer held for the job's full duration nor duplicated per month. Re-run `f3-pugetsound` under `/usr/bin/time -v` to confirm this alone clears the OOM before committing to **Phase 2** (deferred, sat-811 design doc §4): a month-sharded spill-to-disk rewrite of `_gather_digest_data`/`build_monthly_digests` so no phase ever holds more than one channel's messages, plus `--spill-dir`/`--resume` crash durability. |
 | `files_out` sidecar accumulated a permanent, ever-growing record for every ordinary image/video attachment (JPG/PNG/GIF/HEIC/MP4/MOV, ...) with no extracted text and never any prospect of some — the additive merge kept every one forever (sat-4uf) | Thousands of such files in a real archive; `has_content: false` in v4 already told a consumer this, but explaining *why* still required opening the sidecar for `archive_status`, and the record persisted regardless of diagnostic value. | **Resolved** by `slack-llm-digest-v5`/`slack-llm-files-v2` (see `docs/adr/0006-digest-v5-archive-status-slim-sidecar.md`) — `archive_status` moves into the digest so `has_content: false` is self-explanatory without the sidecar; the sidecar keeps `content_extracted`/`tombstone` unconditionally and `no_blob`/`unsupported_type` only for non-media files, pruning routine-media records from a pre-v5 sidecar on merge rather than just halting their growth. |
-| Per-channel `description`/`topic`/`purpose` gave the LLM three overlapping fields, one (`description`) a synthesized merge with no Slack UI counterpart and a name that collided with Slack's own "Description" label (which is actually the `purpose` field) | The merge was pure passthrough — `catalog_logic.description_of()` computed once for the catalog cache, re-surfaced as-is by the digest, with no digest logic reading it. | **Resolved** by `slack-llm-digest-v6` (see `docs/adr/0007-digest-v6-drop-merged-description.md`) — `purpose` renamed to `description` (matching Slack's own UI label), the prior merged `description` field dropped; `topic` unchanged. |
 
 ---
 

@@ -416,3 +416,156 @@ def test_register_does_not_overwrite_existing_registered_at(tmp_path, monkeypatc
 
     catalog = channel_logic.catalog_logic.load(cache_dir, "f3test")
     assert catalog["channels"]["C1"]["registered_at"] == "2020-01-01T00:00:00Z"
+
+
+def test_register_matching_prunes_archived_already_tracked_channel(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"}])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "full_scan_complete": True,
+            "channels": {"C1": {"member": True, "name": "helpdesk", "description": "", "is_archived": True}},
+        },
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert [(r["id"], r["reason"]) for r in result["removed"]] == [("C1", "archived")]
+    assert json.loads(channels_file.read_text()) == []
+
+
+def test_register_matching_prunes_missing_channel_on_complete_scan(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"}])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {"full_scan_complete": True, "channels": {}},
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert [(r["id"], r["reason"]) for r in result["removed"]] == [("C1", "missing")]
+    assert json.loads(channels_file.read_text()) == []
+
+
+def test_register_matching_does_not_prune_missing_on_truncated_scan(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"}])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {"full_scan_complete": False, "channels": {}},
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert result["removed"] == []
+    assert [e["id"] for e in json.loads(channels_file.read_text())] == ["C1"]
+
+
+def test_register_matching_shuttered_channel_exempt_from_pruning(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "shuttered-old-ao", "workspace": "f3pugetsound"}])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "full_scan_complete": True,
+            "channels": {"C1": {"member": True, "name": "shuttered-old-ao", "description": "", "is_archived": True}},
+        },
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert result["removed"] == []
+    assert [e["id"] for e in json.loads(channels_file.read_text())] == ["C1"]
+
+
+def test_register_matching_no_prune_leaves_file_untouched(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"}])
+    before = channels_file.read_text()
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "full_scan_complete": True,
+            "channels": {"C1": {"member": True, "name": "helpdesk", "description": "", "is_archived": False}},
+        },
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert result["added"] == []
+    assert result["removed"] == []
+    assert channels_file.read_text() == before
+
+
+def test_register_matching_removed_channel_not_double_reported_as_skipped(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [{"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"}])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "full_scan_complete": True,
+            "channels": {"C1": {"member": True, "name": "helpdesk", "description": "", "is_archived": True}},
+        },
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert [(r["id"], r["reason"]) for r in result["removed"]] == [("C1", "archived")]
+    assert result["skipped"] == []
+
+
+def test_register_matching_add_and_prune_in_same_call(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.json"
+    write_json(channels_file, [
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "old-thing", "workspace": "f3pugetsound"},
+        {"id": "C3", "name": "shuttered-ao", "workspace": "f3pugetsound"},
+    ])
+    monkeypatch.setattr(
+        channel_logic.workspace_logic, "status",
+        _fake_status([{"name": "f3pugetsound", "registered": True}]),
+    )
+    monkeypatch.setattr(
+        channel_logic.catalog_logic, "refresh_full",
+        lambda ws, cache_dir=None: {
+            "full_scan_complete": True,
+            "channels": {
+                "C1": {"member": True, "name": "helpdesk", "description": "", "is_archived": False},
+                "C4": {"member": True, "name": "new-channel", "description": "", "is_archived": False},
+            },
+        },
+    )
+
+    result = channel_logic.register_matching("f3pugetsound", "*", channels_file, cache_dir=tmp_path / "cache")
+
+    assert [e["id"] for e in result["added"]] == ["C4"]
+    ids_by_reason = {(r["id"]): r["reason"] for r in result["removed"]}
+    assert ids_by_reason == {"C2": "missing"}
+    remaining = {e["id"] for e in json.loads(channels_file.read_text())}
+    assert remaining == {"C1", "C3", "C4"}
