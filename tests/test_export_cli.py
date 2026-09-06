@@ -51,7 +51,7 @@ def _stub_profiles(monkeypatch, raise_for_glob=None):
     the fake build_user_profiles raises for a job whose workspace_glob
     matches it (used to simulate one job's processing blowing up)."""
 
-    def fake_build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=None):
+    def fake_build_user_profiles(channels_file, workspace_glob, list_users_fn, handler=None):
         if raise_for_glob is not None and workspace_glob == raise_for_glob:
             raise RuntimeError(f"simulated failure for {workspace_glob}")
         return {"schema_version": "slack-user-profiles-v1", "workspaces": []}

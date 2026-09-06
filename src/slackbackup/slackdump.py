@@ -132,6 +132,22 @@ def list_dms(include_group: bool = True) -> list[dict]:
     return ims + mpims
 
 
+def list_users(workspace: str) -> list[dict]:
+    """`list users -format JSON -workspace <workspace>`, raw Slack user
+    objects (same shape `_clean_user` already consumes from `convert -f
+    export`'s users.json) - one call per workspace, independent of any
+    channel's own archive. See export_logic.build_user_profiles(): this
+    replaces piggybacking the full-roster export on a single "representative"
+    archived channel, which broke once archive()/resume() started passing
+    -channel-users (a DM's own roster is just its 1-3 participants).
+    """
+    result = _run(["list", "users", "-format", "JSON", "-no-json", "-workspace", workspace])
+    if result.returncode != 0:
+        raise SlackdumpError(f"slackdump list users failed: {result.stderr}")
+    text = result.stdout.strip()
+    return json.loads(text) if text else []
+
+
 def search_files(term: str, out_dir: Path) -> bool:
     return _run(["search", "files", "-o", str(out_dir), term]).returncode == 0
 
@@ -141,7 +157,15 @@ def search_messages(query_terms: list[str], out_dir: Path) -> bool:
 
 
 def archive(channel_id: str, out_dir: Path) -> None:
-    result = _run(["archive", "-o", str(out_dir), channel_id], timeout=ARCHIVE_TIMEOUT_SECONDS)
+    # -channel-users: skip fetching the full workspace user directory into
+    # this channel's own S_USER table - confirmed (sat-c69) to dominate
+    # archive/resume time on a large workspace (11k+ users, ~150-250s/channel
+    # vs ~13-15s on a small one) regardless of the channel's own size. Safe
+    # once export_logic.build_user_profiles() gets the full roster from its
+    # own dedicated slackdump.list_users() call instead of a channel's cache.
+    result = _run(
+        ["archive", "-channel-users", "-o", str(out_dir), channel_id], timeout=ARCHIVE_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump archive failed: {result.stderr}")
 
@@ -150,7 +174,8 @@ def resume(channel_dir: Path) -> None:
     # -dedupe deliberately never passed: confirmed to delete thread-root
     # rows (SlackBackup-d3r). Accept duplicate rows across resume cycles -
     # dedupe(), below, cleans them up as a separate, verified-safe step.
-    result = _run(["resume", str(channel_dir)], timeout=RESUME_TIMEOUT_SECONDS)
+    # -channel-users: see archive()'s comment above - same rationale.
+    result = _run(["resume", "-channel-users", str(channel_dir)], timeout=RESUME_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise SlackdumpError(f"slackdump resume failed: {result.stderr}")
 

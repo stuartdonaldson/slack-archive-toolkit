@@ -13,8 +13,20 @@ from pathlib import Path
 import pytest
 
 from slackbackup import catalog_logic, channel_lock, export_logic
+from slackbackup.slackdump import SlackdumpError
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
+_FIXTURE_USERS = json.loads((FIXTURE / "users.json").read_text())
+
+
+@pytest.fixture(autouse=True)
+def _fake_list_users_fn(monkeypatch):
+    """build_digest/build_monthly_digests/write_monthly_digests fall back to
+    the real slackdump.list_users() (a live subprocess call) whenever a test
+    doesn't pass profiles_doc/list_users_fn explicitly - same fixture roster
+    _fake_convert already supplies via users.json, decoupled from any
+    channel's own archive (sat-c69)."""
+    monkeypatch.setattr(export_logic, "_default_list_users_fn", lambda workspace: _FIXTURE_USERS)
 
 
 def _make_file_db(path: Path, files: list[dict]) -> None:
@@ -539,10 +551,6 @@ def test_build_digest_most_active_human_channel_excludes_bot_posting_as_ordinary
     def convert_fn(channel_dir: Path, out_dir: Path) -> None:
         out = out_dir / channel_dir.name
         out.mkdir(parents=True)
-        (out_dir / "users.json").write_text(json.dumps([
-            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
-            {"id": "U0BOT", "name": "f3_nation", "real_name": "F3 Nation", "profile": {}, "is_bot": True},
-        ]))
         if channel_dir.name == "bot-logs":
             (out / "2026-06-01.json").write_text(json.dumps([
                 {"type": "message", "user": "U0BOT", "ts": f"178030{i:04d}.000100", "text": f"log line {i}"}
@@ -556,6 +564,10 @@ def test_build_digest_most_active_human_channel_excludes_bot_posting_as_ordinary
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: [
+            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
+            {"id": "U0BOT", "name": "f3_nation", "real_name": "F3 Nation", "profile": {}, "is_bot": True},
+        ],
     )
 
     index = next(w for w in result["workspace_activity_index"] if w["workspace"] == "f3pugetsound")
@@ -973,18 +985,13 @@ def test_build_digest_leadership_includes_workspace_admin_without_title_match(tm
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
     ]))
 
-    def convert_with_admin(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: _FIXTURE_USERS + [{
             "id": "UADMIN", "name": "plainjane", "real_name": "Plain Jane",
             "profile": {"display_name": "Jane"}, "is_admin": True, "is_owner": False,
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
-
-    result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_admin,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        }],
     )
 
     matches = result["leadership"]["profile_role_matches"]
@@ -1006,18 +1013,13 @@ def test_build_digest_leadership_pulled_from_full_roster_not_just_posters(tmp_pa
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
     ]))
 
-    def convert_with_leader(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: _FIXTURE_USERS + [{
             "id": "ULEADER", "name": "columbia", "real_name": "Real Columbia",
             "profile": {"display_name": "Columbia - Cascades Region Nantan"},
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
-
-    result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_leader,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        }],
     )
 
     # The leader never posted in-range, so doesn't appear in messages...
@@ -1080,22 +1082,18 @@ def test_build_digest_leadership_dedupes_same_person_across_workspaces(tmp_path)
         {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
     ]))
 
-    def convert_with_leader(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
+    def list_users_with_leader(workspace: str) -> list[dict]:
         # Same person, same self-reported role, separate per-workspace
         # account id - this is the duplication reported in
         # docs/llm-leadership-improvement.md.
-        workspace = channel_dir.parent.name
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+        return _FIXTURE_USERS + [{
             "id": f"ULEADER-{workspace}", "name": "columbia", "real_name": "Real Columbia",
             "profile": {"display_name": "Columbia - Cascades Region Nantan"},
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
+        }]
 
     result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_leader,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache", list_users_fn=list_users_with_leader,
     )
 
     assert len(result["leadership"]["profile_role_matches"]) == 2  # one per workspace account
@@ -1161,6 +1159,39 @@ def test_build_digest_skips_locked_channel_and_continues(tmp_path):
     assert len(result["messages"]) > 0  # the unlocked channel's messages still made it in
 
 
+def test_build_digest_skips_convert_failed_channel_and_continues(tmp_path):
+    # sat-d38: -channel-users (sat-c69) can leave a channel's local S_USER
+    # table empty (its only participant unresolvable), which makes `convert
+    # -f export` fail hard ("empty users data base") - one such channel must
+    # not abort the whole digest, same soft-skip treatment as locked/
+    # missing_archive above.
+    archive_root = tmp_path / "archive"
+    for ws in ("f3pugetsound", "f3kirkland"):
+        channel_dir = archive_root / ws / "helpdesk"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "slackdump.sqlite").write_bytes(b"")
+
+    channels_file = tmp_path / "channels.json"
+    channels_file.write_text(json.dumps([
+        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
+    ]))
+
+    def flaky_convert(channel_dir: Path, out_dir: Path) -> None:
+        if channel_dir.parent.name == "f3kirkland":
+            raise SlackdumpError("empty users data base")
+        _fake_convert(channel_dir, out_dir)
+
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", flaky_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+    )
+
+    statuses = {c["workspace"]: c["status"] for c in result["channels"]}
+    assert statuses == {"f3pugetsound": "ok", "f3kirkland": "convert_failed"}
+    assert len(result["messages"]) > 0  # the unaffected channel's messages still made it in
+
+
 def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
     archive_root = tmp_path / "archive"
     channel_dir = archive_root / "f3pugetsound" / "helpdesk"
@@ -1172,18 +1203,13 @@ def test_build_digest_former_leaders_go_to_former_by_region(tmp_path):
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
     ]))
 
-    def convert_with_former(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: _FIXTURE_USERS + [{
             "id": "UFORMER", "name": "ex_nantan", "real_name": "Old Leader",
             "profile": {"display_name": "OldLeader", "title": "Former Cascades Nantan"},
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
-
-    result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_former,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        }],
     )
 
     assert result["leadership"]["by_region"] == []
@@ -1321,19 +1347,14 @@ def test_build_digest_emeritus_in_display_name_goes_to_former_by_region(tmp_path
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
     ]))
 
-    def convert_with_emeritus(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: _FIXTURE_USERS + [{
             "id": "UEMERITUS", "name": "padre", "real_name": "Padre",
             # Sanitized real-world format: modifier after role, trailing noise after " - "
             "profile": {"display_name": "Padre - Seattle Region Nantan Emeritus - 206.555.1234"},
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
-
-    result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_emeritus,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        }],
     )
 
     assert result["leadership"]["by_region"] == []
@@ -1360,21 +1381,16 @@ def test_build_digest_title_high_role_wins_confidence_and_currency(tmp_path):
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
     ]))
 
-    def convert_with_title(channel_dir: Path, out_dir: Path) -> None:
-        _fake_convert(channel_dir, out_dir)
-        users = json.loads((out_dir / "users.json").read_text())
-        users.append({
+    result = export_logic.build_digest(
+        channels_file, archive_root, "f3*", None, "2026-06-23", _fake_convert,
+        catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: _FIXTURE_USERS + [{
             "id": "ULEADER", "name": "columbia", "real_name": "Real Columbia",
             "profile": {
                 "display_name": "Columbia - Cascades Region Nantan",
                 "title": "Cascades Nantan",
             },
-        })
-        (out_dir / "users.json").write_text(json.dumps(users))
-
-    result = export_logic.build_digest(
-        channels_file, archive_root, "f3*", None, "2026-06-23", convert_with_title,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        }],
     )
 
     by_region = result["leadership"]["by_region"]
@@ -1478,13 +1494,6 @@ def test_build_digest_user_index_includes_mentioned_never_posting_user_excludes_
     def convert_fn(channel_dir: Path, out_dir: Path) -> None:
         out = out_dir / "helpdesk"
         out.mkdir(parents=True)
-        (out_dir / "users.json").write_text(json.dumps([
-            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
-            {"id": "U0MENTIONED", "name": "mo", "real_name": "Mo Mentioned",
-             "profile": {"display_name": "Mo"}},
-            {"id": "U0UNUSED", "name": "un", "real_name": "Un Referenced",
-             "profile": {"display_name": "Un"}},
-        ]))
         (out / "2026-06-01.json").write_text(json.dumps([
             {"type": "message", "user": "U0A", "ts": "1780300800.000100", "text": "hey <@U0MENTIONED>"},
         ]))
@@ -1492,6 +1501,13 @@ def test_build_digest_user_index_includes_mentioned_never_posting_user_excludes_
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache",
+        list_users_fn=lambda ws: [
+            {"id": "U0A", "name": "alice.a", "real_name": "Alice Anderson", "profile": {"display_name": "Al"}},
+            {"id": "U0MENTIONED", "name": "mo", "real_name": "Mo Mentioned",
+             "profile": {"display_name": "Mo"}},
+            {"id": "U0UNUSED", "name": "un", "real_name": "Un Referenced",
+             "profile": {"display_name": "Un"}},
+        ],
     )
 
     ws_index = result["user_index"]["f3pugetsound"]
@@ -1514,21 +1530,20 @@ def test_build_digest_user_index_scoped_per_workspace_for_shared_user_id(tmp_pat
     ]))
 
     def convert_fn(channel_dir: Path, out_dir: Path) -> None:
-        workspace = channel_dir.parent.name
         out = out_dir / "helpdesk"
         out.mkdir(parents=True)
-        display_name = "Puget Al" if workspace == "f3pugetsound" else "Kirkland Al"
-        (out_dir / "users.json").write_text(json.dumps([
-            {"id": "U0SAME", "name": "same", "real_name": "Same Real Name",
-             "profile": {"display_name": display_name}},
-        ]))
         (out / "2026-06-01.json").write_text(json.dumps([
             {"type": "message", "user": "U0SAME", "ts": "1780300800.000100", "text": "hi"},
         ]))
 
+    def list_users_fn(workspace: str) -> list[dict]:
+        display_name = "Puget Al" if workspace == "f3pugetsound" else "Kirkland Al"
+        return [{"id": "U0SAME", "name": "same", "real_name": "Same Real Name",
+                 "profile": {"display_name": display_name}}]
+
     result = export_logic.build_digest(
         channels_file, archive_root, "f3*", None, "2026-06-23", convert_fn,
-        catalog_cache_dir=tmp_path / "empty-cache",
+        catalog_cache_dir=tmp_path / "empty-cache", list_users_fn=list_users_fn,
     )
 
     assert result["user_index"]["f3pugetsound"]["U0SAME"]["display_name"] == "Puget Al"
@@ -2205,6 +2220,9 @@ def test_gather_digest_data_files_out_sink_collects_content_and_modification_his
     export_logic.build_digest(
         channels_file, archive_root, "f3*", None, "2026-06-23", _canvas_update_convert_fn,
         catalog_cache_dir=tmp_path / "empty-cache", files_out_sink=sink,
+        list_users_fn=lambda ws: [
+            {"id": "U1", "name": "daniel", "real_name": "Daniel Hüsch", "profile": {"display_name": "Daniel"}},
+        ],
     )
 
     entry = next(f for f in sink if f["id"] == CANVAS_FILE["id"])
@@ -2612,6 +2630,26 @@ def test_gather_and_shard_skips_locked_channel_and_continues(tmp_path):
     statuses = {c["workspace"]: c["status"] for c in channels_meta}
     assert statuses == {"f3aaa": "ok", "f3bbb": "locked", "f3ccc": "ok"}
     assert months_seen == {"2026-04", "2026-05", "2026-06"}  # unlocked channels still contributed
+
+
+def test_gather_and_shard_skips_convert_failed_channel_and_continues(tmp_path):
+    # sat-d38, same reasoning as build_digest's equivalent test.
+    channels_file, archive_root = _multi_channel_digest_setup(tmp_path)
+    spill_dir = tmp_path / "spill"
+
+    def flaky_convert(channel_dir: Path, out_dir: Path) -> None:
+        if channel_dir.parent.name == "f3bbb":
+            raise SlackdumpError("empty users data base")
+        _fake_convert(channel_dir, out_dir)
+
+    channels_meta, months_seen, _, _, _ = export_logic.gather_and_shard_digest_data(
+        channels_file, archive_root, "f3*", None, "2026-06-23", flaky_convert,
+        tmp_path / "empty-cache", None, None, spill_dir,
+    )
+
+    statuses = {c["workspace"]: c["status"] for c in channels_meta}
+    assert statuses == {"f3aaa": "ok", "f3bbb": "convert_failed", "f3ccc": "ok"}
+    assert months_seen == {"2026-04", "2026-05", "2026-06"}  # unaffected channels still contributed
 
 
 def test_write_monthly_digests_matches_build_monthly_digests(tmp_path):

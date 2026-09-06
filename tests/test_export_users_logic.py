@@ -3,17 +3,13 @@ slackdump has cached, not just digest posters (see test_export_digest_logic.py
 for the "is identity scoped per-workspace" reasoning this builds on).
 """
 import json
-import shutil
 from pathlib import Path
 
-from slackbackup import channel_lock, export_logic
+from slackbackup import export_logic
+from slackbackup.slackdump import SlackdumpError
 
 FIXTURE = Path(__file__).parent.parent / "scripts" / "test_fixtures" / "export-archive"
-
-
-def _fake_convert(channel_dir: Path, out_dir: Path) -> None:
-    shutil.copytree(FIXTURE / "helpdesk", out_dir / "helpdesk")
-    shutil.copy(FIXTURE / "users.json", out_dir / "users.json")
+_FIXTURE_USERS = json.loads((FIXTURE / "users.json").read_text())
 
 
 def test_clean_user_strips_noise_and_resolves_display_name():
@@ -71,12 +67,6 @@ def test_clean_user_empty_display_name_becomes_none():
 
 
 def test_build_user_profiles_groups_by_workspace(tmp_path):
-    archive_root = tmp_path / "archive"
-    for ws in ("f3pugetsound", "f3kirkland"):
-        channel_dir = archive_root / ws / "helpdesk"
-        channel_dir.mkdir(parents=True)
-        (channel_dir / "slackdump.sqlite").write_bytes(b"")
-
     channels_file = tmp_path / "channels.json"
     channels_file.write_text(json.dumps([
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
@@ -84,73 +74,47 @@ def test_build_user_profiles_groups_by_workspace(tmp_path):
         {"id": "C3", "name": "ai-coding", "workspace": "dungeons-of-finn-hill"},
     ]))
 
-    result = export_logic.build_user_profiles(channels_file, archive_root, "f3*", _fake_convert)
+    result = export_logic.build_user_profiles(channels_file, "f3*", lambda ws: _FIXTURE_USERS)
 
     assert result["schema_version"] == "slack-user-profiles-v1"
     workspaces = {w["workspace"]: w for w in result["workspaces"]}
     assert set(workspaces) == {"f3pugetsound", "f3kirkland"}
     assert workspaces["f3pugetsound"]["status"] == "ok"
-    assert {p["id"] for p in workspaces["f3pugetsound"]["profiles"]} == {"U0A", "U0B", "U0C", "U0D"}
+    assert {p["id"] for p in workspaces["f3pugetsound"]["profiles"]} == {u["id"] for u in _FIXTURE_USERS}
 
 
-def test_build_user_profiles_missing_archive_per_workspace(tmp_path):
-    archive_root = tmp_path / "archive"  # no channel dirs created
-
+def test_build_user_profiles_calls_list_users_once_per_matched_workspace(tmp_path):
     channels_file = tmp_path / "channels.json"
     channels_file.write_text(json.dumps([
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
+        {"id": "C2", "name": "mumblechatter", "workspace": "f3pugetsound"},
+        {"id": "C3", "name": "helpdesk", "workspace": "f3kirkland"},
     ]))
 
-    result = export_logic.build_user_profiles(channels_file, archive_root, "f3*", _fake_convert)
+    calls = []
 
-    assert result["workspaces"] == [{"workspace": "f3pugetsound", "status": "missing_archive", "profiles": []}]
+    def fake_list_users(workspace):
+        calls.append(workspace)
+        return _FIXTURE_USERS
+
+    export_logic.build_user_profiles(channels_file, "f3*", fake_list_users)
+    assert calls == ["f3kirkland", "f3pugetsound"]
 
 
-def test_build_user_profiles_locked_channel_marks_workspace_locked(tmp_path):
-    # sat-7k9: users.json conversion also shares the per-channel lock - a
-    # locked chosen channel marks that workspace "locked" (soft skip, like
-    # missing_archive) rather than failing the whole job.
-    archive_root = tmp_path / "archive"
-    for ws in ("f3pugetsound", "f3kirkland"):
-        channel_dir = archive_root / ws / "helpdesk"
-        channel_dir.mkdir(parents=True)
-        (channel_dir / "slackdump.sqlite").write_bytes(b"")
-
+def test_build_user_profiles_list_users_failure_marks_workspace_error(tmp_path):
     channels_file = tmp_path / "channels.json"
     channels_file.write_text(json.dumps([
         {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
         {"id": "C2", "name": "helpdesk", "workspace": "f3kirkland"},
     ]))
 
-    with channel_lock.channel_lock(archive_root / "f3kirkland" / "helpdesk"):
-        result = export_logic.build_user_profiles(channels_file, archive_root, "f3*", _fake_convert)
+    def flaky_list_users(workspace):
+        if workspace == "f3kirkland":
+            raise SlackdumpError("session expired")
+        return _FIXTURE_USERS
+
+    result = export_logic.build_user_profiles(channels_file, "f3*", flaky_list_users)
 
     workspaces = {w["workspace"]: w for w in result["workspaces"]}
     assert workspaces["f3pugetsound"]["status"] == "ok"
-    assert workspaces["f3kirkland"] == {"workspace": "f3kirkland", "status": "locked", "profiles": []}
-
-
-def test_build_user_profiles_only_converts_one_channel_per_workspace(tmp_path):
-    """Two archived channels in the same workspace - users.json is
-    workspace-scoped, so only the first archived channel should get
-    converted, not both."""
-    archive_root = tmp_path / "archive"
-    converted = []
-
-    def counting_convert(channel_dir: Path, out_dir: Path) -> None:
-        converted.append(channel_dir.name)
-        _fake_convert(channel_dir, out_dir)
-
-    for name in ("helpdesk", "mumblechatter"):
-        channel_dir = archive_root / "f3pugetsound" / name
-        channel_dir.mkdir(parents=True)
-        (channel_dir / "slackdump.sqlite").write_bytes(b"")
-
-    channels_file = tmp_path / "channels.json"
-    channels_file.write_text(json.dumps([
-        {"id": "C1", "name": "helpdesk", "workspace": "f3pugetsound"},
-        {"id": "C2", "name": "mumblechatter", "workspace": "f3pugetsound"},
-    ]))
-
-    export_logic.build_user_profiles(channels_file, archive_root, "f3*", counting_convert)
-    assert converted == ["helpdesk"]
+    assert workspaces["f3kirkland"] == {"workspace": "f3kirkland", "status": "error", "profiles": []}

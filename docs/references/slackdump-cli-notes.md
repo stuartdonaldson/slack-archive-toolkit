@@ -69,6 +69,19 @@ file/canvas harvesting) for how this project uses these facts.
 - `archive`/`resume` against a single named channel does **not** require listing or
   touching any other channel in the workspace — cost scales with that one channel's
   message history, not workspace size.
+- **Without `-channel-users`, `archive`/`resume` unconditionally re-fetch the entire
+  workspace user directory** into that channel's own `S_USER` table on every call,
+  regardless of the channel's own size — confirmed 2026-09-05 (sat-c69) backing up
+  f3nation DMs: an 11,032-user workspace roster made every 1:1 DM archive/resume take
+  150-250s (vs 13-15s for the same operation on a small workspace like f3pugetsound),
+  and it's subject to Slack's rate limiting on top of that. `-channel-users` ("export
+  only users involved in the channel, and skip fetching of all users") fetches just
+  that channel's own participants instead — this project's `slackdump.archive()`/
+  `resume()` now pass it unconditionally. The tradeoff: a channel's local `S_USER`
+  table is no longer a reliable full-workspace roster, which is why
+  `export_logic.build_user_profiles()` now calls `slackdump list users -workspace
+  <ws>` directly (see docs/DESIGN-export.md §User Profiles Export) instead of reading
+  one "representative" archived channel's converted `users.json`.
 
 ## `convert -f export`
 
@@ -167,6 +180,16 @@ Conclusions:
   plaintext, TTL-based cache (`~/.cache/register-channel/<workspace>.txt`, default
   900s) — reuse that pattern (and ideally that exact cache) rather than building a
   second one; see `docs/DESIGN-files.md` for how the channel catalog generalizes it.
+
+## `list users`
+
+- `-format JSON -no-json -workspace <name>` returns the raw Slack user array, same shape
+  as `convert -f export`'s `users.json`. Cheap relative to per-channel archiving — 653
+  users for f3plateau in ~1.4s including slackdump's own user-cache warm-up (users are
+  cached, TTL controlled by `-user-cache-retention`; `-no-user-cache` disables it).
+  `slackbackup.slackdump.list_users(workspace)` wraps this — see docs/DESIGN-export.md
+  §User Profiles Export for why this project fetches the roster this way now instead of
+  via a channel's own archive.
 
 ## `FILE` table / Slack Canvases
 

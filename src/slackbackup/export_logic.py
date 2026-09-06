@@ -36,6 +36,7 @@ from typing import Callable, AbstractSet
 from zoneinfo import ZoneInfo
 
 from . import catalog_logic, channel_lock, selector_logic
+from .slackdump import SlackdumpError, list_users as _default_list_users_fn
 from .handlers import f3 as _default_handler
 
 _DAY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -1410,6 +1411,7 @@ def _gather_digest_data(
     handler,
     profiles_doc: dict | None,
     files_out_sink: list[dict] | None = None,
+    list_users_fn: Callable[[str], list[dict]] | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, set[str]], dict, tuple[str | None, str]]:
     """Shared first phase of build_digest/build_monthly_digests: reads
     every (workspace, channel) in `channels_file` matching `workspace_glob`,
@@ -1440,7 +1442,7 @@ def _gather_digest_data(
     # (see SlackBackup follow-up: the f3kirkland nation_bot_logs bot posts
     # as user U0A3GF12LEA).
     if profiles_doc is None:
-        profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
+        profiles_doc = build_user_profiles(channels_file, workspace_glob, list_users_fn or _default_list_users_fn, handler=handler)
     bot_ids_by_workspace: dict[str, set[str]] = {
         ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
         for ws_entry in profiles_doc["workspaces"]
@@ -1507,6 +1509,21 @@ def _gather_digest_data(
                 {
                     "workspace": workspace, "channel": channel, "channel_id": channel_id,
                     "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                    "files": [], **channel_info,
+                }
+            )
+            continue
+        except SlackdumpError as exc:
+            # sat-d38: -channel-users (sat-c69) can leave a channel's local
+            # S_USER table empty (its only participant unresolvable), which
+            # makes `convert -f export` fail hard ("empty users data base")
+            # - a soft skip, like locked/missing_archive above, not a hard
+            # failure of the whole digest.
+            print(f"export digest: skipping {workspace}/{channel} - convert failed: {exc}", file=sys.stderr)
+            channels_meta.append(
+                {
+                    "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                    "status": "convert_failed", "channel_url": digest_channel_url(workspace, channel_id),
                     "files": [], **channel_info,
                 }
             )
@@ -1625,6 +1642,7 @@ def gather_and_shard_digest_data(
     profiles_doc: dict | None,
     spill_dir: Path,
     resume: bool = False,
+    list_users_fn: Callable[[str], list[dict]] | None = None,
 ) -> tuple[list[dict], set[str], dict[str, set[str]], dict, tuple[str | None, str]]:
     """Streaming counterpart to _gather_digest_data: instead of accumulating
     every channel's cleaned messages and every channel's file content into
@@ -1661,7 +1679,7 @@ def gather_and_shard_digest_data(
     to_epoch = _date_epoch(date_to, "23:59:59")
 
     if profiles_doc is None:
-        profiles_doc = build_user_profiles(channels_file, archive_root, workspace_glob, convert_fn, handler=handler)
+        profiles_doc = build_user_profiles(channels_file, workspace_glob, list_users_fn or _default_list_users_fn, handler=handler)
     bot_ids_by_workspace: dict[str, set[str]] = {
         ws_entry["workspace"]: {p["id"] for p in ws_entry["profiles"] if "bot" in p["slack_roles"]}
         for ws_entry in profiles_doc["workspaces"]
@@ -1748,6 +1766,17 @@ def gather_and_shard_digest_data(
                         {
                             "workspace": workspace, "channel": channel, "channel_id": channel_id,
                             "status": "locked", "channel_url": digest_channel_url(workspace, channel_id),
+                            "files": [], **channel_info,
+                        }
+                    )
+                    continue
+                except SlackdumpError as exc:
+                    # sat-d38: see _gather_digest_data's equivalent catch.
+                    print(f"export digest: skipping {workspace}/{channel} - convert failed: {exc}", file=sys.stderr)
+                    channels_meta.append(
+                        {
+                            "workspace": workspace, "channel": channel, "channel_id": channel_id,
+                            "status": "convert_failed", "channel_url": digest_channel_url(workspace, channel_id),
                             "files": [], **channel_info,
                         }
                     )
@@ -2218,6 +2247,7 @@ def build_digest(
     handler=_default_handler,
     profiles_doc: dict | None = None,
     files_out_sink: list[dict] | None = None,
+    list_users_fn: Callable[[str], list[dict]] | None = None,
 ) -> dict:
     """Merges messages from the trailing `days` days (or everything ever
     archived, when `days` is None) across every (workspace, channel) in
@@ -2256,7 +2286,7 @@ def build_digest(
     """
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
-        files_out_sink=files_out_sink,
+        files_out_sink=files_out_sink, list_users_fn=list_users_fn,
     )
     return _assemble_digest(
         channels_meta, messages, profiles_doc, handler, date_from, date_to, days, workspace_glob, bot_ids_by_workspace,
@@ -2274,6 +2304,7 @@ def build_monthly_digests(
     handler=_default_handler,
     profiles_doc: dict | None = None,
     files_out_sink: list[dict] | None = None,
+    list_users_fn: Callable[[str], list[dict]] | None = None,
 ) -> dict[str, dict]:
     """Same data and same slack-llm-digest-v6 schema as build_digest, but
     split into one document per calendar month (keyed "YYYY-MM") instead of
@@ -2288,7 +2319,7 @@ def build_monthly_digests(
     has no natural month (see build_digest)."""
     channels_meta, messages, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = _gather_digest_data(
         channels_file, archive_root, workspace_glob, days, as_of, convert_fn, catalog_cache_dir, handler, profiles_doc,
-        files_out_sink=files_out_sink,
+        files_out_sink=files_out_sink, list_users_fn=list_users_fn,
     )
     buckets = partition_messages_by_month(messages)
     return {
@@ -2314,6 +2345,7 @@ def write_monthly_digests(
     files_out_path: Path | None = None,
     spill_dir: Path | None = None,
     resume: bool = False,
+    list_users_fn: Callable[[str], list[dict]] | None = None,
 ) -> list[Path]:
     """Streaming, file-writing counterpart to build_monthly_digests (sat-811
     Phase 2 / sat-svu): shards every channel's messages/file content to disk
@@ -2345,7 +2377,7 @@ def write_monthly_digests(
         channels_meta, months_seen, bot_ids_by_workspace, profiles_doc, (date_from, date_to) = (
             gather_and_shard_digest_data(
                 channels_file, archive_root, workspace_glob, days, as_of, convert_fn,
-                catalog_cache_dir, handler, profiles_doc, spill_dir, resume=resume,
+                catalog_cache_dir, handler, profiles_doc, spill_dir, resume=resume, list_users_fn=list_users_fn,
             )
         )
 
@@ -2443,49 +2475,38 @@ def _clean_user(user: dict) -> dict:
 
 def build_user_profiles(
     channels_file: Path,
-    archive_root: Path,
     workspace_glob: str,
-    convert_fn: Callable[[Path, Path], None],
+    list_users_fn: Callable[[str], list[dict]],
     handler=None,
 ) -> dict:
-    """users.json from `convert -f export` is workspace-scoped, identical
-    no matter which of that workspace's channels you convert - so this
-    converts just one archived channel per workspace (whichever is
-    archived first) to fetch it, rather than every channel.
+    """One `list_users_fn(workspace)` call per workspace matching
+    workspace_glob (from channels_file, same selector channel/DM digests
+    use) - independent of any channel's own local archive (sat-c69).
+
+    Previously this converted one already-archived "representative" channel
+    per workspace, trusting that its users.json held the full workspace
+    roster - true only because archive()/resume() fetched the entire
+    workspace's users into every channel unconditionally. Once those started
+    passing -channel-users (sat-c69, to stop re-fetching a large workspace's
+    full user directory on every tiny channel/DM), a channel's own roster
+    shrank to just its own participants, breaking that assumption - a DM's
+    "representative channel" would supply only the 2-3 people in that one
+    DM. list_users_fn decouples the roster entirely from any channel archive.
 
     `handler` (see handlers/__init__.py), when given, tags each profile
     with a "derived_leadership" field via handler.annotate_profile() -
     None (the default) leaves profiles untouched, since this general-
     purpose roster export has no reason to assume any particular region's
     role vocabulary unless asked."""
-    by_workspace: dict[str, list[dict]] = {}
-    for entry in select_channels(channels_file, workspace_glob):
-        by_workspace.setdefault(entry["workspace"], []).append(entry)
+    workspaces = sorted({entry["workspace"] for entry in select_channels(channels_file, workspace_glob)})
 
     workspaces_out = []
-    for workspace in sorted(by_workspace):
-        archived = next(
-            (e for e in by_workspace[workspace] if (archive_root / workspace / e["name"] / "slackdump.sqlite").exists()),
-            None,
-        )
-        if archived is None:
-            workspaces_out.append({"workspace": workspace, "status": "missing_archive", "profiles": []})
-            continue
-
-        channel_dir = archive_root / workspace / archived["name"]
-        # sat-7k9: shares the per-channel lock with backup/dedupe - a
-        # locked channel marks this workspace "locked" (soft skip, like
-        # missing_archive above), not a hard failure.
+    for workspace in workspaces:
         try:
-            with channel_lock.channel_lock(channel_dir):
-                with tempfile.TemporaryDirectory() as export_dir:
-                    export_dir_path = Path(export_dir)
-                    convert_fn(channel_dir, export_dir_path)
-                    users_file = export_dir_path / "users.json"
-                    raw_users = json.loads(users_file.read_text()) if users_file.exists() else []
-        except channel_lock.ChannelLockedError as exc:
+            raw_users = list_users_fn(workspace)
+        except SlackdumpError as exc:
             print(f"export users: skipping {workspace} - {exc}", file=sys.stderr)
-            workspaces_out.append({"workspace": workspace, "status": "locked", "profiles": []})
+            workspaces_out.append({"workspace": workspace, "status": "error", "profiles": []})
             continue
 
         profiles = [_clean_user(u) for u in raw_users]

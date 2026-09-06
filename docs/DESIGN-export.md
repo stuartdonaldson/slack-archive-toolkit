@@ -277,7 +277,11 @@ instead.
 
 Best-effort across channels: a channel with no local archive is recorded with
 `status: "missing_archive"` in the `channels` array rather than aborting the run — one
-un-archived channel in a 100-channel workspace glob must not block the whole digest.
+un-archived channel in a 100-channel workspace glob must not block the whole digest. Same
+soft-skip treatment for `status: "locked"` (the channel is mid-resume/dedupe — see Concurrency in
+docs/DESIGN.md) and `status: "convert_failed"` (sat-d38: `convert -f export` itself raised —
+observed when `-channel-users`, sat-c69, leaves a channel's local user table empty because its
+only participant is unresolvable, e.g. a legacy/broken DM).
 
 ### Channel context — catalog, not a live call
 
@@ -759,9 +763,14 @@ attach to every month it appears in rather than just the month containing the fi
 ## User Profiles Export (`export users`)
 
 Full per-workspace user roster — everyone slackdump has cached, not just people who posted in
-the digest's date range. Since `users.json` from `convert -f export` is workspace-scoped and
-identical regardless of which channel in that workspace produced it, this converts only **one**
-already-archived channel per workspace (whichever is archived first) rather than every channel.
+the digest's date range. `build_user_profiles` calls `slackdump list users -workspace <ws>` once
+per matched workspace (via `slackdump.list_users`, injected as `list_users_fn`) — independent of
+any channel's own archive (sat-c69). This replaced converting one already-archived "representative"
+channel per workspace and trusting its `users.json` to hold the full roster, an assumption that
+broke once `archive()`/`resume()` started passing `-channel-users` (skip fetching the full
+workspace directory into a small channel's own local cache — see docs/references/slackdump-cli-notes.md)
+for backup speed: a channel's own roster then shrank to just its own participants, and a DM in
+particular would supply only its 1-3 people.
 
 ```jsonc
 {
@@ -773,10 +782,13 @@ already-archived channel per workspace (whichever is archived first) rather than
         { "id": "U123", "name": "jane.doe", "real_name": "Jane Doe", "display_name": "Jane Doe",
           "deleted": false, "slack_roles": ["admin"], "email_hash": "a1b2c3d4e5f6" }
     ] },
-    { "workspace": "f3kirkland", "status": "missing_archive", "profiles": [] }
+    { "workspace": "f3kirkland", "status": "error", "profiles": [] }
   ]
 }
 ```
+
+`status: "error"` means `list_users_fn` raised (e.g. an expired workspace session) — a soft skip
+for that workspace, not a hard failure of the whole roster export.
 
 `slack_roles` is a list, not a pile of individual `is_admin`/`is_owner`/etc. booleans — folded
 from `is_primary_owner`, `is_owner`, `is_admin`, `is_bot`, `is_app_user`, `is_restricted`,
@@ -831,8 +843,8 @@ unsupported type) can specify:
 Path handling: `expand_job_path` does `~`/`$VAR` expansion on any path read from a job file, and
 `resolve_job_out` applies `{as_of}` (and, when splitting by month, `{month}`) templating before
 that expansion. When `users_out` is set, the companion roster is written from **one shared**
-`build_user_profiles` call also used to build the digest, avoiding converting every workspace's
-archive twice. Similarly, when `files_out` is set, `_run_job` passes a `files_out_sink` list into
+`build_user_profiles` call also used to build the digest, avoiding a second `list_users` round
+trip per workspace. Similarly, when `files_out` is set, `_run_job` passes a `files_out_sink` list into
 the same `build_digest`/`build_monthly_digests` call that builds the digest - the sidecar's raw
 per-file entries (content included) are collected from the gather phase already running, not from
 a second pass over every channel's archive. `export._write_files_out` then reads whatever

@@ -291,7 +291,7 @@ def _run_job(job_file: str, job: dict, args: argparse.Namespace, as_of: str) -> 
     split_by_month = bool(job.get("split_by_month", False))
 
     profiles_doc = export_logic.build_user_profiles(
-        channels_file, archive_root, workspace_glob, slackdump.convert_export, handler=handler,
+        channels_file, workspace_glob, slackdump.list_users, handler=handler,
     )
     if "users_out" in job:
         users_out_path = export_logic.resolve_job_out(job["users_out"], as_of)
@@ -361,7 +361,7 @@ def _users(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     result = export_logic.build_user_profiles(
-        Path(args.channels_file), Path(args.archive_root), args.workspace_glob, slackdump.convert_export,
+        Path(args.channels_file), args.workspace_glob, slackdump.list_users,
     )
     out_path.write_text(json.dumps(result, indent=2))
 

@@ -87,6 +87,53 @@ def test_list_dms_empty_output_returns_empty_list(monkeypatch):
     assert slackdump.list_dms() == []
 
 
+def test_list_users_returns_raw_user_objects(monkeypatch):
+    raw = [
+        {"id": "U1", "name": "alice.a", "real_name": "Alice Anderson"},
+        {"id": "USLACKBOT", "name": "slackbot", "real_name": "Slackbot"},
+    ]
+    monkeypatch.setattr(slackdump, "_run", lambda args, timeout=None: _fake_completed(json.dumps(raw)))
+
+    result = slackdump.list_users("f3pugetsound")
+
+    assert [u["id"] for u in result] == ["U1", "USLACKBOT"]
+
+
+def test_list_users_passes_workspace_and_json_flags(monkeypatch):
+    seen_args = []
+
+    def fake_run(args, timeout=None):
+        seen_args.append(args)
+        return _fake_completed("[]")
+
+    monkeypatch.setattr(slackdump, "_run", fake_run)
+    slackdump.list_users("f3nation")
+
+    args = seen_args[0]
+    assert args[:2] == ["list", "users"]
+    assert "-workspace" in args and args[args.index("-workspace") + 1] == "f3nation"
+    assert "-format" in args and args[args.index("-format") + 1] == "JSON"
+    assert "-no-json" in args
+
+
+def test_list_users_empty_output_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(slackdump, "_run", lambda args, timeout=None: _fake_completed(""))
+    assert slackdump.list_users("f3pugetsound") == []
+
+
+def test_list_users_failure_raises(monkeypatch):
+    monkeypatch.setattr(
+        slackdump, "_run", lambda args, timeout=None: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom",
+        ),
+    )
+    try:
+        slackdump.list_users("f3pugetsound")
+        assert False, "expected SlackdumpError"
+    except slackdump.SlackdumpError:
+        pass
+
+
 def test_list_channels_failure_raises(monkeypatch):
     monkeypatch.setattr(
         slackdump, "_run",
@@ -189,6 +236,18 @@ def test_archive_passes_archive_timeout(monkeypatch, tmp_path):
     assert captured["timeout"] == slackdump.ARCHIVE_TIMEOUT_SECONDS
 
 
+def test_archive_passes_channel_users_flag(monkeypatch, tmp_path):
+    captured = {}
+
+    def _run(args, timeout=None):
+        captured["args"] = args
+        return _fake_completed("")
+
+    monkeypatch.setattr(slackdump, "_run", _run)
+    slackdump.archive("C1", tmp_path)
+    assert "-channel-users" in captured["args"]
+
+
 def test_resume_passes_resume_timeout(monkeypatch, tmp_path):
     captured = {}
 
@@ -199,6 +258,18 @@ def test_resume_passes_resume_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(slackdump, "_run", _run)
     slackdump.resume(tmp_path)
     assert captured["timeout"] == slackdump.RESUME_TIMEOUT_SECONDS
+
+
+def test_resume_passes_channel_users_flag(monkeypatch, tmp_path):
+    captured = {}
+
+    def _run(args, timeout=None):
+        captured["args"] = args
+        return _fake_completed("")
+
+    monkeypatch.setattr(slackdump, "_run", _run)
+    slackdump.resume(tmp_path)
+    assert "-channel-users" in captured["args"]
 
 
 def test_dedupe_passes_dedupe_timeout(monkeypatch, tmp_path):
