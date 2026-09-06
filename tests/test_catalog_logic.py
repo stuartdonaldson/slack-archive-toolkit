@@ -69,6 +69,52 @@ def test_full_merge_refreshes_description_without_clobbering_member_flag():
     }
 
 
+CADENCE_STATE = {
+    "last_posted": "2026-07-01T00:00:00Z",
+    "last_checked": "2026-09-05",
+    "last_action": "resume",
+    "registered_at": "2026-06-01T00:00:00Z",
+}
+
+
+def _catalog_with_cadence_state(merge, channel):
+    """A catalog holding `channel` with cadence state already recorded, as a
+    real one does after a backup run has stamped it."""
+    data = merge(_fresh(), [channel])
+    data["channels"][channel["id"]].update(CADENCE_STATE)
+    return data
+
+
+def test_fast_merge_preserves_cadence_state_on_an_existing_channel():
+    data = _catalog_with_cadence_state(catalog_logic.merge_fast, CH1)
+    data = catalog_logic.merge_fast(data, [CH1])
+    assert {k: data["channels"]["C1"].get(k) for k in CADENCE_STATE} == CADENCE_STATE
+
+
+def test_full_merge_preserves_cadence_state_on_an_existing_channel():
+    data = _catalog_with_cadence_state(catalog_logic.merge_full, CH3)
+    data = catalog_logic.merge_full(data, [CH3])
+    assert {k: data["channels"]["C3"].get(k) for k in CADENCE_STATE} == CADENCE_STATE
+
+
+def test_fast_merge_refreshes_description_while_preserving_cadence_state():
+    data = _catalog_with_cadence_state(catalog_logic.merge_fast, CH1)
+    renamed = {"id": "C1", "name": "general-v2", "topic": {"value": "T1-updated"}, "purpose": {"value": ""}}
+    data = catalog_logic.merge_fast(data, [renamed])
+    assert data["channels"]["C1"] == {
+        "member": True, "name": "general-v2", "description": "T1-updated",
+        "topic": "T1-updated", "purpose": None, "is_private": False,
+        "is_archived": False, "creator": None, "created": None, **CADENCE_STATE,
+    }
+
+
+def test_fast_merge_promotes_a_full_tier_only_channel_to_member():
+    data = _catalog_with_cadence_state(catalog_logic.merge_full, CH3)
+    data = catalog_logic.merge_fast(data, [CH3])
+    assert data["channels"]["C3"]["member"] is True
+    assert {k: data["channels"]["C3"].get(k) for k in CADENCE_STATE} == CADENCE_STATE
+
+
 def test_rerunning_fast_tier_never_demotes_a_full_tier_only_channel():
     data = catalog_logic.merge_fast(_fresh(), [CH1])
     data = catalog_logic.merge_full(data, [CH3])

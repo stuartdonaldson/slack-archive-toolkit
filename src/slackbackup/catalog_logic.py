@@ -81,20 +81,36 @@ def _channel_fields(ch: dict, member: bool) -> dict:
     }
 
 
-def merge_fast(data: dict, channels: list[dict]) -> dict:
-    for ch in channels:
-        data["channels"][ch["id"]] = _channel_fields(ch, member=True)
-    return data
+def _merge(data: dict, channels: list[dict], *, promotes_to_member: bool) -> dict:
+    """Refresh the descriptive fields of each channel in `channels`, updating
+    existing records in place rather than replacing them. In-place matters:
+    the cadence state a backup run stamps onto a record (last_posted,
+    last_checked, last_action, registered_at - see backup_logic.should_check_tonight)
+    lives alongside these fields and is not reproducible from a channel list,
+    so a wholesale assignment silently resets the channel to "never checked"
+    and re-enables nightly polling for it (sat-33z).
 
-
-def merge_full(data: dict, channels: list[dict]) -> dict:
+    `promotes_to_member` is the only behavioural difference between the two
+    tiers: the fast tier is member-only, so everything it returns is a member
+    channel and a full-tier-only record it revisits is promoted. The full tier
+    lists every public channel regardless of membership, so it must leave an
+    existing member flag alone and default a newly-seen channel to non-member."""
     for ch in channels:
         existing = data["channels"].get(ch["id"])
         if existing is not None:
-            existing.update(_channel_fields(ch, member=existing["member"]))
+            member = True if promotes_to_member else existing["member"]
+            existing.update(_channel_fields(ch, member=member))
         else:
-            data["channels"][ch["id"]] = _channel_fields(ch, member=False)
+            data["channels"][ch["id"]] = _channel_fields(ch, member=promotes_to_member)
     return data
+
+
+def merge_fast(data: dict, channels: list[dict]) -> dict:
+    return _merge(data, channels, promotes_to_member=True)
+
+
+def merge_full(data: dict, channels: list[dict]) -> dict:
+    return _merge(data, channels, promotes_to_member=False)
 
 
 _TRUNCATION_RETRIES = 3  # 1 initial attempt + 2 retries
