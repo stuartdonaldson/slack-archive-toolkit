@@ -55,3 +55,4 @@ jobs/*.json
 # lives in DevStandard: $DEVSTANDARD/tools/bd-run-beads.py — still ignored here
 # because it is run from this repo's root.
 .bd-run-beads/
+desktop.ini
