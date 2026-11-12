@@ -11,6 +11,7 @@ modifies the archive or makes a Slack API call; all three are implemented in
 | `export monthly` | §Monthly Export | One channel, bounded date range, sealed/idempotent per-month files |
 | `export digest` | §Digest Export | Many workspaces, trailing 180 days by default (or a different N), one merged chronological document |
 | `export users` | §User Profiles Export | Full per-workspace user roster, not just digest posters |
+| `export prune` | §Snapshot Retention | Thins `~/slack-exports` snapshots: daily (7 d), weekly (to 35 d), monthly (all older) |
 
 A digest run driven by a report job (`--jobs`) can additionally emit two companion documents
 alongside its digest: a user roster (`users_out`) and the **`files_out` sidecar** that, since
@@ -982,3 +983,25 @@ already uses `split_by_month`.
 | Original digest feature request | `docs/llm-export-suggestion.md` | External feedback that motivated `export digest`'s one-document, embedded-metadata, no-merged-identity design |
 | Leadership inference feedback | `docs/llm-leadership-improvement.md` | External feedback that motivated `_build_leadership_by_region`'s dedupe-by-(region, f3_name, position) rollup and the compact-hyphen/parenthetical display-name parsing in `_split_possible_name` |
 | Digest indexing/precomputed-metrics feedback | `docs/llm-digest2-idea.md` | External feedback that motivated `manifest`, `workspace_activity_index`, per-channel activity fields, and thread rollup fields; its `channel_category` inference and ZIP-packaging suggestions were considered and deferred (see Known Gaps below) |
+
+---
+
+## Snapshot Retention (`export prune`)
+
+Each nightly run writes a new snapshot of the same report, so `~/slack-exports` accumulates
+near-duplicates. `slackbackup export prune` (dry run by default, `--apply` to delete) thins them.
+Logic is in `src/slackbackup/prune_logic.py`; tracked as sat-v4t.
+
+- **Group** = (prefix, kind, report month); one run emits several report months, so these never
+  supersede each other. Both digest naming schemes (`{prefix}-digest-{as_of}-{month}` and
+  `{prefix}-digest-{month}.{as_of}`) and `{prefix}-{digest|users}-{as_of}` are recognised.
+- **Tiers**, each computed independently from the full file list; a file is deleted only if no
+  tier keeps it: *daily* = as_of ≤ 7 days old; *weekly* = latest per ISO week, as_of ≤ 35 days old;
+  *monthly* = one per as_of calendar month at any age — the earliest when the month is after the
+  report month, otherwise the latest (reported as `partial`). The weekly tier only adds to the keep
+  set, so it cannot drop a monthly keeper.
+- **Safety**: keepers must parse as a JSON object; an invalid file is never deleted; a month with
+  no valid snapshot is a `GAP` (nothing in it is deleted, exit code 1). Re-running is a no-op.
+- **Scope**: `-files-` sidecars are cumulative and not regenerable (docs/OPERATIONS.md), so they
+  are skipped unless `--include-files` (the latest is then always kept). `llm-context/`, `{month}`
+  placeholder files and any unrecognised name are never touched.

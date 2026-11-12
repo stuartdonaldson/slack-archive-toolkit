@@ -251,3 +251,11 @@ A corrupt/unreadable sidecar is logged and treated as absent (the job still comp
 means a truncated file silently restarts the history — back it up with the digests, and check the
 `N files -> <path>` log line for an unexpected drop. See `docs/DESIGN-export.md` §`files_out`
 sidecar.
+
+### Pruning old export snapshots
+
+`~/slack-exports` grows by one near-duplicate snapshot per report per night. Thin it with
+`./slackbackup export prune` (dry run: lists what would be deleted) then `./slackbackup export prune --apply`.
+Retention: every snapshot for 7 days, the latest per ISO week to 35 days, one per month beyond that.
+It exits 1 and deletes nothing in a month that has no valid snapshot. Not yet part of the nightly
+script. Details: docs/DESIGN-export.md §Snapshot Retention.

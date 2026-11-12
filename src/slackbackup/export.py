@@ -11,10 +11,10 @@ import argparse
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
-from . import channel_lock, export_logic, handlers, selector_logic, slackdump
+from . import channel_lock, export_logic, handlers, prune_logic, selector_logic, slackdump
 
 DEFAULT_ARCHIVE_ROOT = Path.home() / "slack-backups"
 DEFAULT_EXPORTS_DIR = Path.home() / "slack-exports"
@@ -166,6 +166,22 @@ def register(groups: argparse._SubParsersAction) -> None:
         help="defaults to ~/slack-exports/f3-user-profiles-<today>.json",
     )
     p_users.set_defaults(handler=_users)
+
+    p_prune = sub.add_parser(
+        "prune",
+        help="thin out old export snapshots (daily last week, weekly last month, monthly before that)",
+        epilog=(
+            "Example:\n  ./slackbackup export prune            # dry run: list what would be deleted\n"
+            "  ./slackbackup export prune --apply    # delete\n"
+            "Digest and users snapshots only; files sidecars are cumulative and skipped unless --include-files."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_prune.add_argument("--exports-dir", default=str(DEFAULT_EXPORTS_DIR), help=f"defaults to {DEFAULT_EXPORTS_DIR}")
+    p_prune.add_argument("--today", default=None, help="YYYY-MM-DD; defaults to today (for testing)")
+    p_prune.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
+    p_prune.add_argument("--include-files", action="store_true", help="also prune -files- sidecars (latest always kept)")
+    p_prune.set_defaults(handler=_prune)
 
 
 def _monthly(args: argparse.Namespace) -> int:
@@ -353,6 +369,34 @@ def _digest(args: argparse.Namespace) -> int:
         spill_dir=Path(args.spill_dir).expanduser() if args.spill_dir else None, resume=args.resume,
     )
     return 0
+
+
+def _prune(args: argparse.Namespace) -> int:
+    exports_dir = Path(args.exports_dir).expanduser()
+    today = date.fromisoformat(args.today) if args.today else date.today()
+    plan = prune_logic.plan_prune(
+        sorted(exports_dir.iterdir()), today=today, include_files=args.include_files,
+    )
+
+    for msg in plan.partial:
+        print(f"export prune: partial: {msg}", file=sys.stderr)
+    for path in plan.invalid:
+        print(f"export prune: invalid (left in place): {path.name}", file=sys.stderr)
+    for msg in plan.gaps:
+        print(f"export prune: GAP: {msg}", file=sys.stderr)
+    for path in plan.delete:
+        print(f"export prune: {'delete' if args.apply else 'would delete'}: {path.name}", file=sys.stderr)
+
+    print(
+        f"export prune: keep {len(plan.keep)}, delete {len(plan.delete)}, "
+        f"skipped {len(plan.skipped)}, invalid {len(plan.invalid)}, gaps {len(plan.gaps)}",
+        file=sys.stderr,
+    )
+    if args.apply:
+        prune_logic.apply_plan(plan)
+    else:
+        print("export prune: dry run - pass --apply to delete", file=sys.stderr)
+    return 1 if plan.gaps else 0
 
 
 def _users(args: argparse.Namespace) -> int:
