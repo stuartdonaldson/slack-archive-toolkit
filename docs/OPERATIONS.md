@@ -52,7 +52,7 @@ Started" §1–2: capture token + cookie from the browser, merge tokens into
 
 ### 2. Detecting expiry
 
-- **Automatically, every night:** `scripts/nightly-backup-digest.sh` runs a pre-flight
+- **Automatically, on each scheduled run (Wed and Sat via the NUUTS rotation):** `scripts/nightly-backup-digest.sh` runs a pre-flight
   (`scripts/preflight-auth.sh`) *before* the backup and lists any stale workspaces at
   the **top** of `~/slack-backups/nightly.log`, so expiries are announced up front
   rather than discovered channel-by-channel mid-run.
@@ -108,7 +108,7 @@ It is wired into `nightly-backup-digest.sh` (before the pre-flight and backup), 
 running nightly job keeps credentials fresh with no human involvement. Requirements: the
 persistent profile must still be logged in (a hard logout — password change / forced
 sign-out — drops back to interactive §3), and the cadence must beat Slack's inactivity
-window (nightly is comfortably inside the observed ~2–3 week expiry).
+window (a twice-weekly run, Wed and Sat, is comfortably inside the observed ~2–3 week expiry).
 
 ### Failure modes
 
@@ -124,9 +124,12 @@ window (nightly is comfortably inside the observed ~2–3 week expiry).
 
 ## Nightly Backup
 
-`scripts/nightly-backup-digest.sh` is invoked by a Windows Scheduled Task
-(`wsl.exe -d Ubuntu -- /home/stuar/proj/SlackArchiver/scripts/nightly-backup-digest.sh`) at 2am,
-appending everything to `~/slack-backups/nightly.log`. In order, each run:
+`scripts/nightly-backup-digest.sh` is invoked by the NUUTS-Shell rotation (single Windows Scheduled Task
+"NUUTS Rotation", 00:05 daily; the Wednesday and Saturday slices run this script unchanged under a 3 h timeout —
+see NUUTS-Shell `scripts/nightly/README-weekly.md`). The former `SlackArchiveToolkit-Nightly` 2am task is disabled.
+The rotation parses this run's section of `~/slack-backups/nightly.log` and shows failures (non-zero step exit,
+missing finish marker, expired or probe-failed workspaces) in its login notice. The script itself still appends
+everything to `~/slack-backups/nightly.log` and can still be run by hand. In order, each run:
 
 | # | Step | Notes |
 |---|------|-------|
